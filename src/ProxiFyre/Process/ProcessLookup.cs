@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using System.Text;
 
 namespace ProxiFyre;
 
@@ -14,6 +15,7 @@ internal sealed class ProcessLookup
     private const int UdpTableOwnerPid = 1;
     private const int ErrorInsufficientBuffer = 122;
     private const int NoError = 0;
+    private const uint ProcessQueryLimitedInformation = 0x1000;
 
     private readonly TimeSpan _refreshInterval = TimeSpan.FromMilliseconds(250);
     private readonly ConcurrentDictionary<int, ProcessInfo> _processCache = new();
@@ -395,19 +397,52 @@ internal sealed class ProcessLookup
                 ? process.ProcessName
                 : process.ProcessName + ".exe";
 
-            var path = string.Empty;
-            try
-            {
-                path = process.MainModule?.FileName ?? string.Empty;
-            }
-            catch
-            {
-                path = name;
-            }
+            var path = TryGetProcessImagePath(pid)
+                ?? TryGetMainModulePath(process)
+                ?? name;
 
             var processInfo = new ProcessInfo(pid, name, path);
             _processCache.TryAdd(pid, processInfo);
             return processInfo;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string? TryGetProcessImagePath(int pid)
+    {
+        var processHandle = OpenProcess(ProcessQueryLimitedInformation, false, pid);
+        if (processHandle == IntPtr.Zero)
+        {
+            return null;
+        }
+
+        try
+        {
+            var builder = new StringBuilder(32768);
+            var capacity = builder.Capacity;
+            if (!QueryFullProcessImageName(processHandle, 0, builder, ref capacity))
+            {
+                return null;
+            }
+
+            var path = builder.ToString();
+            return string.IsNullOrWhiteSpace(path) ? null : path;
+        }
+        finally
+        {
+            CloseHandle(processHandle);
+        }
+    }
+
+    private static string? TryGetMainModulePath(Process process)
+    {
+        try
+        {
+            var path = process.MainModule?.FileName;
+            return string.IsNullOrWhiteSpace(path) ? null : path;
         }
         catch
         {
@@ -444,6 +479,24 @@ internal sealed class ProcessLookup
         int ipVersion,
         int tblClass,
         uint reserved);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenProcess(
+        uint desiredAccess,
+        [MarshalAs(UnmanagedType.Bool)] bool inheritHandle,
+        int processId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool QueryFullProcessImageName(
+        IntPtr processHandle,
+        int flags,
+        StringBuilder exeName,
+        ref int size);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseHandle(IntPtr handle);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct MibTcpRowOwnerPid

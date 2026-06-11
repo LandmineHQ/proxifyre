@@ -237,7 +237,7 @@ internal sealed class TcpDirectRelay : IDisposable
             TcpRelayKey? outboundFlowKey = null;
             try
             {
-                client = new TcpClient(remoteEndPoint.AddressFamily);
+                client = CreateRelayTcpClient(remoteEndPoint.AddressFamily);
                 var bindEndPoint = NetworkEndpointResolver.CreateBindEndPoint(_target);
                 try
                 {
@@ -249,7 +249,7 @@ internal sealed class TcpDirectRelay : IDisposable
                 {
                     _errorLog($"DIRECT TCP bind failed, retrying any app={_target.AppLabel} appLocal={_target.ClientEndpoint} target={_target.RemoteEndpoint} bind={bindEndPoint}: {ex.Message}");
                     client.Dispose();
-                    client = new TcpClient(remoteEndPoint.AddressFamily);
+                    client = CreateRelayTcpClient(remoteEndPoint.AddressFamily);
                     client.Client.Bind(NetworkEndpointResolver.CreateAnyEndPoint(remoteEndPoint.AddressFamily));
                 }
 
@@ -307,6 +307,14 @@ internal sealed class TcpDirectRelay : IDisposable
                 _errorLog($"DIRECT TCP connect failed app={_target.AppLabel} appLocal={_target.ClientEndpoint} client={_clientKey.ClientAddress}:{_clientKey.ClientPort} target={_target.RemoteEndpoint} relayProcess={Environment.ProcessId}: {ex.Message}");
                 CloseNetwork();
             }
+        }
+
+        private static TcpClient CreateRelayTcpClient(AddressFamily addressFamily)
+        {
+            return new TcpClient(addressFamily)
+            {
+                NoDelay = true
+            };
         }
 
         public async Task SendClientPayloadAsync(uint sequenceNumber, uint acknowledgmentNumber, ushort window, ReadOnlyMemory<byte> payload, bool fin, bool rst, CancellationToken cancellationToken)
@@ -473,7 +481,7 @@ internal sealed class TcpDirectRelay : IDisposable
 
                     _downBytes += read;
                     _trafficCounter.AddDownload(read);
-                    Inject(packetSequence, packetAck, PacketView.TcpFlagAck, payload);
+                    Inject(packetSequence, packetAck, PacketView.TcpFlagPsh | PacketView.TcpFlagAck, payload);
                     _packetWakeSignal?.Pulse();
                     LogStats("RECV");
                 }

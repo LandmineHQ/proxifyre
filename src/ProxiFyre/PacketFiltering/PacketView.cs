@@ -14,6 +14,7 @@ internal ref struct PacketView
     public const byte TcpFlagFin = 0x01;
     public const byte TcpFlagSyn = 0x02;
     public const byte TcpFlagRst = 0x04;
+    public const byte TcpFlagPsh = 0x08;
     public const byte TcpFlagAck = 0x10;
 
     private readonly Span<byte> _frame;
