@@ -93,7 +93,7 @@ public partial class MainWindow : Window
             SetVersionStatusRemote(result.LatestVersion ?? "未知", hasUpdate: true);
             MessageBox.Show(
                 this,
-                $"发现新版本 {result.LatestVersion}。\n当前版本：{result.CurrentVersion}\n\n请从仓库获取最新源码或构建产物。",
+                $"发现新版本 {result.LatestVersion}\n当前版本：{result.CurrentVersion}\n\n请及时更新！",
                 "ProxiFyre 更新提示",
                 MessageBoxButton.OK,
                 MessageBoxImage.Information);

@@ -296,8 +296,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             TimeSpan.FromSeconds(2));
         var target = CreateTarget(buffer, packet, process, matchedPattern);
         var clientKey = new TcpClientKey(packet.SourceAddress, packet.SourcePort);
-        var connection = _tcpRelay.RegisterSyn(relayKey, clientKey, target, packet.TcpSequenceNumber, packet.TcpWindow, _cancellationToken);
-        connection.AcceptSyn();
+        _tcpRelay.RegisterSyn(relayKey, clientKey, target, packet.TcpSequenceNumber, packet.TcpWindow, _cancellationToken);
         _packetsRedirected++;
         LogPacketStats();
     }

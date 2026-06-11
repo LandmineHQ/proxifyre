@@ -277,7 +277,13 @@ internal sealed class TcpDirectRelay : IDisposable
                 }
 
                 _detailLog?.Invoke($"DIRECT TCP CONNECT app={_target.AppLabel} appLocal={_target.ClientEndpoint} client={_clientKey.ClientAddress}:{_clientKey.ClientPort} target={_target.RemoteEndpoint} relayProcess={Environment.ProcessId} relayLocal={client.Client.LocalEndPoint}");
-                await FlushPendingPayloadsAsync(_stream, cancellationToken).ConfigureAwait(false);
+                AcceptSyn();
+                var flushedPayloadBytes = await FlushPendingPayloadsAsync(_stream, cancellationToken).ConfigureAwait(false);
+                if (flushedPayloadBytes > 0)
+                {
+                    Inject(_nextRemoteSequence, _nextClientSequence, PacketView.TcpFlagAck, ReadOnlyMemory<byte>.Empty);
+                }
+
                 _receiveTask = Task.Run(() => ReceiveRemoteLoopAsync(cancellationToken), cancellationToken);
             }
             catch (OperationCanceledException)
@@ -299,8 +305,7 @@ internal sealed class TcpDirectRelay : IDisposable
 
                 client?.Dispose();
                 _errorLog($"DIRECT TCP connect failed app={_target.AppLabel} appLocal={_target.ClientEndpoint} client={_clientKey.ClientAddress}:{_clientKey.ClientPort} target={_target.RemoteEndpoint} relayProcess={Environment.ProcessId}: {ex.Message}");
-                Inject(_nextRemoteSequence, _nextClientSequence, PacketView.TcpFlagRst | PacketView.TcpFlagAck, ReadOnlyMemory<byte>.Empty);
-                _remove(_clientKey);
+                CloseNetwork();
             }
         }
 
@@ -364,8 +369,6 @@ internal sealed class TcpDirectRelay : IDisposable
                         _pendingPayloads ??= new Queue<byte[]>();
                         _pendingPayloads.Enqueue(acceptedPayload.ToArray());
                     }
-
-                    Inject(_nextRemoteSequence, _nextClientSequence, PacketView.TcpFlagAck, ReadOnlyMemory<byte>.Empty);
                 }
 
                 return;
@@ -401,7 +404,7 @@ internal sealed class TcpDirectRelay : IDisposable
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 _errorLog($"DIRECT TCP send failed app={_target.AppLabel} appLocal={_target.ClientEndpoint} client={_clientKey.ClientAddress}:{_clientKey.ClientPort} target={_target.RemoteEndpoint}: {ex.Message}");
-                Close(resetClient: true);
+                Close();
             }
         }
 
@@ -484,7 +487,7 @@ internal sealed class TcpDirectRelay : IDisposable
             catch (Exception ex)
             {
                 _errorLog($"DIRECT TCP remote receive failed for {_clientKey.ClientAddress}:{_clientKey.ClientPort} -> {_target.RemoteAddress}:{_target.RemotePort}: {ex.Message}");
-                Close(resetClient: true);
+                Close();
             }
             finally
             {
@@ -492,8 +495,9 @@ internal sealed class TcpDirectRelay : IDisposable
             }
         }
 
-        private async Task FlushPendingPayloadsAsync(NetworkStream stream, CancellationToken cancellationToken)
+        private async Task<int> FlushPendingPayloadsAsync(NetworkStream stream, CancellationToken cancellationToken)
         {
+            var flushedBytes = 0;
             while (true)
             {
                 byte[]? payload;
@@ -506,10 +510,11 @@ internal sealed class TcpDirectRelay : IDisposable
 
                 if (payload is null)
                 {
-                    return;
+                    return flushedBytes;
                 }
 
                 await stream.WriteAsync(payload, cancellationToken).ConfigureAwait(false);
+                flushedBytes += payload.Length;
                 _upBytes += payload.Length;
                 _trafficCounter.AddUpload(payload.Length);
                 _packetWakeSignal?.Pulse();
@@ -522,18 +527,11 @@ internal sealed class TcpDirectRelay : IDisposable
             _packetInjector?.Invoke(_target, sequenceNumber, acknowledgmentNumber, flags, _clientWindow, payload);
         }
 
-        private void Close(bool resetClient = false)
+        private void Close()
         {
-            bool shouldReset;
             lock (_sync)
             {
-                shouldReset = resetClient && !_closed;
                 _closed = true;
-            }
-
-            if (shouldReset)
-            {
-                Inject(_nextRemoteSequence, _nextClientSequence, PacketView.TcpFlagRst | PacketView.TcpFlagAck, ReadOnlyMemory<byte>.Empty);
             }
 
             _remove(_clientKey);

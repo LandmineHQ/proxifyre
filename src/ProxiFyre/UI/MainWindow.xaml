@@ -91,7 +91,7 @@
 
                 <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
                     <Border x:Name="StatusBadge" Padding="10,6" CornerRadius="16" Background="#EEF2F7" Margin="0,0,10,0">
-                        <StackPanel Orientation="Horizontal">
+                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" VerticalAlignment="Center">
                             <Ellipse x:Name="StatusDot" Width="8" Height="8" Fill="#98A2B3" Margin="0,0,8,0" VerticalAlignment="Center" />
                             <TextBlock x:Name="StatusText" Text="已暂停" FontWeight="SemiBold" Foreground="#475467" />
                         </StackPanel>
