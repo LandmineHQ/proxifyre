@@ -4,8 +4,10 @@ using System.Globalization;
 using System.Runtime.InteropServices;
 using System.IO;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Windows;
 using System.Windows.Data;
+using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
@@ -15,11 +17,16 @@ namespace ProxiFyre;
 
 public partial class MainWindow : Window
 {
+    private static readonly Regex TrafficLinePattern = new(
+        @"(?:^|\s)TRAFFIC up=(?<up>\d+) down=(?<down>\d+) upRate=(?<upRate>\d+) downRate=(?<downRate>\d+)",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
     private readonly ObservableCollection<ConfiguredApplication> _apps = [];
     private readonly ICollectionView _appsView;
     private readonly ObservableCollection<string> _logs = [];
     private readonly string _configPath = Path.Combine(AppContext.BaseDirectory, "app-config.json");
     private readonly CoreProcessHost _coreProcessHost;
+    private string _lastSavedConfigurationKey = string.Empty;
 
     public MainWindow()
     {
@@ -75,6 +82,7 @@ public partial class MainWindow : Window
             }
 
             AppendLog($"Loaded {_apps.Count} app rule(s).");
+            _lastSavedConfigurationKey = BuildLocalConfigurationKey();
         }
         catch (Exception ex)
         {
@@ -82,10 +90,25 @@ public partial class MainWindow : Window
         }
     }
 
-    private void SaveConfig()
+    private bool SaveConfig()
     {
-        AppConfiguration.SaveApps(_configPath, BuildApps(), CoreProcessNameInput.Text);
         CoreProcessNameInput.Text = AppConfiguration.NormalizeCoreProcessName(CoreProcessNameInput.Text);
+        var configurationKey = BuildLocalConfigurationKey();
+        if (string.Equals(configurationKey, _lastSavedConfigurationKey, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        AppConfiguration.SaveApps(_configPath, BuildApps(), CoreProcessNameInput.Text);
+        _lastSavedConfigurationKey = configurationKey;
+        return true;
+    }
+
+    private string BuildLocalConfigurationKey()
+    {
+        return AppConfiguration.NormalizeCoreProcessName(CoreProcessNameInput.Text)
+            + "\n"
+            + string.Join("\n", BuildApps().Order(StringComparer.OrdinalIgnoreCase));
     }
 
     private void AddButton_Click(object sender, RoutedEventArgs e)
@@ -116,8 +139,9 @@ public partial class MainWindow : Window
         }
 
         _apps.Remove(selected);
-        SaveConfig();
+        var saved = SaveConfig();
         AppendLog($"Removed {selected.Value}");
+        AppendHotReloadHint(saved);
     }
 
     private void ReloadButton_Click(object sender, RoutedEventArgs e)
@@ -175,8 +199,9 @@ public partial class MainWindow : Window
         }
 
         _apps.Add(ConfiguredApplication.CreateRule(value));
-        SaveConfig();
+        var saved = SaveConfig();
         AppendLog($"Added {value}");
+        AppendHotReloadHint(saved);
     }
 
     private void AddLoadedApp(string value)
@@ -211,8 +236,46 @@ public partial class MainWindow : Window
         }
 
         _apps.Add(app);
-        SaveConfig();
+        var saved = SaveConfig();
         AppendLog($"Added {app.FilePath}");
+        AppendHotReloadHint(saved);
+    }
+
+    private void CoreProcessNameInput_LostFocus(object sender, RoutedEventArgs e)
+    {
+        var saved = SaveConfig();
+        UpdateCoreProcessInfo();
+        AppendCoreProcessNameHintIfRunning(saved);
+    }
+
+    private void CoreProcessNameInput_KeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key != Key.Enter)
+        {
+            return;
+        }
+
+        e.Handled = true;
+        var saved = SaveConfig();
+        UpdateCoreProcessInfo();
+        AppendCoreProcessNameHintIfRunning(saved);
+        Keyboard.ClearFocus();
+    }
+
+    private void AppendHotReloadHint(bool saved)
+    {
+        if (saved && _coreProcessHost.IsRunning)
+        {
+            AppendLog("配置已保存，核心将热加载规则；已有连接不会被重启。");
+        }
+    }
+
+    private void AppendCoreProcessNameHintIfRunning(bool saved)
+    {
+        if (saved && _coreProcessHost.IsRunning)
+        {
+            AppendLog("核心进程名已保存；当前核心进程文件名会在下次启动时生效，应用规则已热加载。");
+        }
     }
 
     private bool ContainsApp(string value)
@@ -281,6 +344,11 @@ public partial class MainWindow : Window
         StartStopButton.Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString(running ? "#C73535" : "#16803C"));
         StartStopButtonText.Text = running ? "暂停" : "启用";
         StartStopIcon.Data = Geometry.Parse(running ? "M 2 1 H 6 V 13 H 2 Z M 9 1 H 13 V 13 H 9 Z" : "M 2 1 L 13 7 L 2 13 Z");
+        if (!running)
+        {
+            UpdateTrafficStatus(TrafficSnapshot.Empty);
+        }
+
         UpdateCoreProcessInfo();
     }
 
@@ -304,6 +372,12 @@ public partial class MainWindow : Window
 
     private void AppendLog(string message)
     {
+        if (TryParseTrafficLine(message, out var traffic))
+        {
+            Dispatcher.InvokeAsync(() => UpdateTrafficStatus(traffic));
+            return;
+        }
+
         Dispatcher.InvokeAsync(() =>
         {
             _logs.Add($"{DateTime.Now:HH:mm:ss}  {message}");
@@ -314,6 +388,45 @@ public partial class MainWindow : Window
 
             LogList.ScrollIntoView(_logs.LastOrDefault());
         });
+    }
+
+    private static bool TryParseTrafficLine(string message, out TrafficSnapshot snapshot)
+    {
+        snapshot = default;
+        var match = TrafficLinePattern.Match(message);
+        if (!match.Success)
+        {
+            return false;
+        }
+
+        snapshot = new TrafficSnapshot(
+            long.Parse(match.Groups["up"].Value, CultureInfo.InvariantCulture),
+            long.Parse(match.Groups["down"].Value, CultureInfo.InvariantCulture),
+            long.Parse(match.Groups["upRate"].Value, CultureInfo.InvariantCulture),
+            long.Parse(match.Groups["downRate"].Value, CultureInfo.InvariantCulture));
+        return true;
+    }
+
+    private void UpdateTrafficStatus(TrafficSnapshot snapshot)
+    {
+        TrafficUploadText.Text = $"↑ {FormatBytes(snapshot.UploadBytesPerSecond)}/s · {FormatBytes(snapshot.UploadBytes)}";
+        TrafficDownloadText.Text = $"↓ {FormatBytes(snapshot.DownloadBytesPerSecond)}/s · {FormatBytes(snapshot.DownloadBytes)}";
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        string[] units = ["B", "KB", "MB", "GB", "TB"];
+        var value = (double)Math.Max(0, bytes);
+        var unit = 0;
+        while (value >= 1024 && unit < units.Length - 1)
+        {
+            value /= 1024;
+            unit++;
+        }
+
+        return unit == 0
+            ? $"{value:0} {units[unit]}"
+            : $"{value:0.0} {units[unit]}";
     }
 
     protected override void OnClosed(EventArgs e)

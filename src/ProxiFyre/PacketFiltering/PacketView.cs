@@ -143,6 +143,16 @@ internal ref struct PacketView
         }
     }
 
+    public byte[] GetEthernetSource()
+    {
+        return _frame.Slice(6, 6).ToArray();
+    }
+
+    public byte[] GetEthernetDestination()
+    {
+        return _frame.Slice(0, 6).ToArray();
+    }
+
     public void SwapIpAddresses()
     {
         var addressLength = AddressFamily == AddressFamily.InterNetwork ? 4 : 16;

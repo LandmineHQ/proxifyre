@@ -11,7 +11,10 @@ param(
     [switch]$Detailed,
 
     [ValidateSet("Debug", "Release")]
-    [string]$Configuration = "Debug"
+    [string]$Configuration = "Debug",
+
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$ExtraArgs
 )
 
 $ErrorActionPreference = "Stop"
@@ -25,7 +28,7 @@ function Show-Usage {
     Write-Host "Usage:"
     Write-Host "  .\proxifyre.ps1 build [-Configuration Debug|Release]"
     Write-Host "  .\proxifyre.ps1 ui"
-    Write-Host "  .\proxifyre.ps1 test [curl-ipv4|curl-ipv6|curl-http-ipv4|curl-large-ipv4|curl-large-ipv6|stun-ipv4|stun-ipv6] [-Detailed]"
+    Write-Host "  .\proxifyre.ps1 test [curl-ipv4|curl-ipv6|curl-http-ipv4|curl-large-ipv4|curl-large-ipv6|stun-ipv4|stun-ipv6|stun-bench-ipv4|stun-bench-ipv6|stun-scan-ipv4|stun-scan-ipv6|stun-relay-scan-ipv4|stun-relay-scan-ipv6] [-Detailed] [-- <test args>]"
     Write-Host "  .\proxifyre.ps1 run [-Config .\app-config.json] [-Detailed]"
     Write-Host "  .\proxifyre.ps1 reset-filter"
     Write-Host "  .\proxifyre.ps1 add-app <exe-or-path> [-Config .\app-config.json]"
@@ -51,6 +54,9 @@ switch ($Command) {
         }
         if ($Detailed) {
             $testArgs += "--detailed"
+        }
+        if ($ExtraArgs) {
+            $testArgs += $ExtraArgs
         }
 
         dotnet run --project $TrafficTestProject -- @testArgs

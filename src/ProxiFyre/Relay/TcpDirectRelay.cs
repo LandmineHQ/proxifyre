@@ -14,13 +14,17 @@ internal sealed class TcpDirectRelay : IDisposable
     private readonly TimeSpan _targetTtl = TimeSpan.FromMinutes(5);
     private readonly Action<string> _log;
     private readonly bool _detailedLogging;
+    private readonly TrafficCounter _trafficCounter;
+    private readonly PacketWakeSignal? _packetWakeSignal;
     private readonly TimeProvider _timeProvider;
     private TcpListener? _listener;
 
-    public TcpDirectRelay(Action<string>? log = null, bool detailedLogging = false, TimeProvider? timeProvider = null)
+    public TcpDirectRelay(Action<string>? log = null, bool detailedLogging = false, TrafficCounter? trafficCounter = null, PacketWakeSignal? packetWakeSignal = null, TimeProvider? timeProvider = null)
     {
         _log = log ?? Console.WriteLine;
         _detailedLogging = detailedLogging;
+        _trafficCounter = trafficCounter ?? new TrafficCounter();
+        _packetWakeSignal = packetWakeSignal;
         _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
@@ -146,8 +150,30 @@ internal sealed class TcpDirectRelay : IDisposable
             await using var inboundStream = inbound.GetStream();
             await using var outboundStream = outbound.GetStream();
             var stats = new TcpRelayStats(key, target, _detailedLogging ? LogDetail : null, _timeProvider);
-            var upstream = CopyAndCountAsync("upstream", inboundStream, outboundStream, bytes => stats.AddUp(bytes), key, target, cancellationToken);
-            var downstream = CopyAndCountAsync("downstream", outboundStream, inboundStream, bytes => stats.AddDown(bytes), key, target, cancellationToken);
+            var upstream = CopyAndCountAsync(
+                "upstream",
+                inboundStream,
+                outboundStream,
+                bytes =>
+                {
+                    stats.AddUp(bytes);
+                    _trafficCounter.AddUpload(bytes);
+                },
+                key,
+                target,
+                cancellationToken);
+            var downstream = CopyAndCountAsync(
+                "downstream",
+                outboundStream,
+                inboundStream,
+                bytes =>
+                {
+                    stats.AddDown(bytes);
+                    _trafficCounter.AddDownload(bytes);
+                },
+                key,
+                target,
+                cancellationToken);
 
             await WaitForRelayCompletionAsync(upstream, downstream, inbound.Client, outbound.Client, cancellationToken).ConfigureAwait(false);
             stats.Log("END", force: true);
@@ -323,6 +349,7 @@ internal sealed class TcpDirectRelay : IDisposable
 
                 await destination.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
                 addBytes(read);
+                _packetWakeSignal?.Pulse();
                 total += read;
             }
         }

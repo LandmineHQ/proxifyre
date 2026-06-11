@@ -115,7 +115,10 @@ internal sealed record DirectRelayTarget(
     string ProcessPath = "",
     string MatchedPattern = "",
     IPAddress? ClientAddress = null,
-    ushort ClientPort = 0)
+    ushort ClientPort = 0,
+    IntPtr AdapterHandle = default,
+    byte[]? InboundEthernetSource = null,
+    byte[]? InboundEthernetDestination = null)
 {
     public string AppLabel => ProcessId > 0
         ? $"{ProcessName} pid={ProcessId} pattern={MatchedPattern}"

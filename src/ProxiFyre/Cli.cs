@@ -75,8 +75,8 @@ internal static class Cli
                 cts.Cancel();
             };
 
-            await using var service = new RelayService(logger.Info, detailedLogging);
-            service.Start(configuration, cts.Token);
+            await using var service = new RelayService(logger.Info, detailedLogging, Console.WriteLine);
+            service.Start(configuration, configPath, cts.Token);
             logger.Info("Running. Press Ctrl+C to stop.");
 
             try
