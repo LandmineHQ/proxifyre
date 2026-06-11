@@ -19,21 +19,35 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$Root = $PSScriptRoot
+$Root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
 $Solution = Join-Path $Root "ProxiFyre.sln"
 $Project = Join-Path $Root "src\ProxiFyre\ProxiFyre.csproj"
 $TrafficTestProject = Join-Path $Root "src\TrafficTest\TrafficTest.csproj"
+$Artifacts = Join-Path $Root "artifacts"
 
 function Show-Usage {
     Write-Host "Usage:"
-    Write-Host "  .\proxifyre.ps1 build [-Configuration Debug|Release]"
-    Write-Host "  .\proxifyre.ps1 ui"
-    Write-Host "  .\proxifyre.ps1 test [curl-ipv4|curl-ipv6|curl-http-ipv4|curl-large-ipv4|curl-large-ipv6|stun-ipv4|stun-ipv6|stun-bench-ipv4|stun-bench-ipv6|stun-scan-ipv4|stun-scan-ipv6|stun-relay-scan-ipv4|stun-relay-scan-ipv6] [-Detailed] [-- <test args>]"
-    Write-Host "  .\proxifyre.ps1 run [-Config .\app-config.json] [-Detailed]"
-    Write-Host "  .\proxifyre.ps1 reset-filter"
-    Write-Host "  .\proxifyre.ps1 add-app <exe-or-path> [-Config .\app-config.json]"
-    Write-Host "  .\proxifyre.ps1 init-config [-Config .\app-config.json]"
-    Write-Host "  .\proxifyre.ps1 clean"
+    Write-Host "  .\scripts\proxifyre.ps1 build [-Configuration Debug|Release]"
+    Write-Host "  .\scripts\proxifyre.ps1 ui"
+    Write-Host "  .\scripts\proxifyre.ps1 test [curl-ipv4|curl-ipv6|curl-http-ipv4|curl-large-ipv4|curl-large-ipv6|stun-ipv4|stun-ipv6|stun-bench-ipv4|stun-bench-ipv6|stun-scan-ipv4|stun-scan-ipv6|stun-relay-scan-ipv4|stun-relay-scan-ipv6] [-Detailed] [-- <test args>]"
+    Write-Host "  .\scripts\proxifyre.ps1 run [-Config .\app-config.json] [-Detailed]"
+    Write-Host "  .\scripts\proxifyre.ps1 reset-filter"
+    Write-Host "  .\scripts\proxifyre.ps1 add-app <exe-or-path> [-Config .\app-config.json]"
+    Write-Host "  .\scripts\proxifyre.ps1 init-config [-Config .\app-config.json]"
+    Write-Host "  .\scripts\proxifyre.ps1 clean"
+}
+
+function Remove-RepoPath {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if (Test-Path -LiteralPath $Path) {
+        $resolved = (Resolve-Path -LiteralPath $Path).Path
+        if (-not $resolved.StartsWith($Root, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Refusing to delete outside repository: $resolved"
+        }
+
+        Remove-Item -LiteralPath $resolved -Recurse -Force
+    }
 }
 
 switch ($Command) {
@@ -88,21 +102,17 @@ switch ($Command) {
         exit $LASTEXITCODE
     }
     "clean" {
-        dotnet clean $Solution
+        dotnet clean $Solution --configuration $Configuration
         $paths = @(
-            Join-Path $Root "src\ProxiFyre\bin"
-            Join-Path $Root "src\ProxiFyre\obj"
+            $Artifacts,
+            (Join-Path $Root "src\ProxiFyre\bin"),
+            (Join-Path $Root "src\ProxiFyre\obj"),
+            (Join-Path $Root "src\TrafficTest\bin"),
+            (Join-Path $Root "src\TrafficTest\obj")
         )
 
         foreach ($path in $paths) {
-            if (Test-Path -LiteralPath $path) {
-                $resolved = (Resolve-Path -LiteralPath $path).Path
-                if (-not $resolved.StartsWith($Root, [StringComparison]::OrdinalIgnoreCase)) {
-                    throw "Refusing to delete outside repository: $resolved"
-                }
-
-                Remove-Item -LiteralPath $resolved -Recurse -Force
-            }
+            Remove-RepoPath -Path $path
         }
 
         exit $LASTEXITCODE

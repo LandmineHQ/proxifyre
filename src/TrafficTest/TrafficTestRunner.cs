@@ -9,7 +9,7 @@ internal static class TrafficTestRunner
     {
         var options = TestOptions.Parse(args);
         var root = RepositoryPaths.FindRepositoryRoot(AppContext.BaseDirectory);
-        var coreDir = Path.Combine(root, "src", "ProxiFyre", "bin", "Debug", "net10.0-windows", "win-x64");
+        var coreDir = Path.Combine(root, "artifacts", "bin", "ProxiFyre", "debug_win-x64");
         var coreExe = Path.Combine(coreDir, "ProxiFyre.exe");
         var coreAlias = Path.Combine(coreDir, TrafficTestConstants.DefaultCoreProcessName);
         var configPath = Path.Combine(coreDir, "traffic-test-config.json");

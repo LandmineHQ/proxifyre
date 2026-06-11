@@ -34,9 +34,15 @@ No `ndisapi.dll` is required. The app installs/checks the WinpkFilter 3.6.2.1 MS
 ```text
 .
 ├── ProxiFyre.sln
+├── Directory.Build.props
 ├── global.json
 ├── README.md
 ├── LICENSE
+├── artifacts/
+│   ├── bin/
+│   └── obj/
+├── scripts/
+│   └── proxifyre.ps1
 └── src/
     ├── ProxiFyre/
         ├── Configuration/
@@ -47,13 +53,18 @@ No `ndisapi.dll` is required. The app installs/checks the WinpkFilter 3.6.2.1 MS
         ├── Relay/
         └── UI/
     └── TrafficTest/
+        ├── Curl/
+        ├── Infrastructure/
+        ├── Models/
+        ├── Options/
+        ├── Stun/
         └── Program.cs
 ```
 
 ## Build
 
 ```powershell
-.\proxifyre.ps1 build
+.\scripts\proxifyre.ps1 build
 ```
 
 or:
@@ -67,7 +78,7 @@ dotnet build
 Run without arguments to open the WPF UI:
 
 ```powershell
-.\proxifyre.ps1 ui
+.\scripts\proxifyre.ps1 ui
 ```
 
 The UI stores its app list in `app-config.json` next to the built executable. Add an executable name such as `chrome.exe`, or browse to a full executable path, then start the direct relay from the window.
@@ -77,19 +88,19 @@ The UI stores its app list in `app-config.json` next to the built executable. Ad
 Run the relay from an elevated terminal:
 
 ```powershell
-.\proxifyre.ps1 run -Config .\app-config.json
+.\scripts\proxifyre.ps1 run -Config .\app-config.json
 ```
 
 Generate a sample config:
 
 ```powershell
-.\proxifyre.ps1 init-config -Config .\app-config.json
+.\scripts\proxifyre.ps1 init-config -Config .\app-config.json
 ```
 
 Add one application:
 
 ```powershell
-.\proxifyre.ps1 add-app chrome.exe -Config .\app-config.json
+.\scripts\proxifyre.ps1 add-app chrome.exe -Config .\app-config.json
 ```
 
 ## Focused traffic test
@@ -97,18 +108,18 @@ Add one application:
 Use the isolated curl test when browser traffic is too noisy to diagnose:
 
 ```powershell
-.\proxifyre.ps1 test
+.\scripts\proxifyre.ps1 test
 ```
 
 The test starts a temporary `proxifyre-test-core.exe` and writes a narrow config for the current test mode. TCP curl modes only match `curl.exe`, disable curl proxy environment variables, and request a known target. IPv4 curl modes use Bing. The IPv6 curl mode uses `ipv6.test-ipv6.com`, because `www.bing.com` may not return an AAAA record on every resolver. UDP STUN modes only match `TrafficTest.exe` and send a STUN binding request to `stun.l.google.com:19302`.
 
 ```powershell
-.\proxifyre.ps1 test curl-ipv4
-.\proxifyre.ps1 test curl-http-ipv4
-.\proxifyre.ps1 test curl-ipv6
-.\proxifyre.ps1 test stun-ipv4
-.\proxifyre.ps1 test stun-ipv6
-.\proxifyre.ps1 test curl-ipv4 -Detailed
+.\scripts\proxifyre.ps1 test curl-ipv4
+.\scripts\proxifyre.ps1 test curl-http-ipv4
+.\scripts\proxifyre.ps1 test curl-ipv6
+.\scripts\proxifyre.ps1 test stun-ipv4
+.\scripts\proxifyre.ps1 test stun-ipv6
+.\scripts\proxifyre.ps1 test curl-ipv4 -Detailed
 ```
 
 Normal core runs keep logs compact and only record when a configured application starts a TCP or UDP connection. Use `-Detailed` on the script, or `--detailed` on the executable, when packet-level relay diagnostics are needed.

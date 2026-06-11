@@ -49,33 +49,41 @@ internal static class CoreLogReporter
 
         var lines = ReadAllLinesShared(logPath);
         Console.WriteLine("core log summary:");
-        foreach (var pattern in new[]
-                 {
-                     "TCP APP MATCH",
-                     "REDIRECT TCP",
-                     "PASS RELAY TCP OUT",
-                     "PASS RELAY TCP IN",
-                     "DIRECT TCP ACCEPT",
-                     "DIRECT TCP CONNECT",
-                     "DIRECT TCP SEND",
-                     "DIRECT TCP RECV",
-                     "DIRECT TCP END",
-                     "RESTORE TCP RECV",
-                     "DIRECT TCP failed",
-                     "copy failed",
-                     "UDP APP MATCH",
-                     "REDIRECT UDP",
-                     "DIRECT UDP SEND",
-                     "DIRECT UDP RECV",
-                     "RESTORE UDP RECV",
-                     "DIRECT UDP send failed",
-                     "UDP relay remote receive failed",
-                     "No direct target",
-                     "SendPacket"
-                 })
+        PrintCounts(lines, ["APP TCP CONNECT", "APP UDP CONNECT"]);
+
+        var errorPatterns = new[]
         {
-            var count = lines.Count(line => line.Contains(pattern, StringComparison.Ordinal));
-            Console.WriteLine($"  {pattern}: {count}");
+            "DIRECT TCP failed",
+            "copy failed",
+            "DIRECT UDP send failed",
+            "UDP relay remote receive failed",
+            "No direct target",
+            "SendPacket"
+        };
+        PrintNonZeroCounts(lines, errorPatterns);
+
+        var detailedPatterns = new[]
+        {
+            "TCP APP MATCH",
+            "REDIRECT TCP",
+            "PASS RELAY TCP OUT",
+            "PASS RELAY TCP IN",
+            "DIRECT TCP ACCEPT",
+            "DIRECT TCP CONNECT",
+            "DIRECT TCP SEND",
+            "DIRECT TCP RECV",
+            "DIRECT TCP END",
+            "RESTORE TCP RECV",
+            "UDP APP MATCH",
+            "REDIRECT UDP",
+            "DIRECT UDP SEND",
+            "DIRECT UDP RECV",
+            "RESTORE UDP RECV"
+        };
+        if (includeRelevantLines || detailedPatterns.Any(pattern => Count(lines, pattern) > 0))
+        {
+            Console.WriteLine("detailed packet counters:");
+            PrintCounts(lines, detailedPatterns);
         }
 
         if (includeRelevantLines)
@@ -105,7 +113,9 @@ internal static class CoreLogReporter
 
     private static bool IsRelevant(string line)
     {
-        return line.Contains("TCP APP MATCH", StringComparison.Ordinal)
+        return line.Contains("APP TCP CONNECT", StringComparison.Ordinal)
+            || line.Contains("APP UDP CONNECT", StringComparison.Ordinal)
+            || line.Contains("TCP APP MATCH", StringComparison.Ordinal)
             || line.Contains("REDIRECT TCP", StringComparison.Ordinal)
             || line.Contains("RESTORE TCP", StringComparison.Ordinal)
             || line.Contains("PASS RELAY TCP", StringComparison.Ordinal)
@@ -118,5 +128,30 @@ internal static class CoreLogReporter
             || line.Contains("failed", StringComparison.OrdinalIgnoreCase)
             || line.Contains("No direct target", StringComparison.Ordinal)
             || line.Contains("SendPacket", StringComparison.Ordinal);
+    }
+
+    private static void PrintCounts(IReadOnlyCollection<string> lines, IEnumerable<string> patterns)
+    {
+        foreach (var pattern in patterns)
+        {
+            Console.WriteLine($"  {pattern}: {Count(lines, pattern)}");
+        }
+    }
+
+    private static void PrintNonZeroCounts(IReadOnlyCollection<string> lines, IEnumerable<string> patterns)
+    {
+        foreach (var pattern in patterns)
+        {
+            var count = Count(lines, pattern);
+            if (count > 0)
+            {
+                Console.WriteLine($"  {pattern}: {count}");
+            }
+        }
+    }
+
+    private static int Count(IEnumerable<string> lines, string pattern)
+    {
+        return lines.Count(line => line.Contains(pattern, StringComparison.Ordinal));
     }
 }
