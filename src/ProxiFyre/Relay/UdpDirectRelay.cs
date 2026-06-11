@@ -189,6 +189,7 @@ internal sealed class UdpDirectRelay : IDisposable
         private DateTimeOffset _lastReceiveStatsLog;
         private long _upBytes;
         private long _downBytes;
+        private bool _sniProbeFinished;
 
         public UdpRelaySocket(Socket remoteSocket, UdpRelayKey key, DirectRelayTarget target, IPEndPoint clientEndPoint, IPEndPoint remoteEndPoint, Action<UdpRelayKey> remove, ConcurrentDictionary<UdpEndpointKey, byte> relayOutboundEndpoints, TrafficCounter trafficCounter, PacketWakeSignal? packetWakeSignal, Action<DirectRelayTarget, IPEndPoint, ReadOnlyMemory<byte>>? responseInjector, Action<string>? detailLog, Action<string> errorLog, TimeProvider timeProvider)
         {
@@ -221,11 +222,26 @@ internal sealed class UdpDirectRelay : IDisposable
         public async Task SendToRemoteAsync(ReadOnlyMemory<byte> payload, CancellationToken cancellationToken)
         {
             Refresh();
+            ProbeClientSni(payload.Span);
             await _remoteSocket.SendAsync(payload, SocketFlags.None, cancellationToken).ConfigureAwait(false);
             _upBytes += payload.Length;
             _trafficCounter.AddUpload(payload.Length);
             _packetWakeSignal?.Pulse();
             LogStats("SEND");
+        }
+
+        private void ProbeClientSni(ReadOnlySpan<byte> payload)
+        {
+            if (_sniProbeFinished || payload.IsEmpty)
+            {
+                return;
+            }
+
+            _sniProbeFinished = true;
+            if (TlsSniParser.TryGetDtlsServerName(payload, out var serverName))
+            {
+                _errorLog($"APP UDP SNI app={_target.AppLabel} appLocal={_target.ClientEndpoint} client={_key.ClientAddress}:{_key.ClientPort} target={_target.RemoteEndpoint} domain={serverName}");
+            }
         }
 
         private async Task ReceiveRemoteLoopAsync(CancellationToken cancellationToken)

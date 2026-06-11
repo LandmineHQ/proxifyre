@@ -159,11 +159,16 @@ internal sealed class TcpDirectRelay : IDisposable
         private readonly Action<string> _errorLog;
         private readonly TimeProvider _timeProvider;
         private readonly uint _remoteInitialSequence;
+        private readonly SemaphoreSlim _sendLock = new(1, 1);
         private TcpClient? _client;
         private NetworkStream? _stream;
         private TcpRelayKey? _outboundFlowKey;
         private Task? _receiveTask;
-        private Queue<byte[]>? _pendingPayloads;
+        private Queue<byte[]>? _pendingWritePayloads;
+        private SortedDictionary<uint, byte[]>? _pendingOutOfOrderPayloads;
+        private uint? _pendingFinSequence;
+        private byte[]? _sniProbeBuffer;
+        private bool _sniProbeFinished;
         private bool _connected;
         private bool _closed;
         private uint _nextRemoteSequence;
@@ -261,27 +266,37 @@ internal sealed class TcpDirectRelay : IDisposable
                 }
 
                 await client.ConnectAsync(remoteEndPoint, cancellationToken).ConfigureAwait(false);
-                lock (_sync)
+                await _sendLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+                try
                 {
-                    if (_closed)
+                    NetworkStream stream;
+                    lock (_sync)
                     {
-                        client.Dispose();
-                        ClearOutboundFlow();
-                        return;
+                        if (_closed)
+                        {
+                            client.Dispose();
+                            ClearOutboundFlow();
+                            return;
+                        }
+
+                        stream = client.GetStream();
+                        _client = client;
+                        _stream = stream;
+                        _connected = true;
+                        LastActivity = _timeProvider.GetUtcNow();
                     }
 
-                    _client = client;
-                    _stream = client.GetStream();
-                    _connected = true;
-                    LastActivity = _timeProvider.GetUtcNow();
+                    _detailLog?.Invoke($"DIRECT TCP CONNECT app={_target.AppLabel} appLocal={_target.ClientEndpoint} client={_clientKey.ClientAddress}:{_clientKey.ClientPort} target={_target.RemoteEndpoint} relayProcess={Environment.ProcessId} relayLocal={client.Client.LocalEndPoint}");
+                    AcceptSyn();
+                    var flushedPayloadBytes = await FlushPendingPayloadsAsync(stream, cancellationToken).ConfigureAwait(false);
+                    if (flushedPayloadBytes > 0)
+                    {
+                        Inject(_nextRemoteSequence, _nextClientSequence, PacketView.TcpFlagAck, ReadOnlyMemory<byte>.Empty);
+                    }
                 }
-
-                _detailLog?.Invoke($"DIRECT TCP CONNECT app={_target.AppLabel} appLocal={_target.ClientEndpoint} client={_clientKey.ClientAddress}:{_clientKey.ClientPort} target={_target.RemoteEndpoint} relayProcess={Environment.ProcessId} relayLocal={client.Client.LocalEndPoint}");
-                AcceptSyn();
-                var flushedPayloadBytes = await FlushPendingPayloadsAsync(_stream, cancellationToken).ConfigureAwait(false);
-                if (flushedPayloadBytes > 0)
+                finally
                 {
-                    Inject(_nextRemoteSequence, _nextClientSequence, PacketView.TcpFlagAck, ReadOnlyMemory<byte>.Empty);
+                    _sendLock.Release();
                 }
 
                 _receiveTask = Task.Run(() => ReceiveRemoteLoopAsync(cancellationToken), cancellationToken);
@@ -319,9 +334,24 @@ internal sealed class TcpDirectRelay : IDisposable
 
         public async Task SendClientPayloadAsync(uint sequenceNumber, uint acknowledgmentNumber, ushort window, ReadOnlyMemory<byte> payload, bool fin, bool rst, CancellationToken cancellationToken)
         {
+            await _sendLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await SendClientPayloadCoreAsync(sequenceNumber, acknowledgmentNumber, window, payload, fin, rst, cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                _sendLock.Release();
+            }
+        }
+
+        private async Task SendClientPayloadCoreAsync(uint sequenceNumber, uint acknowledgmentNumber, ushort window, ReadOnlyMemory<byte> payload, bool fin, bool rst, CancellationToken cancellationToken)
+        {
             NetworkStream? stream;
             bool connected;
-            ReadOnlyMemory<byte> acceptedPayload = ReadOnlyMemory<byte>.Empty;
+            var acceptedPayloads = new List<byte[]>();
+            var shouldAcknowledgeClient = false;
+            var shouldShutdownSend = false;
             lock (_sync)
             {
                 if (_closed)
@@ -333,29 +363,32 @@ internal sealed class TcpDirectRelay : IDisposable
                 LastActivity = _timeProvider.GetUtcNow();
                 if (payload.Length > 0)
                 {
-                    var payloadEnd = sequenceNumber + (uint)payload.Length;
-                    if (payloadEnd > _nextClientSequence)
-                    {
-                        if (sequenceNumber < _nextClientSequence)
-                        {
-                            acceptedPayload = payload[(int)(_nextClientSequence - sequenceNumber)..];
-                        }
-                        else
-                        {
-                            acceptedPayload = payload;
-                        }
-
-                        _nextClientSequence = payloadEnd;
-                    }
+                    shouldAcknowledgeClient = AcceptClientPayload(sequenceNumber, payload, acceptedPayloads);
                 }
 
                 if (fin)
                 {
-                    var finSequence = sequenceNumber + (uint)payload.Length + 1;
-                    if (finSequence > _nextClientSequence)
+                    var finSequence = sequenceNumber + (uint)payload.Length;
+                    if (finSequence == _nextClientSequence)
                     {
-                        _nextClientSequence = finSequence;
+                        _nextClientSequence++;
+                        shouldAcknowledgeClient = true;
+                        shouldShutdownSend = true;
                     }
+                    else if (finSequence > _nextClientSequence)
+                    {
+                        _pendingFinSequence = finSequence;
+                    }
+                    else
+                    {
+                        shouldShutdownSend = true;
+                    }
+                }
+
+                if (TryConsumePendingFin())
+                {
+                    shouldAcknowledgeClient = true;
+                    shouldShutdownSend = true;
                 }
 
                 stream = _stream;
@@ -370,12 +403,15 @@ internal sealed class TcpDirectRelay : IDisposable
 
             if (stream is null || !connected)
             {
-                if (acceptedPayload.Length > 0)
+                if (acceptedPayloads.Count > 0)
                 {
                     lock (_sync)
                     {
-                        _pendingPayloads ??= new Queue<byte[]>();
-                        _pendingPayloads.Enqueue(acceptedPayload.ToArray());
+                        _pendingWritePayloads ??= new Queue<byte[]>();
+                        foreach (var acceptedPayload in acceptedPayloads)
+                        {
+                            _pendingWritePayloads.Enqueue(acceptedPayload);
+                        }
                     }
                 }
 
@@ -384,7 +420,8 @@ internal sealed class TcpDirectRelay : IDisposable
 
             try
             {
-                if (acceptedPayload.Length > 0)
+                ProbeClientSni(acceptedPayloads);
+                foreach (var acceptedPayload in acceptedPayloads)
                 {
                     await stream.WriteAsync(acceptedPayload, cancellationToken).ConfigureAwait(false);
                     _upBytes += acceptedPayload.Length;
@@ -393,12 +430,12 @@ internal sealed class TcpDirectRelay : IDisposable
                     LogStats("SEND");
                 }
 
-                if (acceptedPayload.Length > 0 || fin)
+                if (shouldAcknowledgeClient)
                 {
                     Inject(_nextRemoteSequence, _nextClientSequence, PacketView.TcpFlagAck, ReadOnlyMemory<byte>.Empty);
                 }
 
-                if (fin)
+                if (shouldShutdownSend)
                 {
                     try
                     {
@@ -414,6 +451,151 @@ internal sealed class TcpDirectRelay : IDisposable
                 _errorLog($"DIRECT TCP send failed app={_target.AppLabel} appLocal={_target.ClientEndpoint} client={_clientKey.ClientAddress}:{_clientKey.ClientPort} target={_target.RemoteEndpoint}: {ex.Message}");
                 Close();
             }
+        }
+
+        private void ProbeClientSni(IReadOnlyList<byte[]> payloads)
+        {
+            if (_sniProbeFinished || payloads.Count == 0)
+            {
+                return;
+            }
+
+            foreach (var payload in payloads)
+            {
+                if (payload.Length == 0)
+                {
+                    continue;
+                }
+
+                AppendSniProbePayload(payload);
+                if (_sniProbeBuffer is null)
+                {
+                    return;
+                }
+
+                if (TlsSniParser.TryGetTlsServerName(_sniProbeBuffer, out var serverName, out var needMore))
+                {
+                    _errorLog($"APP TCP SNI app={_target.AppLabel} appLocal={_target.ClientEndpoint} client={_clientKey.ClientAddress}:{_clientKey.ClientPort} target={_target.RemoteEndpoint} domain={serverName}");
+                    _sniProbeFinished = true;
+                    _sniProbeBuffer = null;
+                    return;
+                }
+
+                if (!needMore || _sniProbeBuffer.Length >= TlsSniParser.MaxProbeBytes)
+                {
+                    _sniProbeFinished = true;
+                    _sniProbeBuffer = null;
+                    return;
+                }
+            }
+        }
+
+        private void AppendSniProbePayload(byte[] payload)
+        {
+            var currentLength = _sniProbeBuffer?.Length ?? 0;
+            var remainingLength = TlsSniParser.MaxProbeBytes - currentLength;
+            if (remainingLength <= 0)
+            {
+                _sniProbeFinished = true;
+                _sniProbeBuffer = null;
+                return;
+            }
+
+            var appendLength = Math.Min(remainingLength, payload.Length);
+            var nextBuffer = new byte[currentLength + appendLength];
+            if (_sniProbeBuffer is not null)
+            {
+                Buffer.BlockCopy(_sniProbeBuffer, 0, nextBuffer, 0, currentLength);
+            }
+
+            Buffer.BlockCopy(payload, 0, nextBuffer, currentLength, appendLength);
+            _sniProbeBuffer = nextBuffer;
+        }
+
+        private bool AcceptClientPayload(uint sequenceNumber, ReadOnlyMemory<byte> payload, List<byte[]> acceptedPayloads)
+        {
+            var payloadEnd = sequenceNumber + (uint)payload.Length;
+            if (payloadEnd <= _nextClientSequence)
+            {
+                return false;
+            }
+
+            if (sequenceNumber > _nextClientSequence)
+            {
+                StoreOutOfOrderPayload(sequenceNumber, payload);
+                return true;
+            }
+
+            AcceptContiguousPayload(sequenceNumber, payload, acceptedPayloads);
+            FlushOutOfOrderPayloads(acceptedPayloads);
+            return acceptedPayloads.Count > 0;
+        }
+
+        private void AcceptContiguousPayload(uint sequenceNumber, ReadOnlyMemory<byte> payload, List<byte[]> acceptedPayloads)
+        {
+            var offset = sequenceNumber < _nextClientSequence
+                ? (int)(_nextClientSequence - sequenceNumber)
+                : 0;
+            if (offset >= payload.Length)
+            {
+                return;
+            }
+
+            var acceptedPayload = payload[offset..].ToArray();
+            acceptedPayloads.Add(acceptedPayload);
+            _nextClientSequence += (uint)acceptedPayload.Length;
+        }
+
+        private void StoreOutOfOrderPayload(uint sequenceNumber, ReadOnlyMemory<byte> payload)
+        {
+            _pendingOutOfOrderPayloads ??= [];
+            if (_pendingOutOfOrderPayloads.TryGetValue(sequenceNumber, out var existingPayload)
+                && existingPayload.Length >= payload.Length)
+            {
+                return;
+            }
+
+            _pendingOutOfOrderPayloads[sequenceNumber] = payload.ToArray();
+            _detailLog?.Invoke($"DIRECT TCP buffered out-of-order payload app={_target.AppLabel} appLocal={_target.ClientEndpoint} seq={sequenceNumber} expected={_nextClientSequence} bytes={payload.Length}");
+        }
+
+        private void FlushOutOfOrderPayloads(List<byte[]> acceptedPayloads)
+        {
+            while (_pendingOutOfOrderPayloads is { Count: > 0 })
+            {
+                using var enumerator = _pendingOutOfOrderPayloads.GetEnumerator();
+                if (!enumerator.MoveNext())
+                {
+                    return;
+                }
+
+                var sequenceNumber = enumerator.Current.Key;
+                if (sequenceNumber > _nextClientSequence)
+                {
+                    return;
+                }
+
+                var payload = enumerator.Current.Value;
+                _pendingOutOfOrderPayloads.Remove(sequenceNumber);
+                if (sequenceNumber + (uint)payload.Length <= _nextClientSequence)
+                {
+                    continue;
+                }
+
+                AcceptContiguousPayload(sequenceNumber, payload, acceptedPayloads);
+            }
+        }
+
+        private bool TryConsumePendingFin()
+        {
+            if (_pendingFinSequence != _nextClientSequence)
+            {
+                return false;
+            }
+
+            _pendingFinSequence = null;
+            _nextClientSequence++;
+            return true;
         }
 
         private async Task ReceiveRemoteLoopAsync(CancellationToken cancellationToken)
@@ -511,8 +693,8 @@ internal sealed class TcpDirectRelay : IDisposable
                 byte[]? payload;
                 lock (_sync)
                 {
-                    payload = _pendingPayloads is { Count: > 0 }
-                        ? _pendingPayloads.Dequeue()
+                    payload = _pendingWritePayloads is { Count: > 0 }
+                        ? _pendingWritePayloads.Dequeue()
                         : null;
                 }
 
@@ -521,6 +703,7 @@ internal sealed class TcpDirectRelay : IDisposable
                     return flushedBytes;
                 }
 
+                ProbeClientSni([payload]);
                 await stream.WriteAsync(payload, cancellationToken).ConfigureAwait(false);
                 flushedBytes += payload.Length;
                 _upBytes += payload.Length;
@@ -591,6 +774,7 @@ internal sealed class TcpDirectRelay : IDisposable
             }
 
             CloseNetwork();
+            _sendLock.Dispose();
         }
     }
 }
