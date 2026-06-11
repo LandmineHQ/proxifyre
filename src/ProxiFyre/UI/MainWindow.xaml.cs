@@ -31,6 +31,7 @@ public partial class MainWindow : Window
     private readonly Forms.NotifyIcon _trayIcon;
     private string _lastSavedConfigurationKey = string.Empty;
     private bool _hasShownTrayHint;
+    private bool _hasCheckedForUpdates;
 
     public MainWindow()
     {
@@ -51,6 +52,52 @@ public partial class MainWindow : Window
             Dispatcher.InvokeAsync(() => SetRunning(false));
         });
         LoadConfig();
+        Loaded += MainWindow_Loaded;
+    }
+
+    private async void MainWindow_Loaded(object sender, RoutedEventArgs e)
+    {
+        if (_hasCheckedForUpdates)
+        {
+            return;
+        }
+
+        _hasCheckedForUpdates = true;
+        await CheckForUpdatesAsync();
+    }
+
+    private async Task CheckForUpdatesAsync()
+    {
+        try
+        {
+            var result = await UpdateChecker.CheckAsync(AppendLog);
+            if (result.CheckFailed)
+            {
+                MessageBox.Show(
+                    this,
+                    $"{result.ErrorMessage}\n\n这不会影响当前版本继续使用。",
+                    "ProxiFyre 更新检查失败",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Information);
+                return;
+            }
+
+            if (!result.HasUpdate)
+            {
+                return;
+            }
+
+            MessageBox.Show(
+                this,
+                $"发现新版本 {result.LatestVersion}。\n当前版本：{result.CurrentVersion}\n\n请从仓库获取最新源码或构建产物。",
+                "ProxiFyre 更新提示",
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"Update check failed: {ex.Message}");
+        }
     }
 
     private void ClearCoreLog()

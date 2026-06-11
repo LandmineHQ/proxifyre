@@ -28,5 +28,6 @@
     <None Remove="Assets\AppIcon.ico" />
     <Resource Include="Assets\AppIcon.ico" />
     <Compile Include="..\Shared\LicenseKey.cs" Link="Shared\LicenseKey.cs" />
+    <Content Include="..\..\manifest.json" Link="manifest.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>
