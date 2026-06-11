@@ -6,8 +6,8 @@ The current implementation is direct mode only:
 
 - Add applications by executable name, full executable path, or install directory.
 - Intercept matching traffic with WinpkFilter.
-- Redirect the selected application's packets into the C# process.
-- Re-send the traffic directly from `ProxiFyre.exe` to the original destination.
+- Forward selected traffic from the C# relay core to the original destination.
+- Inject responses back to the selected application without opening local TCP or UDP listener ports.
 - Configure the core process name used for self-exclusion. The default is `steamwebhelper.exe`.
 
 Implemented protocols:
@@ -169,4 +169,4 @@ Matching rules:
 - IPv6 extension headers are parsed for hop-by-hop, routing, and destination options. Fragmented packets are passed through.
 - TCP ownership is resolved from the Windows TCP owner table. A brand-new connection may pass through normally if Windows has not published ownership for the first packet yet.
 - UDP ownership is resolved from the Windows UDP owner table by local endpoint, with wildcard-bind fallback.
-- Windows Firewall may require an allow rule for `ProxiFyre.exe`, because redirected traffic is delivered to local TCP and UDP listeners inside the process.
+- The relay core does not open local TCP or UDP listener ports. It still creates outbound sockets to the original destination, so firewall prompts should be limited to normal outbound network access.

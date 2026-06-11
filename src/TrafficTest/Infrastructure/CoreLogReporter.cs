@@ -53,7 +53,9 @@ internal static class CoreLogReporter
 
         var errorPatterns = new[]
         {
-            "DIRECT TCP failed",
+            "DIRECT TCP connect failed",
+            "DIRECT TCP send failed",
+            "DIRECT TCP remote receive failed",
             "copy failed",
             "DIRECT UDP send failed",
             "UDP relay remote receive failed",
@@ -65,17 +67,14 @@ internal static class CoreLogReporter
         var detailedPatterns = new[]
         {
             "TCP APP MATCH",
-            "REDIRECT TCP",
             "PASS RELAY TCP OUT",
             "PASS RELAY TCP IN",
-            "DIRECT TCP ACCEPT",
             "DIRECT TCP CONNECT",
             "DIRECT TCP SEND",
             "DIRECT TCP RECV",
-            "DIRECT TCP END",
             "RESTORE TCP RECV",
             "UDP APP MATCH",
-            "REDIRECT UDP",
+            "DIRECT UDP CAPTURE",
             "DIRECT UDP SEND",
             "DIRECT UDP RECV",
             "RESTORE UDP RECV"
@@ -116,12 +115,10 @@ internal static class CoreLogReporter
         return line.Contains("APP TCP CONNECT", StringComparison.Ordinal)
             || line.Contains("APP UDP CONNECT", StringComparison.Ordinal)
             || line.Contains("TCP APP MATCH", StringComparison.Ordinal)
-            || line.Contains("REDIRECT TCP", StringComparison.Ordinal)
             || line.Contains("RESTORE TCP", StringComparison.Ordinal)
             || line.Contains("PASS RELAY TCP", StringComparison.Ordinal)
             || line.Contains("DIRECT TCP", StringComparison.Ordinal)
             || line.Contains("UDP APP MATCH", StringComparison.Ordinal)
-            || line.Contains("REDIRECT UDP", StringComparison.Ordinal)
             || line.Contains("RESTORE UDP", StringComparison.Ordinal)
             || line.Contains("DIRECT UDP", StringComparison.Ordinal)
             || line.Contains("UDP relay", StringComparison.Ordinal)

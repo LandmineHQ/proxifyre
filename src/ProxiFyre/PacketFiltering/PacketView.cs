@@ -88,6 +88,12 @@ internal ref struct PacketView
 
     public byte TcpFlags => IsTcp ? _frame[TransportOffset + 13] : (byte)0;
 
+    public uint TcpSequenceNumber => IsTcp ? BinaryPrimitives.ReadUInt32BigEndian(_frame.Slice(TransportOffset + 4, 4)) : 0;
+
+    public uint TcpAcknowledgmentNumber => IsTcp ? BinaryPrimitives.ReadUInt32BigEndian(_frame.Slice(TransportOffset + 8, 4)) : 0;
+
+    public ushort TcpWindow => IsTcp ? BinaryPrimitives.ReadUInt16BigEndian(_frame.Slice(TransportOffset + 14, 2)) : (ushort)0;
+
     public int TcpHeaderLength => IsTcp ? (_frame[TransportOffset + 12] >> 4) * 4 : 0;
 
     public int TcpPayloadLength => IsTcp ? Math.Max(0, TransportLength - TcpHeaderLength) : 0;
@@ -102,7 +108,18 @@ internal ref struct PacketView
 
     public TcpClientKey ClientKey => new(SourceAddress, SourcePort);
 
-    public TcpClientKey DestinationClientKey => new(DestinationAddress, DestinationPort);
+    public ReadOnlySpan<byte> TcpPayload
+    {
+        get
+        {
+            if (!IsTcp || TcpPayloadLength <= 0)
+            {
+                return [];
+            }
+
+            return _frame.Slice(TransportOffset + TcpHeaderLength, TcpPayloadLength);
+        }
+    }
 
     public ReadOnlySpan<byte> UdpPayload
     {
@@ -135,14 +152,6 @@ internal ref struct PacketView
         };
     }
 
-    public void SwapEthernetAddresses()
-    {
-        for (var i = 0; i < 6; i++)
-        {
-            (_frame[i], _frame[6 + i]) = (_frame[6 + i], _frame[i]);
-        }
-    }
-
     public byte[] GetEthernetSource()
     {
         return _frame.Slice(6, 6).ToArray();
@@ -151,67 +160,6 @@ internal ref struct PacketView
     public byte[] GetEthernetDestination()
     {
         return _frame.Slice(0, 6).ToArray();
-    }
-
-    public void SwapIpAddresses()
-    {
-        var addressLength = AddressFamily == AddressFamily.InterNetwork ? 4 : 16;
-        for (var i = 0; i < addressLength; i++)
-        {
-            (_frame[_sourceAddressOffset + i], _frame[_destinationAddressOffset + i]) =
-                (_frame[_destinationAddressOffset + i], _frame[_sourceAddressOffset + i]);
-        }
-    }
-
-    public bool TryPrependUdpPayload(ReadOnlySpan<byte> prefix)
-    {
-        if (!IsUdp || prefix.Length == 0)
-        {
-            return false;
-        }
-
-        if (PacketLength + prefix.Length > _frame.Length)
-        {
-            return false;
-        }
-
-        var payloadOffset = TransportOffset + 8;
-        var payloadLength = TransportLength - 8;
-        _frame.Slice(payloadOffset, payloadLength).CopyTo(_frame.Slice(payloadOffset + prefix.Length, payloadLength));
-        prefix.CopyTo(_frame.Slice(payloadOffset, prefix.Length));
-
-        PacketLength += prefix.Length;
-        TransportLength += prefix.Length;
-        WritePacketLengths();
-        return true;
-    }
-
-    public bool TryRemoveUdpPayloadPrefix(int prefixLength)
-    {
-        if (!IsUdp || prefixLength <= 0 || TransportLength < 8 + prefixLength)
-        {
-            return false;
-        }
-
-        var payloadOffset = TransportOffset + 8;
-        var remainingPayloadLength = TransportLength - 8 - prefixLength;
-        _frame.Slice(payloadOffset + prefixLength, remainingPayloadLength)
-            .CopyTo(_frame.Slice(payloadOffset, remainingPayloadLength));
-
-        PacketLength -= prefixLength;
-        TransportLength -= prefixLength;
-        WritePacketLengths();
-        return true;
-    }
-
-    public void RecalculateChecksums()
-    {
-        if (AddressFamily == AddressFamily.InterNetwork)
-        {
-            RecalculateIpv4HeaderChecksum();
-        }
-
-        RecalculateTransportChecksum();
     }
 
     private static bool TryParseIpv4(Span<byte> frame, int packetLength, out PacketView packet)
@@ -384,92 +332,4 @@ internal ref struct PacketView
         address.GetAddressBytes().CopyTo(_frame.Slice(offset, AddressFamily == AddressFamily.InterNetwork ? 4 : 16));
     }
 
-    private void WritePacketLengths()
-    {
-        if (AddressFamily == AddressFamily.InterNetwork)
-        {
-            BinaryPrimitives.WriteUInt16BigEndian(_frame.Slice(IpOffset + 2, 2), (ushort)(PacketLength - EthernetHeaderLength));
-        }
-        else
-        {
-            BinaryPrimitives.WriteUInt16BigEndian(_frame.Slice(IpOffset + 4, 2), (ushort)(PacketLength - EthernetHeaderLength - 40));
-        }
-
-        if (IsUdp)
-        {
-            BinaryPrimitives.WriteUInt16BigEndian(_frame.Slice(TransportOffset + 4, 2), (ushort)TransportLength);
-        }
-    }
-
-    private void RecalculateIpv4HeaderChecksum()
-    {
-        _frame[IpOffset + 10] = 0;
-        _frame[IpOffset + 11] = 0;
-        var checksum = ComputeOnesComplement(_frame.Slice(IpOffset, IpHeaderLength));
-        BinaryPrimitives.WriteUInt16BigEndian(_frame.Slice(IpOffset + 10, 2), checksum);
-    }
-
-    private void RecalculateTransportChecksum()
-    {
-        var checksumOffset = IsTcp ? TransportOffset + 16 : TransportOffset + 6;
-        _frame[checksumOffset] = 0;
-        _frame[checksumOffset + 1] = 0;
-
-        uint sum = 0;
-        if (AddressFamily == AddressFamily.InterNetwork)
-        {
-            sum = AddBytes(sum, _frame.Slice(_sourceAddressOffset, 4));
-            sum = AddBytes(sum, _frame.Slice(_destinationAddressOffset, 4));
-            sum += Protocol;
-            sum += (uint)TransportLength;
-        }
-        else
-        {
-            sum = AddBytes(sum, _frame.Slice(_sourceAddressOffset, 16));
-            sum = AddBytes(sum, _frame.Slice(_destinationAddressOffset, 16));
-            sum += (uint)(TransportLength >> 16);
-            sum += (uint)(TransportLength & 0xFFFF);
-            sum += Protocol;
-        }
-
-        sum = AddBytes(sum, _frame.Slice(TransportOffset, TransportLength));
-        var checksum = FoldChecksum(sum);
-        if (IsUdp && checksum == 0)
-        {
-            checksum = 0xFFFF;
-        }
-
-        BinaryPrimitives.WriteUInt16BigEndian(_frame.Slice(checksumOffset, 2), checksum);
-    }
-
-    private static ushort ComputeOnesComplement(ReadOnlySpan<byte> data)
-    {
-        return FoldChecksum(AddBytes(0, data));
-    }
-
-    private static uint AddBytes(uint sum, ReadOnlySpan<byte> data)
-    {
-        var i = 0;
-        for (; i + 1 < data.Length; i += 2)
-        {
-            sum += BinaryPrimitives.ReadUInt16BigEndian(data.Slice(i, 2));
-        }
-
-        if (i < data.Length)
-        {
-            sum += (uint)(data[i] << 8);
-        }
-
-        return sum;
-    }
-
-    private static ushort FoldChecksum(uint sum)
-    {
-        while ((sum >> 16) != 0)
-        {
-            sum = (sum & 0xFFFF) + (sum >> 16);
-        }
-
-        return (ushort)~sum;
-    }
 }
