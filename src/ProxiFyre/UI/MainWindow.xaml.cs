@@ -6,12 +6,14 @@ using System.IO;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Windows;
+using System.Windows.Controls;
 using System.Windows.Data;
 using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using Microsoft.Win32;
+using Forms = System.Windows.Forms;
 
 namespace ProxiFyre;
 
@@ -26,11 +28,14 @@ public partial class MainWindow : Window
     private readonly ObservableCollection<string> _logs = [];
     private readonly string _configPath = Path.Combine(AppContext.BaseDirectory, "app-config.json");
     private readonly CoreProcessHost _coreProcessHost;
+    private readonly Forms.NotifyIcon _trayIcon;
     private string _lastSavedConfigurationKey = string.Empty;
+    private bool _hasShownTrayHint;
 
     public MainWindow()
     {
         InitializeComponent();
+        _trayIcon = CreateTrayIcon();
         _appsView = CollectionViewSource.GetDefaultView(_apps);
         _appsView.Filter = FilterApp;
         _appsView.SortDescriptions.Add(new SortDescription(nameof(ConfiguredApplication.Kind), ListSortDirection.Ascending));
@@ -122,7 +127,7 @@ public partial class MainWindow : Window
         var dialog = new OpenFileDialog
         {
             Filter = "Executable (*.exe)|*.exe|All files (*.*)|*.*",
-            Title = "Select application"
+            Title = "选择应用"
         };
 
         if (dialog.ShowDialog(this) == true)
@@ -131,17 +136,47 @@ public partial class MainWindow : Window
         }
     }
 
-    private void RemoveSelectedAppButton_Click(object sender, RoutedEventArgs e)
+    private void BrowseDirectoryButton_Click(object sender, RoutedEventArgs e)
     {
-        if (AppsList.SelectedItem is not ConfiguredApplication selected)
+        var dialog = new OpenFolderDialog
+        {
+            Title = "选择目录"
+        };
+
+        if (dialog.ShowDialog(this) == true)
+        {
+            AddBrowsedDirectory(dialog.FolderName);
+        }
+    }
+
+    private void EditAppButton_Click(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.DataContext is not ConfiguredApplication selected)
         {
             return;
         }
 
-        _apps.Remove(selected);
-        var saved = SaveConfig();
-        AppendLog($"Removed {selected.Value}");
-        AppendHotReloadHint(saved);
+        if (selected.Kind == AppRuleKind.ExecutablePath)
+        {
+            ReselectApplicationPath(selected);
+            return;
+        }
+
+        if (selected.Kind == AppRuleKind.DirectoryPath)
+        {
+            ReselectDirectory(selected);
+            return;
+        }
+
+        EditCustomRule(selected);
+    }
+
+    private void RemoveAppButton_Click(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.DataContext is ConfiguredApplication selected)
+        {
+            RemoveApplication(selected);
+        }
     }
 
     private void ReloadButton_Click(object sender, RoutedEventArgs e)
@@ -187,26 +222,36 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (TryCreateBrowsedApplication(value, out var app) && File.Exists(app.FilePath))
-        {
-            AddBrowsedApplication(app.FilePath);
-            return;
-        }
-
-        if (ContainsApp(value))
+        if (!TryCreateApplicationFromInput(value, out var app))
         {
             return;
         }
 
-        _apps.Add(ConfiguredApplication.CreateRule(value));
+        if (ContainsApp(app.Value))
+        {
+            ShowDuplicateRuleMessage(app.Value);
+            return;
+        }
+
+        _apps.Add(app);
         var saved = SaveConfig();
-        AppendLog($"Added {value}");
+        AppendLog($"Added {app.Value}");
         AppendHotReloadHint(saved);
     }
 
     private void AddLoadedApp(string value)
     {
-        if (TryCreateBrowsedApplication(value, out var app) && File.Exists(app.FilePath))
+        if (TryCreateBrowsedApplication(value, out var app))
+        {
+            if (!ContainsApp(app.Value))
+            {
+                _apps.Add(app);
+            }
+
+            return;
+        }
+
+        if (TryCreateDirectoryApplication(value, out app))
         {
             if (!ContainsApp(app.Value))
             {
@@ -232,12 +277,33 @@ public partial class MainWindow : Window
 
         if (ContainsApp(app.FilePath))
         {
+            ShowDuplicateRuleMessage(app.FilePath);
             return;
         }
 
         _apps.Add(app);
         var saved = SaveConfig();
         AppendLog($"Added {app.FilePath}");
+        AppendHotReloadHint(saved);
+    }
+
+    private void AddBrowsedDirectory(string directoryPath)
+    {
+        if (!TryCreateDirectoryApplication(directoryPath, out var app))
+        {
+            AppendLog($"Invalid directory path: {directoryPath}");
+            return;
+        }
+
+        if (ContainsApp(app.Value))
+        {
+            ShowDuplicateRuleMessage(app.Value);
+            return;
+        }
+
+        _apps.Add(app);
+        var saved = SaveConfig();
+        AppendLog($"Added {app.Value}");
         AppendHotReloadHint(saved);
     }
 
@@ -248,7 +314,7 @@ public partial class MainWindow : Window
         AppendCoreProcessNameHintIfRunning(saved);
     }
 
-    private void CoreProcessNameInput_KeyDown(object sender, KeyEventArgs e)
+    private void CoreProcessNameInput_KeyDown(object sender, System.Windows.Input.KeyEventArgs e)
     {
         if (e.Key != Key.Enter)
         {
@@ -280,7 +346,14 @@ public partial class MainWindow : Window
 
     private bool ContainsApp(string value)
     {
-        return _apps.Any(app => string.Equals(app.Value, value, StringComparison.OrdinalIgnoreCase));
+        return ContainsApp(value, except: null);
+    }
+
+    private bool ContainsApp(string value, ConfiguredApplication? except)
+    {
+        return _apps.Any(app =>
+            !ReferenceEquals(app, except)
+            && string.Equals(app.Value, value, StringComparison.OrdinalIgnoreCase));
     }
 
     private IEnumerable<string> BuildApps()
@@ -317,6 +390,154 @@ public partial class MainWindow : Window
             fullPath,
             IconLoader.ExtractIcon(fullPath));
         return true;
+    }
+
+    private static bool TryCreateApplicationFromInput(string value, out ConfiguredApplication app)
+    {
+        app = default!;
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        var trimmed = value.Trim();
+        if (TryCreateBrowsedApplication(trimmed, out app))
+        {
+            return true;
+        }
+
+        if (TryCreateDirectoryApplication(trimmed, out app))
+        {
+            return true;
+        }
+
+        app = ConfiguredApplication.CreateRule(trimmed);
+        return true;
+    }
+
+    private static bool TryCreateDirectoryApplication(string value, out ConfiguredApplication app)
+    {
+        app = default!;
+        if (!ProcessMatcher.TryNormalizeDirectoryPattern(value, out var directoryPath))
+        {
+            return false;
+        }
+
+        app = ConfiguredApplication.CreateDirectory(directoryPath);
+        return true;
+    }
+
+    private void ReselectApplicationPath(ConfiguredApplication selected)
+    {
+        var dialog = new OpenFileDialog
+        {
+            Filter = "Executable (*.exe)|*.exe|All files (*.*)|*.*",
+            Title = "重选应用"
+        };
+
+        var directory = Path.GetDirectoryName(selected.FilePath);
+        if (!string.IsNullOrWhiteSpace(directory) && Directory.Exists(directory))
+        {
+            dialog.InitialDirectory = directory;
+        }
+
+        if (dialog.ShowDialog(this) != true)
+        {
+            return;
+        }
+
+        if (!TryCreateBrowsedApplication(dialog.FileName, out var replacement))
+        {
+            AppendLog($"Invalid application path: {dialog.FileName}");
+            return;
+        }
+
+        ReplaceApplication(selected, replacement);
+    }
+
+    private void ReselectDirectory(ConfiguredApplication selected)
+    {
+        var dialog = new OpenFolderDialog
+        {
+            Title = "重选目录"
+        };
+
+        if (Directory.Exists(selected.DirectoryPath))
+        {
+            dialog.InitialDirectory = selected.DirectoryPath;
+        }
+
+        if (dialog.ShowDialog(this) != true)
+        {
+            return;
+        }
+
+        if (!TryCreateDirectoryApplication(dialog.FolderName, out var replacement))
+        {
+            AppendLog($"Invalid directory path: {dialog.FolderName}");
+            return;
+        }
+
+        ReplaceApplication(selected, replacement);
+    }
+
+    private void EditCustomRule(ConfiguredApplication selected)
+    {
+        var updatedValue = RuleEditDialog.Show(this, selected.Value);
+        if (updatedValue is null)
+        {
+            return;
+        }
+
+        if (!TryCreateApplicationFromInput(updatedValue, out var replacement))
+        {
+            return;
+        }
+
+        ReplaceApplication(selected, replacement);
+    }
+
+    private void ReplaceApplication(ConfiguredApplication selected, ConfiguredApplication replacement)
+    {
+        if (string.Equals(selected.Value, replacement.Value, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        if (ContainsApp(replacement.Value, selected))
+        {
+            ShowDuplicateRuleMessage(replacement.Value);
+            return;
+        }
+
+        var index = _apps.IndexOf(selected);
+        if (index < 0)
+        {
+            return;
+        }
+
+        _apps[index] = replacement;
+        _appsView.Refresh();
+        var saved = SaveConfig();
+        AppendLog($"Updated {selected.Value} -> {replacement.Value}");
+        AppendHotReloadHint(saved);
+    }
+
+    private void RemoveApplication(ConfiguredApplication selected)
+    {
+        if (!_apps.Remove(selected))
+        {
+            return;
+        }
+
+        var saved = SaveConfig();
+        AppendLog($"Removed {selected.Value}");
+        AppendHotReloadHint(saved);
+    }
+
+    private void ShowDuplicateRuleMessage(string value)
+    {
+        MessageBox.Show(this, $"规则已存在：{value}", "ProxiFyre", MessageBoxButton.OK, MessageBoxImage.Information);
     }
 
     private void SearchBox_TextChanged(object sender, System.Windows.Controls.TextChangedEventArgs e)
@@ -429,10 +650,71 @@ public partial class MainWindow : Window
             : $"{value:0.0} {units[unit]}";
     }
 
+    protected override void OnStateChanged(EventArgs e)
+    {
+        base.OnStateChanged(e);
+        if (WindowState == WindowState.Minimized)
+        {
+            MinimizeToTray();
+        }
+    }
+
     protected override void OnClosed(EventArgs e)
     {
+        _trayIcon.Visible = false;
+        _trayIcon.Dispose();
         _coreProcessHost.Dispose();
         base.OnClosed(e);
+    }
+
+    private Forms.NotifyIcon CreateTrayIcon()
+    {
+        var menu = new Forms.ContextMenuStrip();
+        menu.Items.Add("显示窗口", null, (_, _) => Dispatcher.Invoke(RestoreFromTray));
+        menu.Items.Add("退出", null, (_, _) => Dispatcher.Invoke(Close));
+
+        var trayIcon = new Forms.NotifyIcon
+        {
+            Icon = LoadTrayIcon(),
+            Text = "ProxiFyre Direct Relay",
+            ContextMenuStrip = menu,
+            Visible = false
+        };
+        trayIcon.DoubleClick += (_, _) => Dispatcher.Invoke(RestoreFromTray);
+        return trayIcon;
+    }
+
+    private static System.Drawing.Icon LoadTrayIcon()
+    {
+        var resource = System.Windows.Application.GetResourceStream(new Uri("pack://application:,,,/Assets/AppIcon.ico", UriKind.Absolute));
+        if (resource?.Stream is not null)
+        {
+            using var stream = resource.Stream;
+            return new System.Drawing.Icon(stream);
+        }
+
+        return System.Drawing.SystemIcons.Application;
+    }
+
+    private void MinimizeToTray()
+    {
+        Hide();
+        ShowInTaskbar = false;
+        _trayIcon.Visible = true;
+        if (!_hasShownTrayHint)
+        {
+            _hasShownTrayHint = true;
+            _trayIcon.ShowBalloonTip(1200, "ProxiFyre", "已最小化到托盘。双击图标可恢复窗口。", Forms.ToolTipIcon.Info);
+        }
+    }
+
+    private void RestoreFromTray()
+    {
+        _trayIcon.Visible = false;
+        ShowInTaskbar = true;
+        Show();
+        WindowState = WindowState.Normal;
+        Activate();
     }
 
     private sealed record ConfiguredApplication(
@@ -444,9 +726,23 @@ public partial class MainWindow : Window
     {
         public string FilePath => Kind == AppRuleKind.ExecutablePath ? Value : string.Empty;
 
-        public string KindText => Kind == AppRuleKind.ExecutablePath ? "路径" : "规则";
+        public string DirectoryPath => Kind == AppRuleKind.DirectoryPath ? Value : string.Empty;
 
-        public string IconText => Kind == AppRuleKind.ExecutablePath ? string.Empty : "*";
+        public string KindText => Kind switch
+        {
+            AppRuleKind.ExecutablePath => "应用",
+            AppRuleKind.DirectoryPath => "目录",
+            _ => "规则"
+        };
+
+        public string PrimaryActionText => Kind == AppRuleKind.CustomRule ? "编辑" : "重选";
+
+        public string IconText => Kind switch
+        {
+            AppRuleKind.ExecutablePath => string.Empty,
+            AppRuleKind.DirectoryPath => "D",
+            _ => "*"
+        };
 
         public string SearchText => $"{Name} {Value} {Detail}";
 
@@ -458,6 +754,26 @@ public partial class MainWindow : Window
                 filePath,
                 AppRuleKind.ExecutablePath,
                 icon);
+        }
+
+        public static ConfiguredApplication CreateDirectory(string directoryPath)
+        {
+            var normalized = ProcessMatcher.TryNormalizeDirectoryPattern(directoryPath, out var normalizedDirectory)
+                ? normalizedDirectory
+                : directoryPath;
+            var trimmed = Path.TrimEndingDirectorySeparator(normalized);
+            var name = Path.GetFileName(trimmed);
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                name = normalized;
+            }
+
+            return new ConfiguredApplication(
+                name,
+                normalized,
+                normalized,
+                AppRuleKind.DirectoryPath,
+                null);
         }
 
         public static ConfiguredApplication CreateRule(string rule)
@@ -474,7 +790,8 @@ public partial class MainWindow : Window
     private enum AppRuleKind
     {
         ExecutablePath = 0,
-        CustomRule = 1
+        DirectoryPath = 1,
+        CustomRule = 2
     }
 
     private static class FuzzyMatcher
@@ -572,5 +889,130 @@ public partial class MainWindow : Window
         [DllImport("user32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool DestroyIcon(IntPtr hIcon);
+    }
+
+    private sealed class RuleEditDialog : Window
+    {
+        private readonly System.Windows.Controls.TextBox _input;
+
+        private RuleEditDialog(string currentValue)
+        {
+            Title = "编辑应用规则";
+            Owner = System.Windows.Application.Current.MainWindow;
+            Width = 460;
+            MinHeight = 210;
+            MinWidth = 420;
+            SizeToContent = SizeToContent.Height;
+            ResizeMode = ResizeMode.NoResize;
+            WindowStartupLocation = WindowStartupLocation.CenterOwner;
+            Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#F3F6FA"));
+
+            var root = new Grid
+            {
+                Margin = new Thickness(16)
+            };
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+            var label = new TextBlock
+            {
+                Text = "应用规则",
+                FontWeight = FontWeights.SemiBold,
+                Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#1F2937"))
+            };
+            root.Children.Add(label);
+
+            _input = new System.Windows.Controls.TextBox
+            {
+                Text = currentValue,
+                MinHeight = 32,
+                Margin = new Thickness(0, 8, 0, 6),
+                Padding = new Thickness(9, 5, 9, 5),
+                VerticalContentAlignment = VerticalAlignment.Center
+            };
+            _input.SelectAll();
+            _input.KeyDown += Input_KeyDown;
+            Grid.SetRow(_input, 1);
+            root.Children.Add(_input);
+
+            var hint = new TextBlock
+            {
+                Text = "例如 chrome.exe、完整 exe 路径，或目录路径。",
+                FontSize = 12,
+                Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#667085"))
+            };
+            Grid.SetRow(hint, 2);
+            root.Children.Add(hint);
+
+            var buttons = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                HorizontalAlignment = HorizontalAlignment.Right,
+                Margin = new Thickness(0, 14, 0, 0)
+            };
+
+            var cancel = new Button
+            {
+                Content = "取消",
+                MinWidth = 72,
+                Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#EEF2F7")),
+                Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#1F2937")),
+                Margin = new Thickness(0, 0, 8, 0)
+            };
+            cancel.Click += (_, _) => DialogResult = false;
+            buttons.Children.Add(cancel);
+
+            var confirm = new Button
+            {
+                Content = "保存",
+                MinWidth = 72,
+                Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#2563EB")),
+                Foreground = Brushes.White
+            };
+            confirm.Click += (_, _) => Confirm();
+            buttons.Children.Add(confirm);
+
+            Grid.SetRow(buttons, 3);
+            root.Children.Add(buttons);
+
+            Content = root;
+            Loaded += (_, _) => _input.Focus();
+        }
+
+        public string RuleText => _input.Text.Trim();
+
+        public static string? Show(Window owner, string currentValue)
+        {
+            var dialog = new RuleEditDialog(currentValue)
+            {
+                Owner = owner
+            };
+
+            return dialog.ShowDialog() == true
+                ? dialog.RuleText
+                : null;
+        }
+
+        private void Input_KeyDown(object sender, System.Windows.Input.KeyEventArgs e)
+        {
+            if (e.Key == Key.Enter)
+            {
+                e.Handled = true;
+                Confirm();
+            }
+        }
+
+        private void Confirm()
+        {
+            if (string.IsNullOrWhiteSpace(_input.Text))
+            {
+                MessageBox.Show(this, "请输入应用规则。", "ProxiFyre", MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
+            DialogResult = true;
+        }
     }
 }

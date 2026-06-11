@@ -10,6 +10,7 @@ internal static class WinpkFilterDependency
 {
     private const string InstallerFileName = "Windows.Packet.Filter.3.6.2.1.x64.msi";
     private const string DownloadUrl = "https://github.com/wiresock/ndisapi/releases/download/v3.6.2/Windows.Packet.Filter.3.6.2.1.x64.msi";
+    private const string GhProxyPrefix = "https://ghproxy.net/";
 
     public static async Task EnsureInstalledAsync(Action<string> log, CancellationToken cancellationToken = default)
     {
@@ -45,7 +46,46 @@ internal static class WinpkFilterDependency
             return filePath;
         }
 
-        log($"Downloading dependency: {url}");
+        var urls = new[] { url, GhProxyPrefix + url };
+        Exception? lastError = null;
+        for (var i = 0; i < urls.Length; i++)
+        {
+            var candidateUrl = urls[i];
+            var sourceName = i == 0 ? "GitHub" : "ghproxy";
+            try
+            {
+                await DownloadFileFromUrlAsync(candidateUrl, filePath, sourceName, log, cancellationToken).ConfigureAwait(false);
+                log($"Downloaded dependency: {filePath}");
+                return filePath;
+            }
+            catch (Exception ex) when (ex is HttpRequestException or IOException
+                || (ex is TaskCanceledException && !cancellationToken.IsCancellationRequested))
+            {
+                lastError = ex;
+                if (File.Exists(filePath))
+                {
+                    File.Delete(filePath);
+                }
+
+                log($"{sourceName} dependency download failed: {ex.Message}");
+                if (i + 1 < urls.Length)
+                {
+                    log("Retrying dependency download through ghproxy.");
+                }
+            }
+        }
+
+        throw new InvalidOperationException("Could not download WinpkFilter dependency.", lastError);
+    }
+
+    private static async Task DownloadFileFromUrlAsync(
+        string url,
+        string filePath,
+        string sourceName,
+        Action<string> log,
+        CancellationToken cancellationToken)
+    {
+        log($"Downloading dependency from {sourceName}: {url}");
         using var client = new HttpClient
         {
             Timeout = TimeSpan.FromMinutes(10)
@@ -78,13 +118,10 @@ internal static class WinpkFilterDependency
                 if (percent >= lastLoggedPercent + 10)
                 {
                     lastLoggedPercent = percent;
-                    log($"Dependency download progress: {percent}%");
+                    log($"Dependency download progress ({sourceName}): {percent}%");
                 }
             }
         }
-
-        log($"Downloaded dependency: {filePath}");
-        return filePath;
     }
 
     private static void InstallMsi(string installerPath, Action<string> log)

@@ -4,6 +4,7 @@
         Title="ProxiFyre Direct Relay" Height="660" Width="960"
         MinHeight="600" MinWidth="860"
         WindowStartupLocation="CenterScreen"
+        Icon="/Assets/AppIcon.ico"
         Background="#F3F6FA">
     <Window.Resources>
         <SolidColorBrush x:Key="PanelBrush" Color="#FFFFFF" />
@@ -111,6 +112,8 @@
                     <ColumnDefinition Width="Auto" />
                     <ColumnDefinition Width="6" />
                     <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="6" />
+                    <ColumnDefinition Width="Auto" />
                 </Grid.ColumnDefinitions>
 
                 <StackPanel Grid.Column="0">
@@ -123,12 +126,14 @@
 
                 <StackPanel Grid.Column="2">
                     <TextBlock Text="自定义规则" FontSize="12" Foreground="{StaticResource MutedTextBrush}" Margin="0,0,0,4" />
-                    <TextBox x:Name="AppInput" ToolTip="例如 chrome.exe，或完整 exe 路径" />
+                    <TextBox x:Name="AppInput" ToolTip="例如 chrome.exe、完整 exe 路径，或目录路径" />
                 </StackPanel>
 
                 <Button Grid.Column="4" Content="添加" Click="AddButton_Click" VerticalAlignment="Bottom"
                         Background="#2563EB" Foreground="White" />
-                <Button Grid.Column="6" Content="浏览..." Click="BrowseButton_Click" VerticalAlignment="Bottom"
+                <Button Grid.Column="6" Content="应用..." Click="BrowseButton_Click" VerticalAlignment="Bottom"
+                        Background="#EEF2F7" Foreground="#1F2937" />
+                <Button Grid.Column="8" Content="目录..." Click="BrowseDirectoryButton_Click" VerticalAlignment="Bottom"
                         Background="#EEF2F7" Foreground="#1F2937" />
             </Grid>
         </Border>
@@ -147,7 +152,6 @@
                                 <RowDefinition Height="Auto" />
                                 <RowDefinition Height="Auto" />
                                 <RowDefinition Height="*" />
-                                <RowDefinition Height="Auto" />
                             </Grid.RowDefinitions>
 
                             <Grid Margin="0,0,0,8">
@@ -178,51 +182,77 @@
                             </Grid>
 
                             <ListBox x:Name="AppsList" Grid.Row="2">
+                                <ListBox.ItemContainerStyle>
+                                    <Style TargetType="ListBoxItem">
+                                        <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                                        <Setter Property="Padding" Value="0" />
+                                    </Style>
+                                </ListBox.ItemContainerStyle>
                                 <ListBox.ItemTemplate>
                                     <DataTemplate>
                                         <Grid Margin="8,5">
                                             <Grid.ColumnDefinitions>
-                                                <ColumnDefinition Width="28" />
                                                 <ColumnDefinition Width="*" />
                                                 <ColumnDefinition Width="Auto" />
                                             </Grid.ColumnDefinitions>
 
-                                            <Border Width="24" Height="24" CornerRadius="4" Background="#EEF2F7" VerticalAlignment="Center">
-                                                <Grid>
-                                                    <Image Source="{Binding Icon}" Width="20" Height="20" Stretch="Uniform" />
-                                                    <TextBlock Text="{Binding IconText}"
-                                                               FontSize="15"
-                                                               FontWeight="SemiBold"
-                                                               Foreground="#667085"
-                                                               HorizontalAlignment="Center"
-                                                               VerticalAlignment="Center" />
-                                                </Grid>
-                                            </Border>
+                                            <Grid Grid.Column="0">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="28" />
+                                                    <ColumnDefinition Width="*" />
+                                                </Grid.ColumnDefinitions>
 
-                                            <StackPanel Grid.Column="1" Margin="8,0,0,0">
-                                                <TextBlock Text="{Binding Name}" FontWeight="SemiBold" Foreground="#1F2937" />
-                                                <TextBlock Text="{Binding Detail}" FontSize="11" Foreground="{StaticResource MutedTextBrush}"
-                                                           TextTrimming="CharacterEllipsis" />
+                                                <Border Width="24" Height="24" CornerRadius="4" Background="#EEF2F7" VerticalAlignment="Center">
+                                                    <Grid>
+                                                        <Image Source="{Binding Icon}" Width="20" Height="20" Stretch="Uniform" />
+                                                        <TextBlock Text="{Binding IconText}"
+                                                                   FontSize="15"
+                                                                   FontWeight="SemiBold"
+                                                                   Foreground="#667085"
+                                                                   HorizontalAlignment="Center"
+                                                                   VerticalAlignment="Center" />
+                                                    </Grid>
+                                                </Border>
+
+                                                <StackPanel Grid.Column="1" Margin="8,0,0,0">
+                                                    <StackPanel Orientation="Horizontal">
+                                                        <TextBlock Text="{Binding Name}" FontWeight="SemiBold" Foreground="#1F2937" />
+                                                        <Border Background="#EEF2F7"
+                                                                CornerRadius="4"
+                                                                Padding="5,2"
+                                                                VerticalAlignment="Center"
+                                                                Margin="8,0,0,0">
+                                                            <TextBlock Text="{Binding KindText}"
+                                                                       FontSize="10"
+                                                                       Foreground="#475467" />
+                                                        </Border>
+                                                    </StackPanel>
+                                                    <TextBlock Text="{Binding Detail}" FontSize="11" Foreground="{StaticResource MutedTextBrush}"
+                                                               TextTrimming="CharacterEllipsis" />
+                                                </StackPanel>
+                                            </Grid>
+
+                                            <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center" Margin="12,0,0,0">
+                                                <Button Content="{Binding PrimaryActionText}"
+                                                        Click="EditAppButton_Click"
+                                                        MinWidth="56"
+                                                        MinHeight="28"
+                                                        Padding="10,4"
+                                                        Background="#EEF2F7"
+                                                        Foreground="#1F2937"
+                                                        Margin="0,0,6,0" />
+                                                <Button Content="删除"
+                                                        Click="RemoveAppButton_Click"
+                                                        MinWidth="52"
+                                                        MinHeight="28"
+                                                        Padding="10,4"
+                                                        Background="#FEE4E2"
+                                                        Foreground="#B42318" />
                                             </StackPanel>
-
-                                            <Border Grid.Column="2"
-                                                    Background="#EEF2F7"
-                                                    CornerRadius="4"
-                                                    Padding="6,3"
-                                                    VerticalAlignment="Center"
-                                                    Margin="8,0,0,0">
-                                                <TextBlock Text="{Binding KindText}"
-                                                           FontSize="11"
-                                                           Foreground="#475467" />
-                                            </Border>
                                         </Grid>
                                     </DataTemplate>
                                 </ListBox.ItemTemplate>
                             </ListBox>
-
-                            <Button Grid.Row="3" Content="移除选中项" Click="RemoveSelectedAppButton_Click"
-                                    HorizontalAlignment="Right" Margin="0,8,0,0"
-                                    Background="#FEE4E2" Foreground="#B42318" />
                         </Grid>
                     </TabItem>
 

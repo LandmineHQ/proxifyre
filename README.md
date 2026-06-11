@@ -4,7 +4,7 @@ ProxiFyre is now a C#/.NET 10 WPF application with the UI and relay core in `src
 
 The current implementation is direct mode only:
 
-- Add applications by executable name or full path.
+- Add applications by executable name, full executable path, or install directory.
 - Intercept matching traffic with WinpkFilter.
 - Redirect the selected application's packets into the C# process.
 - Re-send the traffic directly from `ProxiFyre.exe` to the original destination.
@@ -81,7 +81,7 @@ Run without arguments to open the WPF UI:
 .\scripts\proxifyre.ps1 ui
 ```
 
-The UI stores its app list in `app-config.json` next to the built executable. Add an executable name such as `chrome.exe`, or browse to a full executable path, then start the direct relay from the window.
+The UI stores its app list in `app-config.json` next to the built executable. Add an executable name such as `chrome.exe`, browse to a full executable path, or browse to a directory, then start the direct relay from the window.
 
 ## CLI
 
@@ -133,7 +133,8 @@ Minimal shape:
   "coreProcessName": "steamwebhelper.exe",
   "apps": [
     "chrome.exe",
-    "C:\\Program Files\\SomeApp\\SomeApp.exe"
+    "C:\\Program Files\\SomeApp\\SomeApp.exe",
+    "C:\\Games\\SomeGame\\"
   ]
 }
 ```
@@ -158,7 +159,9 @@ The WPF executable is built as a Windows app, so launching the UI does not open 
 Matching rules:
 
 - A pattern without `/` or `\` matches the process executable name, case-insensitively.
-- A pattern with `/` or `\` matches the executable path, case-insensitively.
+- A full `.exe` path matches that executable path, case-insensitively.
+- A directory path with a trailing slash, or an existing directory path, matches processes under that directory by path prefix.
+- Other patterns containing `/` or `\` keep the legacy path-substring behavior.
 - `ProxiFyre.exe` excludes its own process traffic to avoid relay loops.
 
 ## Notes

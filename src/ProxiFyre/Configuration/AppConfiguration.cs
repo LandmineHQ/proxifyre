@@ -110,7 +110,7 @@ internal sealed class AppConfiguration
         var sample = new SampleConfiguration
         {
             CoreProcessName = DefaultCoreProcessName,
-            Apps = ["chrome.exe", @"C:\Program Files\SomeApp\SomeApp.exe"],
+            Apps = ["chrome.exe", @"C:\Program Files\SomeApp\SomeApp.exe", @"C:\Games\SomeGame\"],
             Proxies =
             [
                 new SampleProxy
