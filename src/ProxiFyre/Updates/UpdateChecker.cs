@@ -30,7 +30,7 @@ internal static class UpdateChecker
         var latestVersion = manifest.Version.Trim();
         if (VersionsEqual(CurrentVersion, latestVersion))
         {
-            return UpdateCheckResult.NoUpdate(CurrentVersion);
+            return UpdateCheckResult.NoUpdate(CurrentVersion, latestVersion, manifest.SourceUrl);
         }
 
         return UpdateCheckResult.UpdateAvailable(CurrentVersion, latestVersion, manifest.SourceUrl);
@@ -122,9 +122,9 @@ internal sealed record UpdateCheckResult(
     string? SourceUrl,
     string? ErrorMessage)
 {
-    public static UpdateCheckResult NoUpdate(string currentVersion)
+    public static UpdateCheckResult NoUpdate(string currentVersion, string? latestVersion = null, string? sourceUrl = null)
     {
-        return new UpdateCheckResult(false, false, currentVersion, null, null, null);
+        return new UpdateCheckResult(false, false, currentVersion, latestVersion, sourceUrl, null);
     }
 
     public static UpdateCheckResult UpdateAvailable(string currentVersion, string latestVersion, string? sourceUrl)

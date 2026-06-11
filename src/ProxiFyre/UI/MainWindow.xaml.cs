@@ -45,6 +45,7 @@ public partial class MainWindow : Window
         LogList.ItemsSource = _logs;
         ConfigPathText.Text = _configPath;
         CoreProcessNameInput.Text = AppConfiguration.DefaultCoreProcessName;
+        SetVersionStatusChecking();
         UpdateCoreProcessInfo();
         ClearCoreLog();
         _coreProcessHost = new CoreProcessHost(AppendLog, () =>
@@ -73,6 +74,7 @@ public partial class MainWindow : Window
             var result = await UpdateChecker.CheckAsync(AppendLog);
             if (result.CheckFailed)
             {
+                SetVersionStatusFailed();
                 MessageBox.Show(
                     this,
                     $"{result.ErrorMessage}\n\n这不会影响当前版本继续使用。",
@@ -84,9 +86,11 @@ public partial class MainWindow : Window
 
             if (!result.HasUpdate)
             {
+                SetVersionStatusRemote(result.LatestVersion ?? result.CurrentVersion, hasUpdate: false);
                 return;
             }
 
+            SetVersionStatusRemote(result.LatestVersion ?? "未知", hasUpdate: true);
             MessageBox.Show(
                 this,
                 $"发现新版本 {result.LatestVersion}。\n当前版本：{result.CurrentVersion}\n\n请从仓库获取最新源码或构建产物。",
@@ -98,6 +102,25 @@ public partial class MainWindow : Window
         {
             AppendLog($"Update check failed: {ex.Message}");
         }
+    }
+
+    private void SetVersionStatusChecking()
+    {
+        LocalVersionText.Text = UpdateChecker.CurrentVersion;
+        RemoteVersionText.Text = "检查中";
+        RemoteVersionText.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#667085"));
+    }
+
+    private void SetVersionStatusRemote(string version, bool hasUpdate)
+    {
+        RemoteVersionText.Text = version;
+        RemoteVersionText.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString(hasUpdate ? "#B54708" : "#067647"));
+    }
+
+    private void SetVersionStatusFailed()
+    {
+        RemoteVersionText.Text = "获取失败";
+        RemoteVersionText.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#C73535"));
     }
 
     private void ClearCoreLog()
