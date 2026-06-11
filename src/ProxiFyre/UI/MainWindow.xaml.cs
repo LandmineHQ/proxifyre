@@ -1,9 +1,11 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.InteropServices;
 using System.IO;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Windows;
 using System.Windows.Controls;
@@ -19,6 +21,8 @@ namespace ProxiFyre;
 
 public partial class MainWindow : Window
 {
+    private const string DefaultSourceUrl = "https://github.com/LandmineHQ/proxifyre";
+
     private static readonly Regex TrafficLinePattern = new(
         @"(?:^|\s)TRAFFIC up=(?<up>\d+) down=(?<down>\d+) upRate=(?<upRate>\d+) downRate=(?<downRate>\d+)",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
@@ -32,6 +36,8 @@ public partial class MainWindow : Window
     private string _lastSavedConfigurationKey = string.Empty;
     private bool _hasShownTrayHint;
     private bool _hasCheckedForUpdates;
+    private bool _isAnnouncementDismissed;
+    private string _sourceUrl = DefaultSourceUrl;
 
     public MainWindow()
     {
@@ -45,6 +51,7 @@ public partial class MainWindow : Window
         LogList.ItemsSource = _logs;
         ConfigPathText.Text = _configPath;
         CoreProcessNameInput.Text = AppConfiguration.DefaultCoreProcessName;
+        LoadLocalManifestInfo();
         SetVersionStatusChecking();
         UpdateCoreProcessInfo();
         ClearCoreLog();
@@ -86,10 +93,12 @@ public partial class MainWindow : Window
 
             if (!result.HasUpdate)
             {
+                ApplyManifestInfo(result.SourceUrl, result.Announcement);
                 SetVersionStatusRemote(result.LatestVersion ?? result.CurrentVersion, hasUpdate: false);
                 return;
             }
 
+            ApplyManifestInfo(result.SourceUrl, result.Announcement);
             SetVersionStatusRemote(result.LatestVersion ?? "未知", hasUpdate: true);
             MessageBox.Show(
                 this,
@@ -102,6 +111,86 @@ public partial class MainWindow : Window
         {
             AppendLog($"Update check failed: {ex.Message}");
         }
+    }
+
+    private void LoadLocalManifestInfo()
+    {
+        var manifestPath = Path.Combine(AppContext.BaseDirectory, "manifest.json");
+        if (!File.Exists(manifestPath))
+        {
+            return;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(File.ReadAllText(manifestPath, Encoding.UTF8));
+            var root = document.RootElement;
+            var sourceUrl = TryGetManifestString(root, "sourceUrl");
+            var announcement = TryGetManifestString(root, "announcement");
+            ApplyManifestInfo(sourceUrl, announcement);
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"Failed to load local manifest: {ex.Message}");
+        }
+    }
+
+    private static string? TryGetManifestString(JsonElement root, string propertyName)
+    {
+        return root.ValueKind == JsonValueKind.Object
+            && root.TryGetProperty(propertyName, out var value)
+            && value.ValueKind == JsonValueKind.String
+            ? value.GetString()
+            : null;
+    }
+
+    private void ApplyManifestInfo(string? sourceUrl, string? announcement)
+    {
+        var normalizedSourceUrl = NormalizeWebUrl(sourceUrl);
+        if (normalizedSourceUrl is not null)
+        {
+            _sourceUrl = normalizedSourceUrl;
+        }
+
+        if (announcement is not null)
+        {
+            SetAnnouncement(announcement);
+        }
+    }
+
+    private static string? NormalizeWebUrl(string? sourceUrl)
+    {
+        if (string.IsNullOrWhiteSpace(sourceUrl))
+        {
+            return null;
+        }
+
+        var trimmed = sourceUrl.Trim();
+        return Uri.TryCreate(trimmed, UriKind.Absolute, out var uri)
+            && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps)
+            ? uri.AbsoluteUri
+            : null;
+    }
+
+    private void SetAnnouncement(string? announcement)
+    {
+        var text = announcement?.Trim();
+        if (_isAnnouncementDismissed || string.IsNullOrWhiteSpace(text))
+        {
+            AnnouncementText.Text = string.Empty;
+            AnnouncementBorder.Visibility = Visibility.Collapsed;
+            return;
+        }
+
+        AnnouncementText.Text = text;
+        AnnouncementBorder.Visibility = Visibility.Visible;
+    }
+
+    private void CloseAnnouncementButton_Click(object sender, RoutedEventArgs e)
+    {
+        _isAnnouncementDismissed = true;
+        AnnouncementText.Text = string.Empty;
+        AnnouncementBorder.Visibility = Visibility.Collapsed;
     }
 
     private void SetVersionStatusChecking()
@@ -273,6 +362,22 @@ public partial class MainWindow : Window
     private void ReloadButton_Click(object sender, RoutedEventArgs e)
     {
         LoadConfig();
+    }
+
+    private void OpenSourceButton_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            Process.Start(new ProcessStartInfo(_sourceUrl)
+            {
+                UseShellExecute = true
+            });
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"Failed to open source URL: {ex.Message}");
+            MessageBox.Show(this, _sourceUrl, "GitHub", MessageBoxButton.OK, MessageBoxImage.Information);
+        }
     }
 
     private async void StartStopButton_Click(object sender, RoutedEventArgs e)

@@ -30,10 +30,10 @@ internal static class UpdateChecker
         var latestVersion = manifest.Version.Trim();
         if (VersionsEqual(CurrentVersion, latestVersion))
         {
-            return UpdateCheckResult.NoUpdate(CurrentVersion, latestVersion, manifest.SourceUrl);
+            return UpdateCheckResult.NoUpdate(CurrentVersion, latestVersion, manifest.SourceUrl, manifest.Announcement);
         }
 
-        return UpdateCheckResult.UpdateAvailable(CurrentVersion, latestVersion, manifest.SourceUrl);
+        return UpdateCheckResult.UpdateAvailable(CurrentVersion, latestVersion, manifest.SourceUrl, manifest.Announcement);
     }
 
     private static async Task<UpdateManifest?> FetchManifestAsync(Action<string>? log, CancellationToken cancellationToken)
@@ -111,6 +111,9 @@ internal static class UpdateChecker
 
         [JsonPropertyName("sourceUrl")]
         public string? SourceUrl { get; init; }
+
+        [JsonPropertyName("announcement")]
+        public string? Announcement { get; init; }
     }
 }
 
@@ -120,20 +123,21 @@ internal sealed record UpdateCheckResult(
     string CurrentVersion,
     string? LatestVersion,
     string? SourceUrl,
+    string? Announcement,
     string? ErrorMessage)
 {
-    public static UpdateCheckResult NoUpdate(string currentVersion, string? latestVersion = null, string? sourceUrl = null)
+    public static UpdateCheckResult NoUpdate(string currentVersion, string? latestVersion = null, string? sourceUrl = null, string? announcement = null)
     {
-        return new UpdateCheckResult(false, false, currentVersion, latestVersion, sourceUrl, null);
+        return new UpdateCheckResult(false, false, currentVersion, latestVersion, sourceUrl, announcement, null);
     }
 
-    public static UpdateCheckResult UpdateAvailable(string currentVersion, string latestVersion, string? sourceUrl)
+    public static UpdateCheckResult UpdateAvailable(string currentVersion, string latestVersion, string? sourceUrl, string? announcement = null)
     {
-        return new UpdateCheckResult(false, true, currentVersion, latestVersion, sourceUrl, null);
+        return new UpdateCheckResult(false, true, currentVersion, latestVersion, sourceUrl, announcement, null);
     }
 
     public static UpdateCheckResult Failed(string currentVersion, string errorMessage)
     {
-        return new UpdateCheckResult(true, false, currentVersion, null, null, errorMessage);
+        return new UpdateCheckResult(true, false, currentVersion, null, null, null, errorMessage);
     }
 }
