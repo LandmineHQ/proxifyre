@@ -24,10 +24,10 @@ Proxy mode and Windows service mode are intentionally not implemented yet.
 - Windows.
 - .NET 10 SDK or runtime.
 - WinpkFilter installed and running.
-- `ndisapi.dll` loadable by `ProxiFyre.exe` through the system path or placed next to the executable.
 - Administrator privileges, because the app opens the WinpkFilter driver and configures adapter tunnel mode.
 
 No C++ compiler or C++ build tools are required.
+No `ndisapi.dll` is required. The app installs/checks the WinpkFilter 3.6.2.1 MSI for the kernel driver and talks to the `NDISRD` device directly from C#.
 
 ## Layout
 
@@ -38,7 +38,7 @@ No C++ compiler or C++ build tools are required.
 ├── README.md
 ├── LICENSE
 └── src/
-    └── ProxiFyre/
+    ├── ProxiFyre/
         ├── Configuration/
         ├── Native/
         ├── Network/
@@ -46,6 +46,8 @@ No C++ compiler or C++ build tools are required.
         ├── Process/
         ├── Relay/
         └── UI/
+    └── TrafficTest/
+        └── Program.cs
 ```
 
 ## Build
@@ -88,6 +90,25 @@ Add one application:
 
 ```powershell
 .\proxifyre.ps1 add-app chrome.exe -Config .\app-config.json
+```
+
+## Focused traffic test
+
+Use the isolated curl test when browser traffic is too noisy to diagnose:
+
+```powershell
+.\proxifyre.ps1 test
+```
+
+The test starts a temporary `proxifyre-test-core.exe` and writes a narrow config for the current test mode. TCP curl modes only match `curl.exe`, disable curl proxy environment variables, and request a known target. IPv4 curl modes use Bing. The IPv6 curl mode uses `ipv6.test-ipv6.com`, because `www.bing.com` may not return an AAAA record on every resolver. UDP STUN modes only match `TrafficTest.exe` and send a STUN binding request to `stun.l.google.com:19302`.
+
+```powershell
+.\proxifyre.ps1 test curl-ipv4
+.\proxifyre.ps1 test curl-http-ipv4
+.\proxifyre.ps1 test curl-ipv6
+.\proxifyre.ps1 test stun-ipv4
+.\proxifyre.ps1 test stun-ipv6
+.\proxifyre.ps1 test curl-ipv4 -Detailed
 ```
 
 ## Configuration

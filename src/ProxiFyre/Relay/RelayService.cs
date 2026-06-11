@@ -1,3 +1,5 @@
+using System.Diagnostics;
+
 namespace ProxiFyre;
 
 internal sealed class RelayService : IDisposable, IAsyncDisposable
@@ -34,6 +36,7 @@ internal sealed class RelayService : IDisposable, IAsyncDisposable
 
         _log($"Configured core process name: {configuration.CoreProcessName}");
         _log($"Configured apps: {string.Join(", ", configuration.Apps)}");
+        _log($"Relay socket owner process: {Process.GetCurrentProcess().ProcessName}.exe pid={Environment.ProcessId}");
         _cts = CancellationTokenSource.CreateLinkedTokenSource(externalCancellationToken);
         _tcpRelay = new TcpDirectRelay(_log, _timeProvider);
         _udpRelay = new UdpDirectRelay(_log, _timeProvider);

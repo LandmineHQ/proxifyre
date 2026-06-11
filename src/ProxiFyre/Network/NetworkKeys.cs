@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Sockets;
 
 namespace ProxiFyre;
 
@@ -6,7 +7,17 @@ internal static class NetworkAddress
 {
     public static IPAddress Normalize(IPAddress address)
     {
-        return address.IsIPv4MappedToIPv6 ? address.MapToIPv4() : address;
+        if (address.IsIPv4MappedToIPv6)
+        {
+            return address.MapToIPv4();
+        }
+
+        if (address.AddressFamily == AddressFamily.InterNetworkV6 && address.ScopeId != 0)
+        {
+            return new IPAddress(address.GetAddressBytes());
+        }
+
+        return address;
     }
 }
 
@@ -79,7 +90,42 @@ internal readonly record struct TcpClientKey
     public ushort ClientPort { get; }
 }
 
-internal sealed record DirectRelayTarget(IPAddress RemoteAddress, ushort RemotePort, DateTimeOffset CreatedAt)
+internal readonly record struct TcpRelayKey
 {
+    public TcpRelayKey(IPAddress remoteAddress, ushort clientPort, ushort remotePort)
+    {
+        RemoteAddress = NetworkAddress.Normalize(remoteAddress);
+        ClientPort = clientPort;
+        RemotePort = remotePort;
+    }
+
+    public IPAddress RemoteAddress { get; }
+
+    public ushort ClientPort { get; }
+
+    public ushort RemotePort { get; }
+}
+
+internal sealed record DirectRelayTarget(
+    IPAddress RemoteAddress,
+    ushort RemotePort,
+    DateTimeOffset CreatedAt,
+    int ProcessId = 0,
+    string ProcessName = "",
+    string ProcessPath = "",
+    string MatchedPattern = "",
+    IPAddress? ClientAddress = null,
+    ushort ClientPort = 0)
+{
+    public string AppLabel => ProcessId > 0
+        ? $"{ProcessName} pid={ProcessId} pattern={MatchedPattern}"
+        : "unknown-app";
+
+    public string RemoteEndpoint => $"{NetworkAddress.Normalize(RemoteAddress)}:{RemotePort}";
+
+    public string ClientEndpoint => ClientAddress is null
+        ? "unknown-client"
+        : $"{NetworkAddress.Normalize(ClientAddress)}:{ClientPort}";
+
     public override string ToString() => $"{NetworkAddress.Normalize(RemoteAddress)}:{RemotePort}";
 }

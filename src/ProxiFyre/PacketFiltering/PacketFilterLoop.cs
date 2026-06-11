@@ -17,6 +17,10 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
     private readonly Action<string> _log;
     private readonly TimeProvider _timeProvider;
     private readonly Dictionary<string, DateTimeOffset> _detailLogTimes = [];
+    private DateTimeOffset _lastPacketStatsLog;
+    private long _packetsRead;
+    private long _packetsPassed;
+    private long _packetsRedirected;
     private IntPtr _driverHandle;
     private bool _disposed;
 
@@ -27,9 +31,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         _udpRelay = udpRelay;
         _log = log ?? Console.WriteLine;
         _timeProvider = timeProvider ?? TimeProvider.System;
-        _processLookup = new ProcessLookup(
-            message => LogDetail(message, message, TimeSpan.FromSeconds(10)),
-            _timeProvider);
+        _processLookup = new ProcessLookup(timeProvider: _timeProvider);
     }
 
     public Task RunAsync(CancellationToken cancellationToken)
@@ -54,16 +56,29 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
 
             while (!cancellationToken.IsCancellationRequested)
             {
-                packetEvent.WaitOne(TimeSpan.FromMilliseconds(250));
+                var signaled = packetEvent.WaitOne(TimeSpan.FromMilliseconds(250));
                 packetEvent.Reset();
 
                 bool drainedAny;
+                var drainedCount = 0;
                 do
                 {
                     cancellationToken.ThrowIfCancellationRequested();
                     drainedAny = TryReadAndProcessPacket();
+                    if (drainedAny)
+                    {
+                        drainedCount++;
+                    }
                 }
                 while (drainedAny);
+
+                if (signaled && drainedCount == 0)
+                {
+                    LogDetail(
+                        $"Packet event was signaled, but no packets were read. Last Win32 error: {NdisApi.LastWin32Error}",
+                        "packet-event-empty",
+                        TimeSpan.FromSeconds(5));
+                }
             }
         }
         finally
@@ -80,7 +95,8 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         _driverHandle = NdisApi.OpenFilterDriver("NDISRD");
         if (_driverHandle == IntPtr.Zero)
         {
-            throw new InvalidOperationException("Failed to open WinpkFilter driver.");
+            var error = NdisApi.LastWin32Error;
+            throw new InvalidOperationException($"Failed to open WinpkFilter driver NDISRD. Win32 error {error}: {new System.ComponentModel.Win32Exception(error).Message}");
         }
 
         if (!NdisApi.IsDriverLoaded(_driverHandle))
@@ -130,23 +146,34 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
 
     private bool TryReadAndProcessPacket()
     {
-        var buffer = default(NdisApi.IntermediateBuffer);
-        var packets = stackalloc IntPtr[1];
-        packets[0] = (IntPtr)(&buffer);
-
-        if (!NdisApi.ReadPacketsUnsorted(_driverHandle, packets, 1, out var packetsRead) || packetsRead == 0)
+        foreach (var adapter in _adapters)
         {
-            return false;
+            var buffer = default(NdisApi.IntermediateBuffer);
+            var request = new NdisApi.EthRequest
+            {
+                AdapterHandle = adapter,
+                Buffer = (IntPtr)(&buffer)
+            };
+
+            if (!NdisApi.ReadPacket(_driverHandle, ref request))
+            {
+                continue;
+            }
+
+            buffer.AdapterOrListFlink = adapter;
+            ProcessPacket(&buffer);
+            return true;
         }
 
-        ProcessPacket(&buffer);
-        return true;
+        return false;
     }
 
     private void ProcessPacket(NdisApi.IntermediateBuffer* buffer)
     {
+        _packetsRead++;
+
         var length = checked((int)Math.Min(buffer->Length, NdisApi.MaxEtherFrame));
-        var frame = new Span<byte>(buffer->Data, length);
+        var frame = new Span<byte>(buffer->Data, NdisApi.MaxEtherFrame);
 
         if (!PacketView.TryParse(frame, length, out var packet))
         {
@@ -209,38 +236,34 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             return;
         }
 
-        var relayKey = new TcpClientKey(packet.DestinationAddress, packet.SourcePort);
-            if (_tcpRelay.HasTarget(relayKey))
-            {
-                _tcpRelay.Refresh(relayKey);
-                LogDetail($"TCP EXISTING TARGET {packet.Session} relayPort={_tcpRelay.Port}", $"tcp-existing:{relayKey.ClientAddress}:{relayKey.ClientPort}", TimeSpan.FromSeconds(10));
-                RedirectTcpClientToRelay(buffer, packet);
-                Revert(buffer);
-                return;
-            }
-
-        var process = _processLookup.LookupTcpOwner(packet.Session);
-        if (process is null)
+        var relayKey = new TcpRelayKey(packet.DestinationAddress, packet.SourcePort, packet.DestinationPort);
+        if (_tcpRelay.IsRelayOutboundFlow(relayKey))
         {
-            if (packet.IsSynOnly)
-            {
-                LogDetail($"TCP OWNER MISS {packet.Session}", $"tcp-owner-miss:{packet.Session}", TimeSpan.FromSeconds(2));
-            }
-
+            LogDetail(
+                $"PASS RELAY TCP OUT flags={FormatTcpFlags(packet.TcpFlags)} payload={packet.TcpPayloadLength} flow={packet.SourceAddress}:{packet.SourcePort} -> {packet.DestinationAddress}:{packet.DestinationPort}",
+                $"tcp-relay-out:{packet.SourceAddress}:{packet.SourcePort}:{packet.DestinationAddress}:{packet.DestinationPort}:{packet.TcpFlags}:{packet.TcpPayloadLength > 0}",
+                packet.TcpPayloadLength > 0 ? TimeSpan.Zero : TimeSpan.FromSeconds(2));
             Pass(buffer);
             return;
         }
 
-        if (!_configuration.TryGetMatchingPattern(process, out var matchedPattern, out var matchMissReason))
+        if (_tcpRelay.TryGetTarget(relayKey, out var existingTarget))
         {
-            if (packet.IsSynOnly)
-            {
-                LogDetail(
-                    $"TCP APP MISS {packet.Session} pid={process.ProcessId} name={process.Name} path={process.Path} reason={matchMissReason}",
-                    $"tcp-app-miss:{process.ProcessId}:{packet.DestinationAddress}:{packet.DestinationPort}",
-                    TimeSpan.FromSeconds(10));
-            }
+            _tcpRelay.Refresh(relayKey);
+            RedirectTcpClientToRelay(buffer, packet, existingTarget);
+            Revert(buffer);
+            return;
+        }
 
+        var process = LookupTcpOwner(packet);
+        if (process is null)
+        {
+            Pass(buffer);
+            return;
+        }
+
+        if (!_configuration.TryGetMatchingPattern(process, out var matchedPattern, out _))
+        {
             Pass(buffer);
             return;
         }
@@ -251,8 +274,10 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 $"TCP APP MATCH {packet.Session} pid={process.ProcessId} name={process.Name} path={process.Path} pattern={matchedPattern}",
                 $"tcp-app-match:{process.ProcessId}:{packet.DestinationAddress}:{packet.DestinationPort}",
                 TimeSpan.FromSeconds(2));
-            _tcpRelay.Register(relayKey, packet.DestinationAddress, packet.DestinationPort);
-            RedirectTcpClientToRelay(buffer, packet);
+            var target = CreateTarget(packet, process, matchedPattern);
+            var clientKey = new TcpClientKey(packet.DestinationAddress, packet.SourcePort);
+            _tcpRelay.Register(relayKey, clientKey, target);
+            RedirectTcpClientToRelay(buffer, packet, target);
             Revert(buffer);
             return;
         }
@@ -268,22 +293,36 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             return;
         }
 
+        var relayKey = new TcpRelayKey(packet.SourceAddress, packet.DestinationPort, packet.SourcePort);
+        if (_tcpRelay.IsRelayOutboundFlow(relayKey))
+        {
+            LogDetail(
+                $"PASS RELAY TCP IN flags={FormatTcpFlags(packet.TcpFlags)} payload={packet.TcpPayloadLength} flow={packet.SourceAddress}:{packet.SourcePort} -> {packet.DestinationAddress}:{packet.DestinationPort}",
+                $"tcp-relay-in:{packet.SourceAddress}:{packet.SourcePort}:{packet.DestinationAddress}:{packet.DestinationPort}:{packet.TcpFlags}:{packet.TcpPayloadLength > 0}",
+                packet.TcpPayloadLength > 0 ? TimeSpan.Zero : TimeSpan.FromSeconds(2));
+        }
+
         Pass(buffer);
     }
 
-    private void RedirectTcpClientToRelay(NdisApi.IntermediateBuffer* buffer, PacketView packet)
+    private void RedirectTcpClientToRelay(NdisApi.IntermediateBuffer* buffer, PacketView packet, DirectRelayTarget target)
     {
-        var originalRemote = new DirectRelayTarget(packet.DestinationAddress, packet.DestinationPort, _timeProvider.GetUtcNow());
         packet.SwapEthernetAddresses();
         packet.SwapIpAddresses();
         packet.DestinationPort = _tcpRelay.Port;
         packet.RecalculateChecksums();
         buffer->Length = (uint)packet.PacketLength;
 
-        if (packet.IsSynOnly)
+        if (packet.IsSynOnly || packet.TcpPayloadLength > 0 || packet.IsClosing)
         {
-            _log($"REDIRECT TCP {packet.DestinationAddress}:{packet.SourcePort} -> {originalRemote}");
+            LogDetail(
+                $"REDIRECT TCP flags={FormatTcpFlags(packet.TcpFlags)} payload={packet.TcpPayloadLength} app={target.AppLabel} appLocal={target.ClientEndpoint} client={packet.DestinationAddress}:{packet.SourcePort} target={target.RemoteEndpoint}",
+                $"tcp-redirect:{target.ProcessId}:{target.ClientEndpoint}:{target.RemoteEndpoint}:{packet.TcpFlags}:{packet.TcpPayloadLength > 0}",
+                packet.TcpPayloadLength > 0 ? TimeSpan.Zero : TimeSpan.FromSeconds(2));
         }
+
+        _packetsRedirected++;
+        LogPacketStats();
     }
 
     private bool TryRestoreTcpServerToClient(NdisApi.IntermediateBuffer* buffer, PacketView packet)
@@ -291,10 +330,13 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         var key = packet.DestinationClientKey;
         if (!_tcpRelay.TryGetTarget(key, out var target))
         {
-            LogDetail($"TCP RESTORE MISS key={key.ClientAddress}:{key.ClientPort} packet={packet.Session}", $"tcp-restore-miss:{key.ClientAddress}:{key.ClientPort}", TimeSpan.FromSeconds(5));
             return false;
         }
 
+        LogDetail(
+            $"RESTORE TCP RECV flags={FormatTcpFlags(packet.TcpFlags)} payload={packet.TcpPayloadLength} app={target.AppLabel} appLocal={target.ClientEndpoint} from={target.RemoteEndpoint} relayLocalPort={_tcpRelay.Port} packetLen={packet.PacketLength}",
+            $"tcp-restore:{target.ProcessId}:{target.ClientEndpoint}:{target.RemoteEndpoint}:{packet.TcpFlags}:{packet.TcpPayloadLength > 0}",
+            packet.TcpPayloadLength > 0 ? TimeSpan.Zero : TimeSpan.FromSeconds(2));
         packet.SourcePort = target.RemotePort;
         packet.SwapEthernetAddresses();
         packet.SwapIpAddresses();
@@ -321,12 +363,17 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             return;
         }
 
+        if (_udpRelay.IsRelayOutboundEndpoint(packet.UdpEndpoint))
+        {
+            Pass(buffer);
+            return;
+        }
+
         var relayKey = new UdpRelayKey(packet.DestinationAddress, packet.SourcePort, packet.DestinationAddress, packet.DestinationPort);
-        if (_udpRelay.HasTarget(relayKey))
+        if (_udpRelay.TryGetTarget(relayKey, out var existingTarget))
         {
             _udpRelay.Refresh(relayKey);
-            LogDetail($"UDP EXISTING TARGET {packet.SourceAddress}:{packet.SourcePort} -> {packet.DestinationAddress}:{packet.DestinationPort}", $"udp-existing:{relayKey.ClientAddress}:{relayKey.ClientPort}:{relayKey.RemoteAddress}:{relayKey.RemotePort}", TimeSpan.FromSeconds(10));
-            if (RedirectUdpClientToRelay(buffer, packet))
+            if (RedirectUdpClientToRelay(buffer, packet, existingTarget))
             {
                 Revert(buffer);
             }
@@ -338,23 +385,31 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             return;
         }
 
-        var process = _processLookup.LookupUdpOwner(packet.UdpEndpoint);
+        var process = _processLookup.LookupUdpOwner(packet.UdpEndpoint, forceRefresh: true);
         if (process is null)
         {
-            LogDetail(
-                $"UDP OWNER MISS {packet.SourceAddress}:{packet.SourcePort} -> {packet.DestinationAddress}:{packet.DestinationPort}",
-                $"udp-owner-miss:{packet.SourceAddress}:{packet.SourcePort}:{packet.DestinationAddress}:{packet.DestinationPort}",
-                TimeSpan.FromSeconds(2));
+            if (packet.SourcePort == 53 || packet.DestinationPort == 53)
+            {
+                LogDetail(
+                    $"UDP DNS owner miss {packet.SourceAddress}:{packet.SourcePort} -> {packet.DestinationAddress}:{packet.DestinationPort}; packet will pass without relay.",
+                    "udp-dns-owner-miss",
+                    TimeSpan.FromSeconds(5));
+            }
+
             Pass(buffer);
             return;
         }
 
-        if (!_configuration.TryGetMatchingPattern(process, out var matchedPattern, out var matchMissReason))
+        if (!_configuration.TryGetMatchingPattern(process, out var matchedPattern, out _))
         {
-            LogDetail(
-                $"UDP APP MISS {packet.SourceAddress}:{packet.SourcePort} -> {packet.DestinationAddress}:{packet.DestinationPort} pid={process.ProcessId} name={process.Name} path={process.Path} reason={matchMissReason}",
-                $"udp-app-miss:{process.ProcessId}:{packet.DestinationAddress}:{packet.DestinationPort}",
-                TimeSpan.FromSeconds(10));
+            if (packet.SourcePort == 53 || packet.DestinationPort == 53)
+            {
+                LogDetail(
+                    $"UDP DNS non-target {packet.SourceAddress}:{packet.SourcePort} -> {packet.DestinationAddress}:{packet.DestinationPort} pid={process.ProcessId} name={process.Name}",
+                    "udp-dns-non-target",
+                    TimeSpan.FromSeconds(5));
+            }
+
             Pass(buffer);
             return;
         }
@@ -363,8 +418,9 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             $"UDP APP MATCH {packet.SourceAddress}:{packet.SourcePort} -> {packet.DestinationAddress}:{packet.DestinationPort} pid={process.ProcessId} name={process.Name} path={process.Path} pattern={matchedPattern}",
             $"udp-app-match:{process.ProcessId}:{packet.DestinationAddress}:{packet.DestinationPort}",
             TimeSpan.FromSeconds(2));
-        _udpRelay.Register(relayKey, packet.DestinationAddress, packet.DestinationPort);
-        if (RedirectUdpClientToRelay(buffer, packet))
+        var target = CreateTarget(packet, process, matchedPattern);
+        _udpRelay.Register(relayKey, target);
+        if (RedirectUdpClientToRelay(buffer, packet, target))
         {
             Revert(buffer);
         }
@@ -386,9 +442,8 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         Pass(buffer);
     }
 
-    private bool RedirectUdpClientToRelay(NdisApi.IntermediateBuffer* buffer, PacketView packet)
+    private bool RedirectUdpClientToRelay(NdisApi.IntermediateBuffer* buffer, PacketView packet, DirectRelayTarget target)
     {
-        var originalRemote = new DirectRelayTarget(packet.DestinationAddress, packet.DestinationPort, _timeProvider.GetUtcNow());
         var header = BuildUdpRelayHeader(packet.DestinationAddress, packet.DestinationPort);
         if (!packet.TryPrependUdpPayload(header))
         {
@@ -400,7 +455,9 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         packet.DestinationPort = _udpRelay.Port;
         packet.RecalculateChecksums();
         buffer->Length = (uint)packet.PacketLength;
-        _log($"REDIRECT UDP {packet.DestinationAddress}:{packet.SourcePort} -> {originalRemote}");
+        _log($"REDIRECT UDP app={target.AppLabel} appLocal={target.ClientEndpoint} client={packet.DestinationAddress}:{packet.SourcePort} target={target.RemoteEndpoint}");
+        _packetsRedirected++;
+        LogPacketStats();
         return true;
     }
 
@@ -408,7 +465,6 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
     {
         if (!TryReadUdpRelayHeader(packet.UdpPayload, packet.AddressFamily, out var remoteAddress, out var remotePort, out var headerSize))
         {
-            LogDetail($"UDP RESTORE HEADER MISS {packet.SourceAddress}:{packet.SourcePort} -> {packet.DestinationAddress}:{packet.DestinationPort}", $"udp-restore-header:{packet.SourceAddress}:{packet.SourcePort}:{packet.DestinationAddress}:{packet.DestinationPort}", TimeSpan.FromSeconds(5));
             return false;
         }
 
@@ -418,9 +474,13 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             target = new DirectRelayTarget(remoteAddress, remotePort, _timeProvider.GetUtcNow());
         }
 
+        LogDetail(
+            $"RESTORE UDP RECV app={target.AppLabel} appLocal={target.ClientEndpoint} from={target.RemoteEndpoint} relayLocalPort={_udpRelay.Port} payloadBytes={Math.Max(0, packet.UdpPayload.Length - headerSize)}",
+            $"udp-restore:{target.ProcessId}:{target.ClientEndpoint}:{target.RemoteEndpoint}",
+            TimeSpan.FromSeconds(2));
+
         if (!packet.TryRemoveUdpPayloadPrefix(headerSize))
         {
-            LogDetail($"UDP RESTORE REMOVE PREFIX FAILED headerSize={headerSize} {packet.SourceAddress}:{packet.SourcePort} -> {packet.DestinationAddress}:{packet.DestinationPort}", $"udp-restore-remove:{packet.SourceAddress}:{packet.SourcePort}:{packet.DestinationAddress}:{packet.DestinationPort}", TimeSpan.FromSeconds(5));
             return false;
         }
 
@@ -432,6 +492,45 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         buffer->Length = (uint)packet.PacketLength;
         _udpRelay.Refresh(key);
         return true;
+    }
+
+    private DirectRelayTarget CreateTarget(PacketView packet, ProcessInfo process, string? matchedPattern)
+    {
+        return new DirectRelayTarget(
+            packet.DestinationAddress,
+            packet.DestinationPort,
+            _timeProvider.GetUtcNow(),
+            process.ProcessId,
+            process.Name,
+            process.Path,
+            matchedPattern ?? string.Empty,
+            packet.SourceAddress,
+            packet.SourcePort);
+    }
+
+    private ProcessInfo? LookupTcpOwner(PacketView packet)
+    {
+        var process = _processLookup.LookupTcpOwner(packet.Session, forceRefresh: packet.IsSynOnly);
+        if (process is not null || !packet.IsSynOnly)
+        {
+            return process;
+        }
+
+        for (var attempt = 0; attempt < 6; attempt++)
+        {
+            Thread.Sleep(30);
+            process = _processLookup.LookupTcpOwner(packet.Session, forceRefresh: true);
+            if (process is not null)
+            {
+                return process;
+            }
+        }
+
+        LogDetail(
+            $"TCP SYN owner miss session={packet.Session}; packet will pass without relay because no owning process was found yet.",
+            "tcp-syn-owner-miss",
+            TimeSpan.FromSeconds(5));
+        return null;
     }
 
     private static byte[] BuildUdpRelayHeader(IPAddress remoteAddress, ushort remotePort)
@@ -485,6 +584,8 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
 
     private void Pass(NdisApi.IntermediateBuffer* buffer)
     {
+        _packetsPassed++;
+        LogPacketStats();
         if (buffer->DeviceFlags == NdisApi.PacketFlagOnSend)
         {
             SendToAdapter(buffer);
@@ -493,6 +594,18 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         {
             SendToMstcp(buffer);
         }
+    }
+
+    private void LogPacketStats()
+    {
+        var now = _timeProvider.GetUtcNow();
+        if (_lastPacketStatsLog != default && now - _lastPacketStatsLog < TimeSpan.FromSeconds(5))
+        {
+            return;
+        }
+
+        _lastPacketStatsLog = now;
+        _log($"Packet stats: read={_packetsRead}, passed={_packetsPassed}, redirected={_packetsRedirected}");
     }
 
     private void LogDetail(string message, string key, TimeSpan interval)
@@ -505,6 +618,21 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
 
         _detailLogTimes[key] = now;
         _log(message);
+    }
+
+    private static string FormatTcpFlags(byte flags)
+    {
+        Span<char> chars = stackalloc char[8];
+        var index = 0;
+        if ((flags & 0x01) != 0) chars[index++] = 'F';
+        if ((flags & 0x02) != 0) chars[index++] = 'S';
+        if ((flags & 0x04) != 0) chars[index++] = 'R';
+        if ((flags & 0x08) != 0) chars[index++] = 'P';
+        if ((flags & 0x10) != 0) chars[index++] = 'A';
+        if ((flags & 0x20) != 0) chars[index++] = 'U';
+        if ((flags & 0x40) != 0) chars[index++] = 'E';
+        if ((flags & 0x80) != 0) chars[index++] = 'C';
+        return index == 0 ? "none" : new string(chars[..index]);
     }
 
     private void Revert(NdisApi.IntermediateBuffer* buffer)
@@ -522,13 +650,25 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
     private void SendToMstcp(NdisApi.IntermediateBuffer* buffer)
     {
         var request = CreateRequest(buffer);
-        NdisApi.SendPacketToMstcp(_driverHandle, ref request);
+        if (!NdisApi.SendPacketToMstcp(_driverHandle, ref request))
+        {
+            LogDetail(
+                $"SendPacketToMstcp failed. adapter=0x{request.AdapterHandle.ToInt64():X} length={buffer->Length} flags={buffer->DeviceFlags} win32={NdisApi.LastWin32Error}",
+                "send-mstcp-failed",
+                TimeSpan.FromSeconds(2));
+        }
     }
 
     private void SendToAdapter(NdisApi.IntermediateBuffer* buffer)
     {
         var request = CreateRequest(buffer);
-        NdisApi.SendPacketToAdapter(_driverHandle, ref request);
+        if (!NdisApi.SendPacketToAdapter(_driverHandle, ref request))
+        {
+            LogDetail(
+                $"SendPacketToAdapter failed. adapter=0x{request.AdapterHandle.ToInt64():X} length={buffer->Length} flags={buffer->DeviceFlags} win32={NdisApi.LastWin32Error}",
+                "send-adapter-failed",
+                TimeSpan.FromSeconds(2));
+        }
     }
 
     private static NdisApi.EthRequest CreateRequest(NdisApi.IntermediateBuffer* buffer)

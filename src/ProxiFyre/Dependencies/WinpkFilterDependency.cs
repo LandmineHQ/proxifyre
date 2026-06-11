@@ -2,66 +2,62 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Net.Http;
-using System.Runtime.InteropServices;
 using Microsoft.Win32;
 
 namespace ProxiFyre;
 
 internal static class WinpkFilterDependency
 {
-    private const string NdisApiDllName = "ndisapi.dll";
     private const string InstallerFileName = "Windows.Packet.Filter.3.6.2.1.x64.msi";
     private const string DownloadUrl = "https://github.com/wiresock/ndisapi/releases/download/v3.6.2/Windows.Packet.Filter.3.6.2.1.x64.msi";
 
     public static async Task EnsureInstalledAsync(Action<string> log, CancellationToken cancellationToken = default)
     {
-        var dllLoadable = IsNdisApiDllLoadable();
         var driverInstalled = IsDriverInstalled();
-        if (dllLoadable && driverInstalled)
+        if (driverInstalled)
         {
-            log("WinpkFilter dependency check passed.");
+            log("WinpkFilter driver dependency check passed.");
             return;
         }
 
-        log($"WinpkFilter dependency missing: dllLoadable={dllLoadable}, driverInstalled={driverInstalled}");
-        var installerPath = await DownloadInstallerAsync(log, cancellationToken).ConfigureAwait(false);
+        log("WinpkFilter driver is not installed.");
+        var installerPath = await DownloadFileAsync(DownloadUrl, InstallerFileName, log, cancellationToken).ConfigureAwait(false);
         InstallMsi(installerPath, log);
 
-        dllLoadable = IsNdisApiDllLoadable();
         driverInstalled = IsDriverInstalled();
-        if (!dllLoadable || !driverInstalled)
+        if (!driverInstalled)
         {
-            throw new InvalidOperationException($"WinpkFilter installation did not complete cleanly. dllLoadable={dllLoadable}, driverInstalled={driverInstalled}");
+            throw new InvalidOperationException("WinpkFilter driver installation did not complete cleanly.");
         }
 
-        log("WinpkFilter dependency installed.");
+        log("WinpkFilter driver installed.");
     }
 
-    private static async Task<string> DownloadInstallerAsync(Action<string> log, CancellationToken cancellationToken)
+    private static async Task<string> DownloadFileAsync(string url, string fileName, Action<string> log, CancellationToken cancellationToken)
     {
         var dependencyDirectory = Path.Combine(AppContext.BaseDirectory, "dependencies");
         Directory.CreateDirectory(dependencyDirectory);
 
-        var installerPath = Path.Combine(dependencyDirectory, InstallerFileName);
-        if (File.Exists(installerPath) && new FileInfo(installerPath).Length > 1024 * 1024)
+        var filePath = Path.Combine(dependencyDirectory, fileName);
+        if (File.Exists(filePath) && new FileInfo(filePath).Length > 1024)
         {
-            log($"Using cached WinpkFilter installer: {installerPath}");
-            return installerPath;
+            log($"Using cached dependency: {filePath}");
+            return filePath;
         }
 
-        log($"Downloading WinpkFilter installer: {DownloadUrl}");
+        log($"Downloading dependency: {url}");
         using var client = new HttpClient
         {
             Timeout = TimeSpan.FromMinutes(10)
         };
 
-        using var response = await client.GetAsync(DownloadUrl, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+        using var response = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
         response.EnsureSuccessStatusCode();
 
         var totalBytes = response.Content.Headers.ContentLength;
         var lastLoggedPercent = -1;
         await using var networkStream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
-        await using var fileStream = new FileStream(installerPath, FileMode.Create, FileAccess.Write, FileShare.Read, 81920, useAsync: true);
+        await using var fileStream = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.Read, 81920, useAsync: true);
 
         var buffer = new byte[81920];
         long totalRead = 0;
@@ -82,24 +78,25 @@ internal static class WinpkFilterDependency
                 if (percent >= lastLoggedPercent + 10)
                 {
                     lastLoggedPercent = percent;
-                    log($"WinpkFilter download progress: {percent}%");
+                    log($"Dependency download progress: {percent}%");
                 }
             }
         }
 
-        log($"Downloaded WinpkFilter installer: {installerPath}");
-        return installerPath;
+        log($"Downloaded dependency: {filePath}");
+        return filePath;
     }
 
     private static void InstallMsi(string installerPath, Action<string> log)
     {
         log("Installing WinpkFilter driver. A UAC prompt may appear.");
+        var installLogPath = Path.Combine(Path.GetDirectoryName(installerPath) ?? AppContext.BaseDirectory, "winpkfilter-msi.log");
         using var process = new Process
         {
             StartInfo = new ProcessStartInfo
             {
                 FileName = "msiexec.exe",
-                Arguments = $"/i \"{installerPath}\" /qn /norestart",
+                Arguments = $"/i \"{installerPath}\" /qn /norestart /L*v \"{installLogPath}\"",
                 UseShellExecute = true,
                 Verb = "runas"
             }
@@ -116,33 +113,12 @@ internal static class WinpkFilterDependency
 
         process.WaitForExit();
         log($"WinpkFilter installer exited with code {process.ExitCode}.");
+        log($"WinpkFilter installer log: {installLogPath}");
 
         if (process.ExitCode is not (0 or 3010))
         {
             throw new InvalidOperationException($"WinpkFilter installer failed with exit code {process.ExitCode}.");
         }
-    }
-
-    private static bool IsNdisApiDllLoadable()
-    {
-        var localPath = Path.Combine(AppContext.BaseDirectory, NdisApiDllName);
-        if (File.Exists(localPath) && TryLoad(localPath))
-        {
-            return true;
-        }
-
-        return TryLoad(NdisApiDllName);
-    }
-
-    private static bool TryLoad(string path)
-    {
-        if (!NativeLibrary.TryLoad(path, out var handle))
-        {
-            return false;
-        }
-
-        NativeLibrary.Free(handle);
-        return true;
     }
 
     private static bool IsDriverInstalled()

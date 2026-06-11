@@ -88,6 +88,10 @@ internal ref struct PacketView
 
     public byte TcpFlags => IsTcp ? _frame[TransportOffset + 13] : (byte)0;
 
+    public int TcpHeaderLength => IsTcp ? (_frame[TransportOffset + 12] >> 4) * 4 : 0;
+
+    public int TcpPayloadLength => IsTcp ? Math.Max(0, TransportLength - TcpHeaderLength) : 0;
+
     public bool IsSynOnly => IsTcp && (TcpFlags & (TcpFlagSyn | TcpFlagAck)) == TcpFlagSyn;
 
     public bool IsClosing => IsTcp && (TcpFlags & (TcpFlagFin | TcpFlagRst)) != 0;

@@ -26,6 +26,7 @@ internal sealed class CoreProcessHost : IDisposable, IAsyncDisposable
 
         var corePath = PrepareCoreExecutable(coreProcessName);
         _log($"Starting core: {Path.GetFileName(corePath)}");
+        _log($"Relay network activity will appear under process: {Path.GetFileName(corePath)}");
         _log($"Core detailed log: {Path.Combine(AppContext.BaseDirectory, "proxifyre-core.log")}");
 
         var process = new Process

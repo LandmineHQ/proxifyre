@@ -21,6 +21,8 @@ internal sealed class ProcessLookup
     private readonly TimeProvider _timeProvider;
     private readonly object _sync = new();
     private Dictionary<TcpSessionKey, int> _tcpOwners = new();
+    private Dictionary<UdpEndpointKey, int> _tcpLocalOwners = new();
+    private Dictionary<ushort, int> _tcpPortOwners = new();
     private Dictionary<UdpEndpointKey, int> _tcpListeners = new();
     private Dictionary<UdpEndpointKey, int> _udpOwners = new();
     private DateTimeOffset _lastTcpRefresh = DateTimeOffset.MinValue;
@@ -32,9 +34,16 @@ internal sealed class ProcessLookup
         _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
-    public ProcessInfo? LookupTcpOwner(TcpSessionKey session)
+    public ProcessInfo? LookupTcpOwner(TcpSessionKey session, bool forceRefresh = false)
     {
-        EnsureTcpFresh();
+        if (forceRefresh)
+        {
+            RefreshTcp(force: true);
+        }
+        else
+        {
+            EnsureTcpFresh();
+        }
 
         if (_tcpOwners.TryGetValue(session, out var pid))
         {
@@ -46,7 +55,7 @@ internal sealed class ProcessLookup
             return GetProcessInfo(pid);
         }
 
-        RefreshTcp();
+        RefreshTcp(force: true);
 
         if (_tcpOwners.TryGetValue(session, out pid))
         {
@@ -58,16 +67,23 @@ internal sealed class ProcessLookup
             : null;
     }
 
-    public ProcessInfo? LookupUdpOwner(UdpEndpointKey endpoint)
+    public ProcessInfo? LookupUdpOwner(UdpEndpointKey endpoint, bool forceRefresh = false)
     {
-        EnsureUdpFresh();
+        if (forceRefresh)
+        {
+            RefreshUdp(force: true);
+        }
+        else
+        {
+            EnsureUdpFresh();
+        }
 
         if (TryLookupUdpPid(endpoint, out var pid))
         {
             return GetProcessInfo(pid);
         }
 
-        RefreshUdp();
+        RefreshUdp(force: true);
 
         return TryLookupUdpPid(endpoint, out pid)
             ? GetProcessInfo(pid)
@@ -91,6 +107,11 @@ internal sealed class ProcessLookup
     private bool TryLookupTcpLocalPid(IPAddress localAddress, ushort localPort, out int pid)
     {
         var endpoint = new UdpEndpointKey(localAddress, localPort);
+        if (_tcpLocalOwners.TryGetValue(endpoint, out pid))
+        {
+            return true;
+        }
+
         if (_tcpListeners.TryGetValue(endpoint, out pid))
         {
             return true;
@@ -100,7 +121,23 @@ internal sealed class ProcessLookup
             ? IPAddress.Any
             : IPAddress.IPv6Any;
 
-        return _tcpListeners.TryGetValue(new UdpEndpointKey(wildcard, localPort), out pid);
+        if (_tcpLocalOwners.TryGetValue(new UdpEndpointKey(wildcard, localPort), out pid))
+        {
+            return true;
+        }
+
+        if (_tcpListeners.TryGetValue(new UdpEndpointKey(wildcard, localPort), out pid))
+        {
+            return true;
+        }
+
+        if (_tcpPortOwners.TryGetValue(localPort, out pid) && pid > 0)
+        {
+            return true;
+        }
+
+        pid = 0;
+        return false;
     }
 
     private void EnsureTcpFresh()
@@ -119,33 +156,37 @@ internal sealed class ProcessLookup
         }
     }
 
-    private void RefreshTcp()
+    private void RefreshTcp(bool force = false)
     {
         lock (_sync)
         {
             var now = _timeProvider.GetUtcNow();
-            if (now - _lastTcpRefresh <= _refreshInterval)
+            if (!force && now - _lastTcpRefresh <= _refreshInterval)
             {
                 return;
             }
 
             var owners = new Dictionary<TcpSessionKey, int>();
+            var localOwners = new Dictionary<UdpEndpointKey, int>();
+            var portOwners = new Dictionary<ushort, int>();
             var listeners = new Dictionary<UdpEndpointKey, int>();
-            AddTcp4(owners, listeners);
-            AddTcp6(owners, listeners);
+            AddTcp4(owners, localOwners, portOwners, listeners);
+            AddTcp6(owners, localOwners, portOwners, listeners);
             _tcpOwners = owners;
+            _tcpLocalOwners = localOwners;
+            _tcpPortOwners = portOwners;
             _tcpListeners = listeners;
             _lastTcpRefresh = now;
             _log($"Process lookup TCP table refreshed: sessions={owners.Count}, listeners={listeners.Count}");
         }
     }
 
-    private void RefreshUdp()
+    private void RefreshUdp(bool force = false)
     {
         lock (_sync)
         {
             var now = _timeProvider.GetUtcNow();
-            if (now - _lastUdpRefresh <= _refreshInterval)
+            if (!force && now - _lastUdpRefresh <= _refreshInterval)
             {
                 return;
             }
@@ -159,7 +200,11 @@ internal sealed class ProcessLookup
         }
     }
 
-    private static void AddTcp4(Dictionary<TcpSessionKey, int> owners, Dictionary<UdpEndpointKey, int> listeners)
+    private static void AddTcp4(
+        Dictionary<TcpSessionKey, int> owners,
+        Dictionary<UdpEndpointKey, int> localOwners,
+        Dictionary<ushort, int> portOwners,
+        Dictionary<UdpEndpointKey, int> listeners)
     {
         QueryTable(
             (IntPtr buffer, ref int size) => GetExtendedTcpTable(buffer, ref size, false, AfInet, TcpTableOwnerPidAll, 0),
@@ -182,6 +227,7 @@ internal sealed class ProcessLookup
                     }
 
                     var localAddress = FromIpv4RowAddress(row.LocalAddr);
+                    AddTcpLocalOwner(localOwners, portOwners, localAddress, localPort, row.OwningPid);
                     if (remotePort == 0)
                     {
                         listeners[new UdpEndpointKey(localAddress, localPort)] = row.OwningPid;
@@ -193,7 +239,11 @@ internal sealed class ProcessLookup
             });
     }
 
-    private static void AddTcp6(Dictionary<TcpSessionKey, int> owners, Dictionary<UdpEndpointKey, int> listeners)
+    private static void AddTcp6(
+        Dictionary<TcpSessionKey, int> owners,
+        Dictionary<UdpEndpointKey, int> localOwners,
+        Dictionary<ushort, int> portOwners,
+        Dictionary<UdpEndpointKey, int> listeners)
     {
         QueryTable(
             (IntPtr buffer, ref int size) => GetExtendedTcpTable(buffer, ref size, false, AfInet6, TcpTableOwnerPidAll, 0),
@@ -216,6 +266,7 @@ internal sealed class ProcessLookup
                     }
 
                     var localAddress = new IPAddress(row.LocalAddr, row.LocalScopeId);
+                    AddTcpLocalOwner(localOwners, portOwners, localAddress, localPort, row.OwningPid);
                     if (remotePort == 0)
                     {
                         listeners[new UdpEndpointKey(localAddress, localPort)] = row.OwningPid;
@@ -225,6 +276,28 @@ internal sealed class ProcessLookup
                     owners[new TcpSessionKey(localAddress, new IPAddress(row.RemoteAddr, row.RemoteScopeId), localPort, remotePort)] = row.OwningPid;
                 }
             });
+    }
+
+    private static void AddTcpLocalOwner(
+        Dictionary<UdpEndpointKey, int> localOwners,
+        Dictionary<ushort, int> portOwners,
+        IPAddress localAddress,
+        ushort localPort,
+        int pid)
+    {
+        localOwners[new UdpEndpointKey(localAddress, localPort)] = pid;
+
+        if (portOwners.TryGetValue(localPort, out var existingPid))
+        {
+            if (existingPid != pid)
+            {
+                portOwners[localPort] = -1;
+            }
+
+            return;
+        }
+
+        portOwners[localPort] = pid;
     }
 
     private static void AddUdp4(Dictionary<UdpEndpointKey, int> owners)

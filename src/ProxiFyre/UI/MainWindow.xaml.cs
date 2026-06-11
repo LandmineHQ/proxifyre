@@ -32,11 +32,26 @@ public partial class MainWindow : Window
         LogList.ItemsSource = _logs;
         ConfigPathText.Text = _configPath;
         CoreProcessNameInput.Text = AppConfiguration.DefaultCoreProcessName;
+        ClearCoreLog();
         _coreProcessHost = new CoreProcessHost(AppendLog, () =>
         {
             Dispatcher.InvokeAsync(() => SetRunning(false));
         });
         LoadConfig();
+    }
+
+    private void ClearCoreLog()
+    {
+        var logPath = Path.Combine(AppContext.BaseDirectory, "proxifyre-core.log");
+        try
+        {
+            File.WriteAllText(logPath, string.Empty);
+            AppendLog($"Cleared core log: {logPath}");
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"Failed to clear core log: {ex.Message}");
+        }
     }
 
     private void LoadConfig()

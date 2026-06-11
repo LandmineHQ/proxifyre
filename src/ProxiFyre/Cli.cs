@@ -15,6 +15,25 @@ internal static class Cli
             return 0;
         }
 
+        if (args.Any(a => string.Equals(a, "--reset-filter", StringComparison.OrdinalIgnoreCase)))
+        {
+            try
+            {
+                using var logger = CoreLogger.CreateForCurrentProcess();
+                PacketFilterReset.Reset(message =>
+                {
+                    Console.WriteLine(message);
+                    logger.Info(message);
+                });
+                return 0;
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine(ex.Message);
+                return 1;
+            }
+        }
+
         var configPath = GetConfigPath(args);
 
         if (args.Any(a => string.Equals(a, "--init-config", StringComparison.OrdinalIgnoreCase)))
@@ -45,6 +64,7 @@ internal static class Cli
             using var logger = CoreLogger.CreateForCurrentProcess();
             var configuration = AppConfiguration.Load(configPath);
             logger.Info($"Configuration path: {configPath}");
+            logger.Info($"Relay network activity process: {System.Diagnostics.Process.GetCurrentProcess().ProcessName}.exe");
             await WinpkFilterDependency.EnsureInstalledAsync(logger.Info).ConfigureAwait(false);
             using var cts = new CancellationTokenSource();
             Console.CancelKeyPress += (_, e) =>
@@ -114,6 +134,7 @@ internal static class Cli
         Console.WriteLine("Usage:");
         Console.WriteLine("  ProxiFyre.exe");
         Console.WriteLine("  ProxiFyre.exe --run [--config <path>]");
+        Console.WriteLine("  ProxiFyre.exe --reset-filter");
         Console.WriteLine("  ProxiFyre.exe --add-app <exe-or-path> [--config <path>]");
         Console.WriteLine("  ProxiFyre.exe --init-config [--config <path>]");
     }
