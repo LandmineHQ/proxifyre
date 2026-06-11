@@ -7,4 +7,7 @@
     <LangVersion>latest</LangVersion>
     <AnalysisLevel>latest</AnalysisLevel>
   </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\Shared\LicenseKey.cs" Link="Shared\LicenseKey.cs" />
+  </ItemGroup>
 </Project>

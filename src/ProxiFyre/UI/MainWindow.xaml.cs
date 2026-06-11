@@ -104,9 +104,30 @@ public partial class MainWindow : Window
             return false;
         }
 
-        AppConfiguration.SaveApps(_configPath, BuildApps(), CoreProcessNameInput.Text);
+        AppConfiguration.SaveApps(_configPath, BuildApps(), CoreProcessNameInput.Text, GetSavedLicenseKey());
         _lastSavedConfigurationKey = configurationKey;
         return true;
+    }
+
+    private string? GetSavedLicenseKey()
+    {
+        try
+        {
+            return File.Exists(_configPath)
+                ? AppConfiguration.Load(_configPath).LicenseKey
+                : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private void SaveLicenseKey(string licenseKey)
+    {
+        CoreProcessNameInput.Text = AppConfiguration.NormalizeCoreProcessName(CoreProcessNameInput.Text);
+        AppConfiguration.SaveApps(_configPath, BuildApps(), CoreProcessNameInput.Text, licenseKey);
+        _lastSavedConfigurationKey = BuildLocalConfigurationKey();
     }
 
     private string BuildLocalConfigurationKey()
@@ -197,6 +218,21 @@ public partial class MainWindow : Window
         {
             SaveConfig();
             var configuration = AppConfiguration.Load(_configPath);
+            var deviceId = LicenseKey.GetCurrentDeviceId();
+            if (!LicenseKey.IsValid(deviceId, configuration.LicenseKey))
+            {
+                var licenseKey = RegistrationDialog.Show(this, deviceId, configuration.LicenseKey);
+                if (licenseKey is null)
+                {
+                    AppendLog("Start canceled: license key is missing or invalid.");
+                    return;
+                }
+
+                SaveLicenseKey(licenseKey);
+                configuration = AppConfiguration.Load(_configPath);
+                AppendLog("License key saved.");
+            }
+
             StartStopButton.IsEnabled = false;
             await WinpkFilterDependency.EnsureInstalledAsync(AppendLog);
             _coreProcessHost.Start(_configPath, configuration.CoreProcessName);
@@ -889,6 +925,196 @@ public partial class MainWindow : Window
         [DllImport("user32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool DestroyIcon(IntPtr hIcon);
+    }
+
+    private sealed class RegistrationDialog : Window
+    {
+        private readonly string _deviceId;
+        private readonly System.Windows.Controls.TextBox _keyInput;
+
+        private RegistrationDialog(string deviceId, string? currentKey)
+        {
+            _deviceId = deviceId;
+            Title = "注册 ProxiFyre";
+            Owner = System.Windows.Application.Current.MainWindow;
+            Width = 520;
+            MinWidth = 460;
+            MinHeight = 300;
+            SizeToContent = SizeToContent.Height;
+            ResizeMode = ResizeMode.NoResize;
+            WindowStartupLocation = WindowStartupLocation.CenterOwner;
+            Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#F3F6FA"));
+
+            var root = new Grid
+            {
+                Margin = new Thickness(18)
+            };
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+            var title = new TextBlock
+            {
+                Text = "需要注册后才能启用核心",
+                FontSize = 16,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#111827"))
+            };
+            root.Children.Add(title);
+
+            var subtitle = new TextBlock
+            {
+                Text = "请复制当前设备码，并输入对应注册码。",
+                Margin = new Thickness(0, 6, 0, 16),
+                Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#667085"))
+            };
+            Grid.SetRow(subtitle, 1);
+            root.Children.Add(subtitle);
+
+            var deviceLabel = new TextBlock
+            {
+                Text = "当前设备码",
+                FontWeight = FontWeights.SemiBold,
+                Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#1F2937"))
+            };
+            Grid.SetRow(deviceLabel, 2);
+            root.Children.Add(deviceLabel);
+
+            var deviceRow = new Grid
+            {
+                Margin = new Thickness(0, 8, 0, 14)
+            };
+            deviceRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            deviceRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+            var deviceInput = new System.Windows.Controls.TextBox
+            {
+                Text = deviceId,
+                IsReadOnly = true,
+                MinHeight = 34,
+                Padding = new Thickness(9, 6, 9, 6),
+                VerticalContentAlignment = VerticalAlignment.Center
+            };
+            deviceRow.Children.Add(deviceInput);
+
+            var copyButton = new Button
+            {
+                Content = "复制",
+                MinWidth = 72,
+                Margin = new Thickness(8, 0, 0, 0),
+                Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#EEF2F7")),
+                Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#1F2937"))
+            };
+            copyButton.Click += (_, _) =>
+            {
+                Clipboard.SetText(_deviceId);
+                copyButton.Content = "已复制";
+            };
+            Grid.SetColumn(copyButton, 1);
+            deviceRow.Children.Add(copyButton);
+
+            Grid.SetRow(deviceRow, 3);
+            root.Children.Add(deviceRow);
+
+            var keyLabel = new TextBlock
+            {
+                Text = "注册码",
+                FontWeight = FontWeights.SemiBold,
+                Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#1F2937"))
+            };
+            Grid.SetRow(keyLabel, 4);
+            root.Children.Add(keyLabel);
+
+            var keyArea = new StackPanel
+            {
+                Margin = new Thickness(0, 8, 0, 0)
+            };
+
+            _keyInput = new System.Windows.Controls.TextBox
+            {
+                Text = currentKey ?? string.Empty,
+                MinHeight = 34,
+                Padding = new Thickness(9, 6, 9, 6),
+                VerticalContentAlignment = VerticalAlignment.Center
+            };
+            _keyInput.SelectAll();
+            _keyInput.KeyDown += Input_KeyDown;
+            keyArea.Children.Add(_keyInput);
+
+            var buttons = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                HorizontalAlignment = HorizontalAlignment.Right,
+                Margin = new Thickness(0, 16, 0, 0)
+            };
+
+            var cancel = new Button
+            {
+                Content = "取消",
+                MinWidth = 72,
+                Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#EEF2F7")),
+                Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#1F2937")),
+                Margin = new Thickness(0, 0, 8, 0)
+            };
+            cancel.Click += (_, _) => DialogResult = false;
+            buttons.Children.Add(cancel);
+
+            var confirm = new Button
+            {
+                Content = "确定",
+                MinWidth = 72,
+                Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#2563EB")),
+                Foreground = Brushes.White
+            };
+            confirm.Click += (_, _) => Confirm();
+            buttons.Children.Add(confirm);
+            keyArea.Children.Add(buttons);
+
+            Grid.SetRow(keyArea, 5);
+            root.Children.Add(keyArea);
+
+            Content = root;
+            Loaded += (_, _) => _keyInput.Focus();
+        }
+
+        public string KeyText => _keyInput.Text.Trim();
+
+        public static string? Show(Window owner, string deviceId, string? currentKey)
+        {
+            var dialog = new RegistrationDialog(deviceId, currentKey)
+            {
+                Owner = owner
+            };
+
+            return dialog.ShowDialog() == true
+                ? dialog.KeyText
+                : null;
+        }
+
+        private void Input_KeyDown(object sender, System.Windows.Input.KeyEventArgs e)
+        {
+            if (e.Key == Key.Enter)
+            {
+                e.Handled = true;
+                Confirm();
+            }
+        }
+
+        private void Confirm()
+        {
+            if (!LicenseKey.IsValid(_deviceId, _keyInput.Text))
+            {
+                MessageBox.Show(this, "注册码无效。", "ProxiFyre", MessageBoxButton.OK, MessageBoxImage.Warning);
+                _keyInput.Focus();
+                _keyInput.SelectAll();
+                return;
+            }
+
+            DialogResult = true;
+        }
     }
 
     private sealed class RuleEditDialog : Window

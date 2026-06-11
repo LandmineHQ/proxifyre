@@ -7,6 +7,11 @@ internal static class TrafficTestRunner
 {
     public static async Task<int> RunAsync(string[] args)
     {
+        if (LicenseCommand.TryRun(args, out var licenseExitCode))
+        {
+            return licenseExitCode;
+        }
+
         var options = TestOptions.Parse(args);
         var root = RepositoryPaths.FindRepositoryRoot(AppContext.BaseDirectory);
         var coreDir = Path.Combine(root, "artifacts", "bin", "ProxiFyre", "debug_win-x64");

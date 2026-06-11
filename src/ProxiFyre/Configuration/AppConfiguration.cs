@@ -21,6 +21,8 @@ internal sealed class AppConfiguration
 
     public string CoreProcessName { get; init; } = DefaultCoreProcessName;
 
+    public string? LicenseKey { get; init; }
+
     public bool Matches(ProcessInfo process)
     {
         return TryGetMatchingPattern(process, out _, out _);
@@ -66,6 +68,7 @@ internal sealed class AppConfiguration
         var apps = new List<string>();
         var root = document.RootElement;
         var coreProcessName = DefaultCoreProcessName;
+        string? licenseKey = null;
 
         if (root.TryGetProperty("apps", out var appsElement) && appsElement.ValueKind == JsonValueKind.Array)
         {
@@ -79,6 +82,11 @@ internal sealed class AppConfiguration
             {
                 coreProcessName = Path.GetFileName(value.Trim());
             }
+        }
+
+        if (root.TryGetProperty("licenseKey", out var licenseKeyElement) && licenseKeyElement.ValueKind == JsonValueKind.String)
+        {
+            licenseKey = licenseKeyElement.GetString();
         }
 
         if (root.TryGetProperty("proxies", out var proxiesElement) && proxiesElement.ValueKind == JsonValueKind.Array)
@@ -95,6 +103,7 @@ internal sealed class AppConfiguration
         return new AppConfiguration
         {
             CoreProcessName = coreProcessName,
+            LicenseKey = string.IsNullOrWhiteSpace(licenseKey) ? null : licenseKey.Trim(),
             Apps = apps
                 .Select(a => a.Trim())
                 .Where(a => a.Length > 0)
@@ -110,6 +119,7 @@ internal sealed class AppConfiguration
         var sample = new SampleConfiguration
         {
             CoreProcessName = DefaultCoreProcessName,
+            LicenseKey = string.Empty,
             Apps = ["chrome.exe", @"C:\Program Files\SomeApp\SomeApp.exe", @"C:\Games\SomeGame\"],
             Proxies =
             [
@@ -138,17 +148,27 @@ internal sealed class AppConfiguration
         }
 
         var coreProcessName = existingConfiguration?.CoreProcessName ?? DefaultCoreProcessName;
-        var simpleConfiguration = new SimpleConfiguration { CoreProcessName = coreProcessName, Apps = apps };
+        var simpleConfiguration = new SimpleConfiguration
+        {
+            CoreProcessName = coreProcessName,
+            LicenseKey = existingConfiguration?.LicenseKey,
+            Apps = apps
+        };
         File.WriteAllText(path, JsonSerializer.Serialize(simpleConfiguration, JsonOptions));
         return apps;
     }
 
-    public static void SaveApps(string path, IEnumerable<string> apps, string coreProcessName = DefaultCoreProcessName)
+    public static void SaveApps(
+        string path,
+        IEnumerable<string> apps,
+        string coreProcessName = DefaultCoreProcessName,
+        string? licenseKey = null)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path)) ?? AppContext.BaseDirectory);
         var simpleConfiguration = new SimpleConfiguration
         {
             CoreProcessName = NormalizeCoreProcessName(coreProcessName),
+            LicenseKey = string.IsNullOrWhiteSpace(licenseKey) ? null : licenseKey.Trim(),
             Apps = apps
                 .Select(a => a.Trim())
                 .Where(a => a.Length > 0)
@@ -190,6 +210,9 @@ internal sealed class AppConfiguration
         [JsonPropertyName("coreProcessName")]
         public required string CoreProcessName { get; init; }
 
+        [JsonPropertyName("licenseKey")]
+        public string? LicenseKey { get; init; }
+
         [JsonPropertyName("apps")]
         public required List<string> Apps { get; init; }
 
@@ -213,6 +236,9 @@ internal sealed class AppConfiguration
     {
         [JsonPropertyName("coreProcessName")]
         public required string CoreProcessName { get; init; }
+
+        [JsonPropertyName("licenseKey")]
+        public string? LicenseKey { get; init; }
 
         [JsonPropertyName("apps")]
         public required List<string> Apps { get; init; }
