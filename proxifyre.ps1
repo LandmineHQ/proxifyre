@@ -25,8 +25,8 @@ function Show-Usage {
     Write-Host "Usage:"
     Write-Host "  .\proxifyre.ps1 build [-Configuration Debug|Release]"
     Write-Host "  .\proxifyre.ps1 ui"
-    Write-Host "  .\proxifyre.ps1 test [curl-ipv4|curl-ipv6|curl-http-ipv4|stun-ipv4|stun-ipv6] [-Detailed]"
-    Write-Host "  .\proxifyre.ps1 run [-Config .\app-config.json]"
+    Write-Host "  .\proxifyre.ps1 test [curl-ipv4|curl-ipv6|curl-http-ipv4|curl-large-ipv4|curl-large-ipv6|stun-ipv4|stun-ipv6] [-Detailed]"
+    Write-Host "  .\proxifyre.ps1 run [-Config .\app-config.json] [-Detailed]"
     Write-Host "  .\proxifyre.ps1 reset-filter"
     Write-Host "  .\proxifyre.ps1 add-app <exe-or-path> [-Config .\app-config.json]"
     Write-Host "  .\proxifyre.ps1 init-config [-Config .\app-config.json]"
@@ -57,7 +57,12 @@ switch ($Command) {
         exit $LASTEXITCODE
     }
     "run" {
-        dotnet run --project $Project -- --run --config $Config
+        $runArgs = @("--run", "--config", $Config)
+        if ($Detailed) {
+            $runArgs += "--detailed"
+        }
+
+        dotnet run --project $Project -- @runArgs
         exit $LASTEXITCODE
     }
     "reset-filter" {

@@ -63,8 +63,10 @@ internal static class Cli
         {
             using var logger = CoreLogger.CreateForCurrentProcess();
             var configuration = AppConfiguration.Load(configPath);
+            var detailedLogging = args.Any(a => string.Equals(a, "--detailed", StringComparison.OrdinalIgnoreCase));
             logger.Info($"Configuration path: {configPath}");
             logger.Info($"Relay network activity process: {System.Diagnostics.Process.GetCurrentProcess().ProcessName}.exe");
+            logger.Info($"Detailed logging: {(detailedLogging ? "enabled" : "disabled")}");
             await WinpkFilterDependency.EnsureInstalledAsync(logger.Info).ConfigureAwait(false);
             using var cts = new CancellationTokenSource();
             Console.CancelKeyPress += (_, e) =>
@@ -73,7 +75,7 @@ internal static class Cli
                 cts.Cancel();
             };
 
-            await using var service = new RelayService(logger.Info);
+            await using var service = new RelayService(logger.Info, detailedLogging);
             service.Start(configuration, cts.Token);
             logger.Info("Running. Press Ctrl+C to stop.");
 
@@ -133,7 +135,7 @@ internal static class Cli
     {
         Console.WriteLine("Usage:");
         Console.WriteLine("  ProxiFyre.exe");
-        Console.WriteLine("  ProxiFyre.exe --run [--config <path>]");
+        Console.WriteLine("  ProxiFyre.exe --run [--config <path>] [--detailed]");
         Console.WriteLine("  ProxiFyre.exe --reset-filter");
         Console.WriteLine("  ProxiFyre.exe --add-app <exe-or-path> [--config <path>]");
         Console.WriteLine("  ProxiFyre.exe --init-config [--config <path>]");

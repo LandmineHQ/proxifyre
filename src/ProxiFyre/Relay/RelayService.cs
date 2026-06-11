@@ -5,6 +5,7 @@ namespace ProxiFyre;
 internal sealed class RelayService : IDisposable, IAsyncDisposable
 {
     private readonly Action<string> _log;
+    private readonly bool _detailedLogging;
     private readonly TimeProvider _timeProvider;
     private CancellationTokenSource? _cts;
     private TcpDirectRelay? _tcpRelay;
@@ -12,9 +13,10 @@ internal sealed class RelayService : IDisposable, IAsyncDisposable
     private PacketFilterLoop? _filter;
     private Task? _filterTask;
 
-    public RelayService(Action<string> log, TimeProvider? timeProvider = null)
+    public RelayService(Action<string> log, bool detailedLogging = false, TimeProvider? timeProvider = null)
     {
         _log = log;
+        _detailedLogging = detailedLogging;
         _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
@@ -37,12 +39,13 @@ internal sealed class RelayService : IDisposable, IAsyncDisposable
         _log($"Configured core process name: {configuration.CoreProcessName}");
         _log($"Configured apps: {string.Join(", ", configuration.Apps)}");
         _log($"Relay socket owner process: {Process.GetCurrentProcess().ProcessName}.exe pid={Environment.ProcessId}");
+        _log($"Detailed packet logging: {(_detailedLogging ? "enabled" : "disabled")}");
         _cts = CancellationTokenSource.CreateLinkedTokenSource(externalCancellationToken);
-        _tcpRelay = new TcpDirectRelay(_log, _timeProvider);
-        _udpRelay = new UdpDirectRelay(_log, _timeProvider);
+        _tcpRelay = new TcpDirectRelay(_log, _detailedLogging, _timeProvider);
+        _udpRelay = new UdpDirectRelay(_log, _detailedLogging, _timeProvider);
         _tcpRelay.Start(_cts.Token);
         _udpRelay.Start(_cts.Token);
-        _filter = new PacketFilterLoop(configuration, _tcpRelay, _udpRelay, _log, _timeProvider);
+        _filter = new PacketFilterLoop(configuration, _tcpRelay, _udpRelay, _log, _detailedLogging, _timeProvider);
         _filterTask = _filter.RunAsync(_cts.Token);
         _ = WatchFilterTaskAsync(_filterTask, _cts);
     }

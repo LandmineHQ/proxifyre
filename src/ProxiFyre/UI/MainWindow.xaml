@@ -224,6 +224,20 @@
                         <TextBlock Text="IPv4 TCP / IPv4 UDP / IPv6 TCP / IPv6 UDP"
                                    Foreground="{StaticResource MutedTextBrush}" TextWrapping="Wrap" Margin="0,3,0,10" />
 
+                        <TextBlock Text="核心进程" FontWeight="SemiBold" />
+                        <TextBlock x:Name="CoreProcessText"
+                                   Text="未运行"
+                                   Foreground="{StaticResource MutedTextBrush}"
+                                   TextWrapping="Wrap"
+                                   Margin="0,3,0,10" />
+
+                        <TextBlock Text="网络占用观察" FontWeight="SemiBold" />
+                        <TextBlock x:Name="NetworkOwnerHintText"
+                                   Text="启动后查看核心进程，而不是 UI 进程。"
+                                   Foreground="{StaticResource MutedTextBrush}"
+                                   TextWrapping="Wrap"
+                                   Margin="0,3,0,10" />
+
                         <TextBlock Text="配置文件" FontWeight="SemiBold" />
                         <TextBlock x:Name="ConfigPathText" Foreground="{StaticResource MutedTextBrush}"
                                    TextWrapping="Wrap" Margin="0,3,0,10" />

@@ -13,12 +13,14 @@ internal sealed class TcpDirectRelay : IDisposable
     private readonly ConcurrentDictionary<TcpRelayKey, byte> _relayOutboundFlows = new();
     private readonly TimeSpan _targetTtl = TimeSpan.FromMinutes(5);
     private readonly Action<string> _log;
+    private readonly bool _detailedLogging;
     private readonly TimeProvider _timeProvider;
     private TcpListener? _listener;
 
-    public TcpDirectRelay(Action<string>? log = null, TimeProvider? timeProvider = null)
+    public TcpDirectRelay(Action<string>? log = null, bool detailedLogging = false, TimeProvider? timeProvider = null)
     {
         _log = log ?? Console.WriteLine;
+        _detailedLogging = detailedLogging;
         _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
@@ -36,7 +38,7 @@ internal sealed class TcpDirectRelay : IDisposable
         _listener.Start(512);
         Port = (ushort)((IPEndPoint)_listener.LocalEndpoint).Port;
 
-        _log($"Local direct TCP relay listening on [::]:{Port}");
+        LogDetail($"Local direct TCP relay listening on [::]:{Port}");
         _ = Task.Run(() => AcceptLoopAsync(_listener, cancellationToken), cancellationToken);
         _ = Task.Run(() => CleanupLoopAsync(cancellationToken), cancellationToken);
     }
@@ -135,15 +137,15 @@ internal sealed class TcpDirectRelay : IDisposable
         TcpRelayKey? outboundFlowKey = null;
         try
         {
-            _log($"DIRECT TCP ACCEPT app={target.AppLabel} appLocal={target.ClientEndpoint} client={key.ClientAddress}:{key.ClientPort} target={target.RemoteEndpoint} relayProcess={Environment.ProcessId} inboundLocal={inbound.Client.LocalEndPoint}");
+            LogDetail($"DIRECT TCP ACCEPT app={target.AppLabel} appLocal={target.ClientEndpoint} client={key.ClientAddress}:{key.ClientPort} target={target.RemoteEndpoint} relayProcess={Environment.ProcessId} inboundLocal={inbound.Client.LocalEndPoint}");
             var connectResult = await ConnectOutboundAsync(remoteEndPoint, target, cancellationToken).ConfigureAwait(false);
             using var outbound = connectResult.Client;
             outboundFlowKey = connectResult.FlowKey;
-            _log($"DIRECT TCP CONNECT app={target.AppLabel} appLocal={target.ClientEndpoint} client={key.ClientAddress}:{key.ClientPort} target={target.RemoteEndpoint} relayProcess={Environment.ProcessId} relayLocal={outbound.Client.LocalEndPoint}");
+            LogDetail($"DIRECT TCP CONNECT app={target.AppLabel} appLocal={target.ClientEndpoint} client={key.ClientAddress}:{key.ClientPort} target={target.RemoteEndpoint} relayProcess={Environment.ProcessId} relayLocal={outbound.Client.LocalEndPoint}");
 
             await using var inboundStream = inbound.GetStream();
             await using var outboundStream = outbound.GetStream();
-            var stats = new TcpRelayStats(key, target, _log, _timeProvider);
+            var stats = new TcpRelayStats(key, target, _detailedLogging ? LogDetail : null, _timeProvider);
             var upstream = CopyAndCountAsync("upstream", inboundStream, outboundStream, bytes => stats.AddUp(bytes), key, target, cancellationToken);
             var downstream = CopyAndCountAsync("downstream", outboundStream, inboundStream, bytes => stats.AddDown(bytes), key, target, cancellationToken);
 
@@ -237,7 +239,7 @@ internal sealed class TcpDirectRelay : IDisposable
         }
 
         var message = task.Exception?.GetBaseException().Message ?? "unknown copy failure";
-        _log($"DIRECT TCP {direction} copy failed app={target.AppLabel} appLocal={target.ClientEndpoint} client={key.ClientAddress}:{key.ClientPort} target={target.RemoteEndpoint} relayProcess={Environment.ProcessId}: {message}");
+        LogDetail($"DIRECT TCP {direction} copy failed app={target.AppLabel} appLocal={target.ClientEndpoint} client={key.ClientAddress}:{key.ClientPort} target={target.RemoteEndpoint} relayProcess={Environment.ProcessId}: {message}");
     }
 
     private static async Task WaitForRelayCompletionAsync(Task<long> upstream, Task<long> downstream, Socket inbound, Socket outbound, CancellationToken cancellationToken)
@@ -316,7 +318,7 @@ internal sealed class TcpDirectRelay : IDisposable
                 if (!loggedFirstChunk)
                 {
                     loggedFirstChunk = true;
-                    _log($"DIRECT TCP {direction} first-chunk app={target.AppLabel} appLocal={target.ClientEndpoint} client={key.ClientAddress}:{key.ClientPort} target={target.RemoteEndpoint} bytes={read} hex={FormatPreview(buffer.AsSpan(0, read))}");
+                    LogDetail($"DIRECT TCP {direction} first-chunk app={target.AppLabel} appLocal={target.ClientEndpoint} client={key.ClientAddress}:{key.ClientPort} target={target.RemoteEndpoint} bytes={read} hex={FormatPreview(buffer.AsSpan(0, read))}");
                 }
 
                 await destination.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
@@ -334,6 +336,14 @@ internal sealed class TcpDirectRelay : IDisposable
     {
         var previewLength = Math.Min(bytes.Length, 24);
         return Convert.ToHexString(bytes[..previewLength]);
+    }
+
+    private void LogDetail(string message)
+    {
+        if (_detailedLogging)
+        {
+            _log(message);
+        }
     }
 
     private async Task CleanupLoopAsync(CancellationToken cancellationToken)
@@ -370,7 +380,7 @@ internal sealed class TcpDirectRelay : IDisposable
         private readonly object _sync = new();
         private readonly TcpClientKey _key;
         private readonly DirectRelayTarget _target;
-        private readonly Action<string> _log;
+        private readonly Action<string>? _log;
         private readonly TimeProvider _timeProvider;
         private DateTimeOffset _lastUpLog;
         private DateTimeOffset _lastDownLog;
@@ -378,7 +388,7 @@ internal sealed class TcpDirectRelay : IDisposable
         private long _upBytes;
         private long _downBytes;
 
-        public TcpRelayStats(TcpClientKey key, DirectRelayTarget target, Action<string> log, TimeProvider timeProvider)
+        public TcpRelayStats(TcpClientKey key, DirectRelayTarget target, Action<string>? log, TimeProvider timeProvider)
         {
             _key = key;
             _target = target;
@@ -414,6 +424,11 @@ internal sealed class TcpDirectRelay : IDisposable
 
         private void LogLocked(string direction, ref DateTimeOffset lastLog, bool force)
         {
+            if (_log is null)
+            {
+                return;
+            }
+
             var now = _timeProvider.GetUtcNow();
             if (!force && lastLog != default && now - lastLog < TimeSpan.FromSeconds(5))
             {

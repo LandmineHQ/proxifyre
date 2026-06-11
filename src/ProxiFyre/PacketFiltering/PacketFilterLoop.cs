@@ -15,6 +15,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
     private readonly ProcessLookup _processLookup;
     private readonly HashSet<IntPtr> _adapters = [];
     private readonly Action<string> _log;
+    private readonly bool _detailedLogging;
     private readonly TimeProvider _timeProvider;
     private readonly Dictionary<string, DateTimeOffset> _detailLogTimes = [];
     private DateTimeOffset _lastPacketStatsLog;
@@ -24,12 +25,13 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
     private IntPtr _driverHandle;
     private bool _disposed;
 
-    public PacketFilterLoop(AppConfiguration configuration, TcpDirectRelay tcpRelay, UdpDirectRelay udpRelay, Action<string>? log = null, TimeProvider? timeProvider = null)
+    public PacketFilterLoop(AppConfiguration configuration, TcpDirectRelay tcpRelay, UdpDirectRelay udpRelay, Action<string>? log = null, bool detailedLogging = false, TimeProvider? timeProvider = null)
     {
         _configuration = configuration;
         _tcpRelay = tcpRelay;
         _udpRelay = udpRelay;
         _log = log ?? Console.WriteLine;
+        _detailedLogging = detailedLogging;
         _timeProvider = timeProvider ?? TimeProvider.System;
         _processLookup = new ProcessLookup(timeProvider: _timeProvider);
     }
@@ -255,6 +257,12 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             return;
         }
 
+        if (!packet.IsSynOnly)
+        {
+            Pass(buffer);
+            return;
+        }
+
         var process = LookupTcpOwner(packet);
         if (process is null)
         {
@@ -268,21 +276,16 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             return;
         }
 
-        if (packet.IsSynOnly)
-        {
-            LogDetail(
-                $"TCP APP MATCH {packet.Session} pid={process.ProcessId} name={process.Name} path={process.Path} pattern={matchedPattern}",
-                $"tcp-app-match:{process.ProcessId}:{packet.DestinationAddress}:{packet.DestinationPort}",
-                TimeSpan.FromSeconds(2));
-            var target = CreateTarget(packet, process, matchedPattern);
-            var clientKey = new TcpClientKey(packet.DestinationAddress, packet.SourcePort);
-            _tcpRelay.Register(relayKey, clientKey, target);
-            RedirectTcpClientToRelay(buffer, packet, target);
-            Revert(buffer);
-            return;
-        }
-
-        Pass(buffer);
+        LogAppConnection("TCP", packet, process, matchedPattern);
+        LogDetail(
+            $"TCP APP MATCH {packet.Session} pid={process.ProcessId} name={process.Name} path={process.Path} pattern={matchedPattern}",
+            $"tcp-app-match:{process.ProcessId}:{packet.DestinationAddress}:{packet.DestinationPort}",
+            TimeSpan.FromSeconds(2));
+        var target = CreateTarget(packet, process, matchedPattern);
+        var clientKey = new TcpClientKey(packet.DestinationAddress, packet.SourcePort);
+        _tcpRelay.Register(relayKey, clientKey, target);
+        RedirectTcpClientToRelay(buffer, packet, target);
+        Revert(buffer);
     }
 
     private void ProcessIncomingTcp(NdisApi.IntermediateBuffer* buffer, PacketView packet)
@@ -385,7 +388,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             return;
         }
 
-        var process = _processLookup.LookupUdpOwner(packet.UdpEndpoint, forceRefresh: true);
+        var process = _processLookup.LookupUdpOwner(packet.UdpEndpoint);
         if (process is null)
         {
             if (packet.SourcePort == 53 || packet.DestinationPort == 53)
@@ -414,6 +417,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             return;
         }
 
+        LogAppConnection("UDP", packet, process, matchedPattern);
         LogDetail(
             $"UDP APP MATCH {packet.SourceAddress}:{packet.SourcePort} -> {packet.DestinationAddress}:{packet.DestinationPort} pid={process.ProcessId} name={process.Name} path={process.Path} pattern={matchedPattern}",
             $"udp-app-match:{process.ProcessId}:{packet.DestinationAddress}:{packet.DestinationPort}",
@@ -455,7 +459,10 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         packet.DestinationPort = _udpRelay.Port;
         packet.RecalculateChecksums();
         buffer->Length = (uint)packet.PacketLength;
-        _log($"REDIRECT UDP app={target.AppLabel} appLocal={target.ClientEndpoint} client={packet.DestinationAddress}:{packet.SourcePort} target={target.RemoteEndpoint}");
+        LogDetail(
+            $"REDIRECT UDP app={target.AppLabel} appLocal={target.ClientEndpoint} client={packet.DestinationAddress}:{packet.SourcePort} target={target.RemoteEndpoint}",
+            $"udp-redirect:{target.ProcessId}:{target.ClientEndpoint}:{target.RemoteEndpoint}",
+            TimeSpan.FromSeconds(2));
         _packetsRedirected++;
         LogPacketStats();
         return true;
@@ -506,6 +513,12 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             matchedPattern ?? string.Empty,
             packet.SourceAddress,
             packet.SourcePort);
+    }
+
+    private void LogAppConnection(string protocol, PacketView packet, ProcessInfo process, string? matchedPattern)
+    {
+        _log(
+            $"APP {protocol} CONNECT app={process.Name} pid={process.ProcessId} local={packet.SourceAddress}:{packet.SourcePort} target={packet.DestinationAddress}:{packet.DestinationPort} pattern={matchedPattern}");
     }
 
     private ProcessInfo? LookupTcpOwner(PacketView packet)
@@ -598,6 +611,11 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
 
     private void LogPacketStats()
     {
+        if (!_detailedLogging)
+        {
+            return;
+        }
+
         var now = _timeProvider.GetUtcNow();
         if (_lastPacketStatsLog != default && now - _lastPacketStatsLog < TimeSpan.FromSeconds(5))
         {
@@ -610,6 +628,11 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
 
     private void LogDetail(string message, string key, TimeSpan interval)
     {
+        if (!_detailedLogging)
+        {
+            return;
+        }
+
         var now = _timeProvider.GetUtcNow();
         if (_detailLogTimes.TryGetValue(key, out var lastLogged) && now - lastLogged < interval)
         {

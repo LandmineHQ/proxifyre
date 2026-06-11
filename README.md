@@ -111,6 +111,8 @@ The test starts a temporary `proxifyre-test-core.exe` and writes a narrow config
 .\proxifyre.ps1 test curl-ipv4 -Detailed
 ```
 
+Normal core runs keep logs compact and only record when a configured application starts a TCP or UDP connection. Use `-Detailed` on the script, or `--detailed` on the executable, when packet-level relay diagnostics are needed.
+
 ## Configuration
 
 Minimal shape:

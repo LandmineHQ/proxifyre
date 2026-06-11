@@ -50,7 +50,9 @@ Task? coreOutputPump = null;
 var coreOutput = new BoundedLog(160);
 try
 {
-    core = StartProcess(coreAlias, $"--run --config \"{configPath}\"", coreDir, redirect: true);
+    core = StartProcess(coreAlias, $"--run --config \"{configPath}\"{(options.Detailed ? " --detailed" : string.Empty)}", coreDir, redirect: true);
+    Console.WriteLine($"Core process: {Path.GetFileName(coreAlias)} pid={core.Id}");
+    Console.WriteLine($"Observe network usage on this process, not on ProxiFyre.exe: {Path.GetFileName(coreAlias)}");
     coreOutputPump = CaptureProcessOutputAsync(core, coreOutput, options.Detailed, cts.Token);
 
     await WaitForLogLineAsync(logPath, "Packet filter started.", TimeSpan.FromSeconds(15), cts.Token);
@@ -595,14 +597,17 @@ sealed record TestOptions(
         }
 
         var common = "--http1.1 --noproxy \"*\" --proxy \"\" --connect-timeout 8 --max-time 20 -L -sS -o NUL -w \"status=%{http_code} bytes=%{size_download} remote=%{remote_ip} time=%{time_total}\\n\"";
+        var largeCommon = "--http1.1 --noproxy \"*\" --proxy \"\" --connect-timeout 8 --max-time 90 --limit-rate 1M -L -sS -o NUL -w \"status=%{http_code} bytes=%{size_download} remote=%{remote_ip} time=%{time_total}\\n\"";
         return mode.ToLowerInvariant() switch
         {
             "curl-ipv4" => new TestOptions(mode, TestKind.Curl, $"--ipv4 {common} https://www.bing.com/", detailed, string.Empty, 0, AddressFamily.Unspecified),
             "curl-ipv6" => new TestOptions(mode, TestKind.Curl, $"--ipv6 {common} https://ipv6.test-ipv6.com/", detailed, string.Empty, 0, AddressFamily.Unspecified),
             "curl-http-ipv4" => new TestOptions(mode, TestKind.Curl, $"--ipv4 {common} http://www.bing.com/", detailed, string.Empty, 0, AddressFamily.Unspecified),
+            "curl-large-ipv4" => new TestOptions(mode, TestKind.Curl, $"--ipv4 {largeCommon} https://speed.cloudflare.com/__down?bytes=26214400", detailed, string.Empty, 0, AddressFamily.Unspecified),
+            "curl-large-ipv6" => new TestOptions(mode, TestKind.Curl, $"--ipv6 {largeCommon} https://speed.cloudflare.com/__down?bytes=26214400", detailed, string.Empty, 0, AddressFamily.Unspecified),
             "stun-ipv4" => new TestOptions(mode, TestKind.Stun, null, detailed, "stun.l.google.com", 19302, AddressFamily.InterNetwork),
             "stun-ipv6" => new TestOptions(mode, TestKind.Stun, null, detailed, "stun.l.google.com", 19302, AddressFamily.InterNetworkV6),
-            _ => throw new ArgumentException($"Unknown test mode '{mode}'. Supported modes: curl-ipv4, curl-ipv6, curl-http-ipv4, stun-ipv4, stun-ipv6.")
+            _ => throw new ArgumentException($"Unknown test mode '{mode}'. Supported modes: curl-ipv4, curl-ipv6, curl-http-ipv4, curl-large-ipv4, curl-large-ipv6, stun-ipv4, stun-ipv6.")
         };
     }
 }

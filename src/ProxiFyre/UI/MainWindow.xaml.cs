@@ -32,6 +32,7 @@ public partial class MainWindow : Window
         LogList.ItemsSource = _logs;
         ConfigPathText.Text = _configPath;
         CoreProcessNameInput.Text = AppConfiguration.DefaultCoreProcessName;
+        UpdateCoreProcessInfo();
         ClearCoreLog();
         _coreProcessHost = new CoreProcessHost(AppendLog, () =>
         {
@@ -142,6 +143,7 @@ public partial class MainWindow : Window
             _coreProcessHost.Start(_configPath, configuration.CoreProcessName);
             SetRunning(true);
             AppendLog("Started direct relay core.");
+            UpdateCoreProcessInfo();
         }
         catch (Exception ex)
         {
@@ -279,6 +281,25 @@ public partial class MainWindow : Window
         StartStopButton.Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString(running ? "#C73535" : "#16803C"));
         StartStopButtonText.Text = running ? "暂停" : "启用";
         StartStopIcon.Data = Geometry.Parse(running ? "M 2 1 H 6 V 13 H 2 Z M 9 1 H 13 V 13 H 9 Z" : "M 2 1 L 13 7 L 2 13 Z");
+        UpdateCoreProcessInfo();
+    }
+
+    private void UpdateCoreProcessInfo()
+    {
+        if (_coreProcessHost is not null && _coreProcessHost.IsRunning)
+        {
+            var processName = _coreProcessHost.ProcessName ?? AppConfiguration.NormalizeCoreProcessName(CoreProcessNameInput.Text);
+            var processId = _coreProcessHost.ProcessId;
+            CoreProcessText.Text = processId is null
+                ? processName
+                : $"{processName}  pid={processId}";
+            NetworkOwnerHintText.Text = $"任务管理器中请观察 {processName}，relay 出站 socket 归属于该进程。";
+            return;
+        }
+
+        var configuredName = AppConfiguration.NormalizeCoreProcessName(CoreProcessNameInput.Text);
+        CoreProcessText.Text = $"未运行，启动后为 {configuredName}";
+        NetworkOwnerHintText.Text = "启动后查看核心进程，而不是 UI 的 ProxiFyre 进程。";
     }
 
     private void AppendLog(string message)

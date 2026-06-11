@@ -17,6 +17,23 @@ internal sealed class CoreProcessHost : IDisposable, IAsyncDisposable
 
     public bool IsRunning => _process is { HasExited: false };
 
+    public int? ProcessId => IsRunning ? _process?.Id : null;
+
+    public string? ProcessName
+    {
+        get
+        {
+            var process = _process;
+            if (process is null || process.HasExited)
+            {
+                return null;
+            }
+
+            var name = process.ProcessName;
+            return name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ? name : name + ".exe";
+        }
+    }
+
     public void Start(string configPath, string coreProcessName)
     {
         if (IsRunning)
@@ -55,6 +72,7 @@ internal sealed class CoreProcessHost : IDisposable, IAsyncDisposable
         }
 
         _process = process;
+        _log($"Core process started: {Path.GetFileName(corePath)} pid={process.Id}");
         process.BeginOutputReadLine();
         process.BeginErrorReadLine();
     }
