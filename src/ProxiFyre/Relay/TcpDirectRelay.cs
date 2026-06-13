@@ -20,6 +20,8 @@ internal sealed class TcpDirectRelay : IDisposable
     private readonly PacketWakeSignal? _packetWakeSignal;
     private readonly TimeProvider _timeProvider;
     private Action<DirectRelayTarget, uint, uint, byte, ushort, ReadOnlyMemory<byte>>? _packetInjector;
+    private Action<RelayOutboundFlow>? _outboundBypassRegister;
+    private Action<RelayOutboundFlow>? _outboundBypassUnregister;
 
     public TcpDirectRelay(Action<string>? log = null, bool detailedLogging = false, TrafficCounter? trafficCounter = null, PacketWakeSignal? packetWakeSignal = null, TimeProvider? timeProvider = null)
     {
@@ -33,6 +35,12 @@ internal sealed class TcpDirectRelay : IDisposable
     public void SetPacketInjector(Action<DirectRelayTarget, uint, uint, byte, ushort, ReadOnlyMemory<byte>> packetInjector)
     {
         _packetInjector = packetInjector;
+    }
+
+    public void SetOutboundBypass(Action<RelayOutboundFlow> register, Action<RelayOutboundFlow> unregister)
+    {
+        _outboundBypassRegister = register;
+        _outboundBypassUnregister = unregister;
     }
 
     public void Start(CancellationToken cancellationToken)
@@ -53,6 +61,8 @@ internal sealed class TcpDirectRelay : IDisposable
             _trafficCounter,
             _packetWakeSignal,
             _packetInjector,
+            _outboundBypassRegister,
+            _outboundBypassUnregister,
             TrackOutboundFlow,
             UntrackOutboundFlow,
             Remove,
@@ -152,6 +162,8 @@ internal sealed class TcpDirectRelay : IDisposable
         private readonly TrafficCounter _trafficCounter;
         private readonly PacketWakeSignal? _packetWakeSignal;
         private readonly Action<DirectRelayTarget, uint, uint, byte, ushort, ReadOnlyMemory<byte>>? _packetInjector;
+        private readonly Action<RelayOutboundFlow>? _outboundBypassRegister;
+        private readonly Action<RelayOutboundFlow>? _outboundBypassUnregister;
         private readonly Action<TcpRelayKey> _trackOutboundFlow;
         private readonly Action<TcpRelayKey> _untrackOutboundFlow;
         private readonly Action<TcpClientKey> _remove;
@@ -163,6 +175,7 @@ internal sealed class TcpDirectRelay : IDisposable
         private TcpClient? _client;
         private NetworkStream? _stream;
         private TcpRelayKey? _outboundFlowKey;
+        private RelayOutboundFlow? _outboundBypassFlow;
         private Task? _receiveTask;
         private Queue<byte[]>? _pendingWritePayloads;
         private SortedDictionary<uint, byte[]>? _pendingOutOfOrderPayloads;
@@ -189,6 +202,8 @@ internal sealed class TcpDirectRelay : IDisposable
             TrafficCounter trafficCounter,
             PacketWakeSignal? packetWakeSignal,
             Action<DirectRelayTarget, uint, uint, byte, ushort, ReadOnlyMemory<byte>>? packetInjector,
+            Action<RelayOutboundFlow>? outboundBypassRegister,
+            Action<RelayOutboundFlow>? outboundBypassUnregister,
             Action<TcpRelayKey> trackOutboundFlow,
             Action<TcpRelayKey> untrackOutboundFlow,
             Action<TcpClientKey> remove,
@@ -202,6 +217,8 @@ internal sealed class TcpDirectRelay : IDisposable
             _trafficCounter = trafficCounter;
             _packetWakeSignal = packetWakeSignal;
             _packetInjector = packetInjector;
+            _outboundBypassRegister = outboundBypassRegister;
+            _outboundBypassUnregister = outboundBypassUnregister;
             _trackOutboundFlow = trackOutboundFlow;
             _untrackOutboundFlow = untrackOutboundFlow;
             _remove = remove;
@@ -263,6 +280,7 @@ internal sealed class TcpDirectRelay : IDisposable
                     outboundFlowKey = new TcpRelayKey(remoteEndPoint.Address, (ushort)localEndPoint.Port, (ushort)remoteEndPoint.Port);
                     _trackOutboundFlow(outboundFlowKey.Value);
                     _outboundFlowKey = outboundFlowKey;
+                    RegisterOutboundBypass(PacketView.ProtocolTcp, remoteEndPoint.Address, (ushort)localEndPoint.Port, (ushort)remoteEndPoint.Port);
                 }
 
                 await client.ConnectAsync(remoteEndPoint, cancellationToken).ConfigureAwait(false);
@@ -735,6 +753,24 @@ internal sealed class TcpDirectRelay : IDisposable
                 _untrackOutboundFlow(outboundFlowKey);
                 _outboundFlowKey = null;
             }
+
+            if (_outboundBypassFlow is { } outboundBypassFlow)
+            {
+                _outboundBypassUnregister?.Invoke(outboundBypassFlow);
+                _outboundBypassFlow = null;
+            }
+        }
+
+        private void RegisterOutboundBypass(byte protocol, IPAddress remoteAddress, ushort localPort, ushort remotePort)
+        {
+            if (_target.AdapterHandle == IntPtr.Zero || localPort == 0)
+            {
+                return;
+            }
+
+            var outboundBypassFlow = new RelayOutboundFlow(_target.AdapterHandle, protocol, remoteAddress, localPort, remotePort);
+            _outboundBypassFlow = outboundBypassFlow;
+            _outboundBypassRegister?.Invoke(outboundBypassFlow);
         }
 
         private void CloseNetwork()

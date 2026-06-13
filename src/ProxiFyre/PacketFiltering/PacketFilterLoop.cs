@@ -16,6 +16,8 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
     private readonly bool _detailedLogging;
     private readonly TimeProvider _timeProvider;
     private readonly Dictionary<string, DateTimeOffset> _detailLogTimes = [];
+    private readonly object _outboundBypassSync = new();
+    private readonly Dictionary<RelayOutboundFlow, int> _outboundBypassFlows = [];
     private DateTimeOffset _lastPacketStatsLog;
     private long _packetsRead;
     private long _packetsPassed;
@@ -36,6 +38,8 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         _processLookup = new ProcessLookup(timeProvider: _timeProvider);
         _tcpRelay.SetPacketInjector(InjectTcpSegmentToClient);
         _udpRelay.SetResponseInjector(InjectUdpResponseToClient);
+        _tcpRelay.SetOutboundBypass(RegisterOutboundBypass, UnregisterOutboundBypass);
+        _udpRelay.SetOutboundBypass(RegisterOutboundBypass, UnregisterOutboundBypass);
     }
 
     public Task RunAsync(CancellationToken cancellationToken)
@@ -142,12 +146,14 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             var mode = new NdisApi.AdapterMode
             {
                 AdapterHandle = adapter,
-                Flags = NdisApi.MstcpFlagSentTunnel | NdisApi.MstcpFlagRecvTunnel
+                // Direct relay only needs to inspect app-originated packets. Keeping
+                // receive traffic on the normal stack preserves Windows traffic attribution.
+                Flags = NdisApi.MstcpFlagSentTunnel
             };
 
             if (!NdisApi.SetAdapterMode(_driverHandle, ref mode))
             {
-                _log($"Failed to set tunnel mode for adapter handle 0x{adapter.ToInt64():X}.");
+                _log($"Failed to set send tunnel mode for adapter handle 0x{adapter.ToInt64():X}.");
             }
         }
 
@@ -156,7 +162,73 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             throw new InvalidOperationException("No TCP/IP adapters were returned by WinpkFilter.");
         }
 
-        _log($"Filtering {_adapters.Count} adapter(s).");
+        _log($"Filtering {_adapters.Count} adapter(s) on send path.");
+    }
+
+    private void RegisterOutboundBypass(RelayOutboundFlow flow)
+    {
+        lock (_outboundBypassSync)
+        {
+            _outboundBypassFlows.TryGetValue(flow, out var count);
+            _outboundBypassFlows[flow] = count + 1;
+            ApplyOutboundBypassFilters();
+        }
+
+        LogDetail($"Registered relay outbound kernel pass flow: {flow}", $"relay-pass-register:{flow}", TimeSpan.FromSeconds(2));
+    }
+
+    private void UnregisterOutboundBypass(RelayOutboundFlow flow)
+    {
+        lock (_outboundBypassSync)
+        {
+            if (!_outboundBypassFlows.TryGetValue(flow, out var count))
+            {
+                return;
+            }
+
+            if (count <= 1)
+            {
+                _outboundBypassFlows.Remove(flow);
+            }
+            else
+            {
+                _outboundBypassFlows[flow] = count - 1;
+            }
+
+            ApplyOutboundBypassFilters();
+        }
+
+        LogDetail($"Unregistered relay outbound kernel pass flow: {flow}", $"relay-pass-unregister:{flow}", TimeSpan.FromSeconds(2));
+    }
+
+    private void ApplyOutboundBypassFilters()
+    {
+        if (_driverHandle == IntPtr.Zero)
+        {
+            return;
+        }
+
+        var filters = new List<NdisApi.StaticFilter>(_outboundBypassFlows.Count * Math.Max(_adapters.Count, 1));
+        foreach (var flow in _outboundBypassFlows.Keys)
+        {
+            foreach (var adapter in _adapters)
+            {
+                filters.Add(NdisApi.CreateOutboundPassFilter(
+                    adapter,
+                    flow.Protocol,
+                    flow.RemoteAddress,
+                    flow.LocalPort,
+                    flow.RemotePort));
+            }
+        }
+
+        if (!NdisApi.SetPacketFilterTable(_driverHandle, filters))
+        {
+            LogThrottled(
+                $"SetPacketFilterTable failed for relay outbound pass flows count={filters.Count} win32={NdisApi.LastWin32Error}",
+                "set-static-filter-failed",
+                TimeSpan.FromSeconds(2));
+        }
     }
 
     private bool TryReadAndProcessPacket()
@@ -854,6 +926,18 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         _log(message);
     }
 
+    private void LogThrottled(string message, string key, TimeSpan interval)
+    {
+        var now = _timeProvider.GetUtcNow();
+        if (_detailLogTimes.TryGetValue(key, out var lastLogged) && now - lastLogged < interval)
+        {
+            return;
+        }
+
+        _detailLogTimes[key] = now;
+        _log(message);
+    }
+
     private static string FormatTcpFlags(byte flags)
     {
         Span<char> chars = stackalloc char[8];
@@ -934,6 +1018,11 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         }
 
         _disposed = true;
+
+        if (_driverHandle != IntPtr.Zero)
+        {
+            NdisApi.ResetPacketFilterTable(_driverHandle);
+        }
 
         foreach (var adapter in _adapters)
         {

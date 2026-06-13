@@ -1,3 +1,4 @@
+using System.Net;
 using System.Runtime.InteropServices;
 using Microsoft.Win32.SafeHandles;
 
@@ -24,6 +25,8 @@ internal static unsafe class NdisApi
     private static readonly uint IoctlSetAdapterMode = CtlCode(FileDeviceNdisrd, NdisrdIoctlIndex + 5, MethodBuffered, FileAnyAccess);
     private static readonly uint IoctlFlushAdapterQueue = CtlCode(FileDeviceNdisrd, NdisrdIoctlIndex + 6, MethodBuffered, FileAnyAccess);
     private static readonly uint IoctlSetEvent = CtlCode(FileDeviceNdisrd, NdisrdIoctlIndex + 7, MethodBuffered, FileAnyAccess);
+    private static readonly uint IoctlSetPacketFilters = CtlCode(FileDeviceNdisrd, NdisrdIoctlIndex + 14, MethodBuffered, FileAnyAccess);
+    private static readonly uint IoctlResetPacketFilters = CtlCode(FileDeviceNdisrd, NdisrdIoctlIndex + 15, MethodBuffered, FileAnyAccess);
     private static readonly uint IoctlReadPacketsUnsorted = CtlCode(FileDeviceNdisrd, NdisrdIoctlIndex + 25, MethodBuffered, FileAnyAccess);
 
     public const int AdapterListSize = 32;
@@ -35,6 +38,20 @@ internal static unsafe class NdisApi
     public const uint MstcpFlagRecvTunnel = 0x00000002;
     public const uint PacketFlagOnSend = 0x00000001;
     public const uint PacketFlagOnReceive = 0x00000002;
+    public const uint FilterPacketPass = 0x00000001;
+    public const uint NetworkLayerValid = 0x00000002;
+    public const uint TransportLayerValid = 0x00000004;
+    public const uint Ipv4 = 0x00000001;
+    public const uint Ipv6 = 0x00000002;
+    public const uint Ipv4FilterDestAddress = 0x00000002;
+    public const uint Ipv4FilterProtocol = 0x00000004;
+    public const uint Ipv6FilterDestAddress = 0x00000002;
+    public const uint Ipv6FilterProtocol = 0x00000004;
+    public const uint IpSubnetV4Type = 0x00000001;
+    public const uint IpSubnetV6Type = 0x00000001;
+    public const uint TcpUdp = 0x00000001;
+    public const uint TcpUdpSrcPort = 0x00000001;
+    public const uint TcpUdpDestPort = 0x00000002;
 
     public static int LastWin32Error => Marshal.GetLastWin32Error();
 
@@ -153,6 +170,106 @@ internal static unsafe class NdisApi
         return DeviceIoControl(handle, IoctlSetEvent, &adapterEvent, (uint)sizeof(AdapterEvent), null, 0, out _, IntPtr.Zero);
     }
 
+    public static bool SetPacketFilterTable(IntPtr handle, IReadOnlyList<StaticFilter> filters)
+    {
+        if (filters.Count == 0)
+        {
+            return ResetPacketFilterTable(handle);
+        }
+
+        var filterSize = sizeof(StaticFilter);
+        var tableSize = checked(sizeof(uint) * 2 + (filterSize * filters.Count));
+        var table = new byte[tableSize];
+        fixed (byte* tablePtr = table)
+        {
+            *(uint*)tablePtr = (uint)filters.Count;
+            *(uint*)(tablePtr + sizeof(uint)) = 0;
+            var filterPtr = tablePtr + (sizeof(uint) * 2);
+            for (var i = 0; i < filters.Count; i++)
+            {
+                *(StaticFilter*)(filterPtr + (i * filterSize)) = filters[i];
+            }
+
+            return DeviceIoControl(handle, IoctlSetPacketFilters, tablePtr, (uint)table.Length, null, 0, out _, IntPtr.Zero);
+        }
+    }
+
+    public static bool ResetPacketFilterTable(IntPtr handle)
+    {
+        return DeviceIoControl(handle, IoctlResetPacketFilters, null, 0, null, 0, out _, IntPtr.Zero);
+    }
+
+    public static StaticFilter CreateOutboundPassFilter(IntPtr adapter, byte protocol, IPAddress remoteAddress, ushort sourcePort, ushort destinationPort)
+    {
+        remoteAddress = NetworkAddress.Normalize(remoteAddress);
+        var filter = new StaticFilter
+        {
+            AdapterHandle = adapter.ToInt64(),
+            DirectionFlags = PacketFlagOnSend,
+            FilterAction = FilterPacketPass,
+            ValidFields = NetworkLayerValid | TransportLayerValid,
+            NetworkSelector = remoteAddress.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork ? Ipv4 : Ipv6,
+            TransportSelector = TcpUdp,
+            TransportValidFields = TcpUdpSrcPort | TcpUdpDestPort,
+            TransportSourcePortStart = sourcePort,
+            TransportSourcePortEnd = sourcePort,
+            TransportDestinationPortStart = destinationPort,
+            TransportDestinationPortEnd = destinationPort
+        };
+
+        if (remoteAddress.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+        {
+            WriteIpv4Filter(&filter, remoteAddress, protocol);
+        }
+        else
+        {
+            WriteIpv6Filter(&filter, remoteAddress, protocol);
+        }
+
+        return filter;
+    }
+
+    private static void WriteIpv4Filter(StaticFilter* filter, IPAddress destinationAddress, byte protocol)
+    {
+        var addressBytes = destinationAddress.GetAddressBytes();
+        var address = MemoryMarshal.Read<uint>(addressBytes);
+        var ipv4 = new Ipv4Filter
+        {
+            ValidFields = Ipv4FilterDestAddress | Ipv4FilterProtocol,
+            DestinationAddressType = IpSubnetV4Type,
+            DestinationAddress = address,
+            DestinationMask = 0xFFFFFFFF,
+            Protocol = protocol
+        };
+
+        WriteNetworkUnion(filter, &ipv4, sizeof(Ipv4Filter));
+    }
+
+    private static void WriteIpv6Filter(StaticFilter* filter, IPAddress destinationAddress, byte protocol)
+    {
+        var ipv6 = new Ipv6Filter
+        {
+            ValidFields = Ipv6FilterDestAddress | Ipv6FilterProtocol,
+            DestinationAddressType = IpSubnetV6Type,
+            Protocol = protocol
+        };
+
+        var addressBytes = destinationAddress.GetAddressBytes();
+        for (var i = 0; i < 16; i++)
+        {
+            ipv6.DestinationAddress[i] = addressBytes[i];
+            ipv6.DestinationMask[i] = 0xFF;
+        }
+
+        WriteNetworkUnion(filter, &ipv6, sizeof(Ipv6Filter));
+    }
+
+    private static void WriteNetworkUnion(StaticFilter* filter, void* source, int length)
+    {
+        var destination = filter->NetworkUnion;
+        Buffer.MemoryCopy(source, destination, StaticFilter.NetworkUnionLength, length);
+    }
+
     private static uint CtlCode(uint deviceType, uint function, uint method, uint access)
     {
         return (deviceType << 16) | (access << 14) | (function << 2) | method;
@@ -189,6 +306,70 @@ internal static unsafe class NdisApi
     {
         public IntPtr AdapterHandle;
         public uint Flags;
+    }
+
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    public unsafe struct StaticFilter
+    {
+        public const int NetworkUnionLength = 80;
+
+        public long AdapterHandle;
+        public uint DirectionFlags;
+        public uint FilterAction;
+        public uint ValidFields;
+        public uint LastReset;
+        public ulong PacketsIn;
+        public ulong BytesIn;
+        public ulong PacketsOut;
+        public ulong BytesOut;
+        public uint DataLinkSelector;
+        public uint DataLinkValidFields;
+        public fixed byte DataLinkSourceAddress[6];
+        public fixed byte DataLinkDestinationAddress[6];
+        public ushort DataLinkProtocol;
+        public ushort DataLinkPadding;
+        public uint NetworkSelector;
+        public fixed byte NetworkUnion[NetworkUnionLength];
+        public uint TransportSelector;
+        public uint TransportValidFields;
+        public ushort TransportSourcePortStart;
+        public ushort TransportSourcePortEnd;
+        public ushort TransportDestinationPortStart;
+        public ushort TransportDestinationPortEnd;
+        public byte TransportTcpFlags;
+        public fixed byte TransportPadding[3];
+    }
+
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    private struct Ipv4Filter
+    {
+        public uint ValidFields;
+        public uint SourceAddressType;
+        public uint SourceAddress;
+        public uint SourceMask;
+        public uint DestinationAddressType;
+        public uint DestinationAddress;
+        public uint DestinationMask;
+        public byte Protocol;
+        public byte Padding0;
+        public byte Padding1;
+        public byte Padding2;
+    }
+
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    private unsafe struct Ipv6Filter
+    {
+        public uint ValidFields;
+        public uint SourceAddressType;
+        public fixed byte SourceAddress[16];
+        public fixed byte SourceMask[16];
+        public uint DestinationAddressType;
+        public fixed byte DestinationAddress[16];
+        public fixed byte DestinationMask[16];
+        public byte Protocol;
+        public byte Padding0;
+        public byte Padding1;
+        public byte Padding2;
     }
 
     [StructLayout(LayoutKind.Sequential, Pack = 1)]

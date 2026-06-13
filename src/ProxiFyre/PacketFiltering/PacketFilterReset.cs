@@ -19,6 +19,8 @@ internal static class PacketFilterReset
                 throw new InvalidOperationException("Failed to enumerate TCP/IP bound adapters.");
             }
 
+            NdisApi.ResetPacketFilterTable(handle);
+
             var resetCount = 0;
             for (var i = 0; i < adapterList.Count; i++)
             {

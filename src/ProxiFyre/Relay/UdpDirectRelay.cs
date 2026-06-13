@@ -16,6 +16,8 @@ internal sealed class UdpDirectRelay : IDisposable
     private readonly PacketWakeSignal? _packetWakeSignal;
     private readonly TimeProvider _timeProvider;
     private Action<DirectRelayTarget, IPEndPoint, ReadOnlyMemory<byte>>? _responseInjector;
+    private Action<RelayOutboundFlow>? _outboundBypassRegister;
+    private Action<RelayOutboundFlow>? _outboundBypassUnregister;
     private CancellationToken _cancellationToken;
 
     public UdpDirectRelay(Action<string>? log = null, bool detailedLogging = false, TrafficCounter? trafficCounter = null, PacketWakeSignal? packetWakeSignal = null, TimeProvider? timeProvider = null)
@@ -30,6 +32,12 @@ internal sealed class UdpDirectRelay : IDisposable
     public void SetResponseInjector(Action<DirectRelayTarget, IPEndPoint, ReadOnlyMemory<byte>> responseInjector)
     {
         _responseInjector = responseInjector;
+    }
+
+    public void SetOutboundBypass(Action<RelayOutboundFlow> register, Action<RelayOutboundFlow> unregister)
+    {
+        _outboundBypassRegister = register;
+        _outboundBypassUnregister = unregister;
     }
 
     public void Start(CancellationToken cancellationToken)
@@ -62,7 +70,15 @@ internal sealed class UdpDirectRelay : IDisposable
 
     public bool IsRelayOutboundEndpoint(UdpEndpointKey endpoint)
     {
-        return _relayOutboundEndpoints.ContainsKey(endpoint);
+        if (_relayOutboundEndpoints.ContainsKey(endpoint))
+        {
+            return true;
+        }
+
+        var wildcardAddress = endpoint.LocalAddress.AddressFamily == AddressFamily.InterNetwork
+            ? IPAddress.Any
+            : IPAddress.IPv6Any;
+        return _relayOutboundEndpoints.ContainsKey(new UdpEndpointKey(wildcardAddress, endpoint.LocalPort));
     }
 
     public void Remove(UdpRelayKey key)
@@ -111,13 +127,21 @@ internal sealed class UdpDirectRelay : IDisposable
             socket.Bind(NetworkEndpointResolver.CreateAnyEndPoint(remoteEndPoint.AddressFamily));
         }
 
+        socket.Connect(remoteEndPoint);
+        var outboundBypassFlow = default(RelayOutboundFlow?);
         if (socket.LocalEndPoint is IPEndPoint localEndPoint)
         {
-            _relayOutboundEndpoints[new UdpEndpointKey(localEndPoint.Address, (ushort)localEndPoint.Port)] = 0;
+            var localPort = (ushort)localEndPoint.Port;
+            _relayOutboundEndpoints[new UdpEndpointKey(localEndPoint.Address, localPort)] = 0;
+            _relayOutboundEndpoints[new UdpEndpointKey(CreateWildcardAddress(localEndPoint.AddressFamily), localPort)] = 0;
+            if (target.AdapterHandle != IntPtr.Zero)
+            {
+                outboundBypassFlow = new RelayOutboundFlow(target.AdapterHandle, PacketView.ProtocolUdp, remoteEndPoint.Address, localPort, (ushort)remoteEndPoint.Port);
+                _outboundBypassRegister?.Invoke(outboundBypassFlow.Value);
+            }
         }
 
-        socket.Connect(remoteEndPoint);
-        var relaySocket = new UdpRelaySocket(socket, key, target, clientEndPoint, remoteEndPoint, Remove, _relayOutboundEndpoints, _trafficCounter, _packetWakeSignal, _responseInjector, _detailedLogging ? LogDetail : null, _log, _timeProvider);
+        var relaySocket = new UdpRelaySocket(socket, key, target, clientEndPoint, remoteEndPoint, outboundBypassFlow, Remove, _relayOutboundEndpoints, _outboundBypassUnregister, _trafficCounter, _packetWakeSignal, _responseInjector, _detailedLogging ? LogDetail : null, _log, _timeProvider);
         relaySocket.Start(cancellationToken);
         return relaySocket;
     }
@@ -139,6 +163,13 @@ internal sealed class UdpDirectRelay : IDisposable
         }
 
         return socket;
+    }
+
+    private static IPAddress CreateWildcardAddress(AddressFamily addressFamily)
+    {
+        return addressFamily == AddressFamily.InterNetwork
+            ? IPAddress.Any
+            : IPAddress.IPv6Any;
     }
 
     private async Task CleanupLoopAsync(CancellationToken cancellationToken)
@@ -176,8 +207,10 @@ internal sealed class UdpDirectRelay : IDisposable
         private readonly DirectRelayTarget _target;
         private readonly IPEndPoint _clientEndPoint;
         private readonly IPEndPoint _remoteEndPoint;
+        private readonly RelayOutboundFlow? _outboundBypassFlow;
         private readonly Action<UdpRelayKey> _remove;
         private readonly ConcurrentDictionary<UdpEndpointKey, byte> _relayOutboundEndpoints;
+        private readonly Action<RelayOutboundFlow>? _outboundBypassUnregister;
         private readonly TrafficCounter _trafficCounter;
         private readonly PacketWakeSignal? _packetWakeSignal;
         private readonly Action<DirectRelayTarget, IPEndPoint, ReadOnlyMemory<byte>>? _responseInjector;
@@ -191,15 +224,17 @@ internal sealed class UdpDirectRelay : IDisposable
         private long _downBytes;
         private bool _sniProbeFinished;
 
-        public UdpRelaySocket(Socket remoteSocket, UdpRelayKey key, DirectRelayTarget target, IPEndPoint clientEndPoint, IPEndPoint remoteEndPoint, Action<UdpRelayKey> remove, ConcurrentDictionary<UdpEndpointKey, byte> relayOutboundEndpoints, TrafficCounter trafficCounter, PacketWakeSignal? packetWakeSignal, Action<DirectRelayTarget, IPEndPoint, ReadOnlyMemory<byte>>? responseInjector, Action<string>? detailLog, Action<string> errorLog, TimeProvider timeProvider)
+        public UdpRelaySocket(Socket remoteSocket, UdpRelayKey key, DirectRelayTarget target, IPEndPoint clientEndPoint, IPEndPoint remoteEndPoint, RelayOutboundFlow? outboundBypassFlow, Action<UdpRelayKey> remove, ConcurrentDictionary<UdpEndpointKey, byte> relayOutboundEndpoints, Action<RelayOutboundFlow>? outboundBypassUnregister, TrafficCounter trafficCounter, PacketWakeSignal? packetWakeSignal, Action<DirectRelayTarget, IPEndPoint, ReadOnlyMemory<byte>>? responseInjector, Action<string>? detailLog, Action<string> errorLog, TimeProvider timeProvider)
         {
             _remoteSocket = remoteSocket;
             _key = key;
             _target = target;
             _clientEndPoint = clientEndPoint;
             _remoteEndPoint = remoteEndPoint;
+            _outboundBypassFlow = outboundBypassFlow;
             _remove = remove;
             _relayOutboundEndpoints = relayOutboundEndpoints;
+            _outboundBypassUnregister = outboundBypassUnregister;
             _trafficCounter = trafficCounter;
             _packetWakeSignal = packetWakeSignal;
             _responseInjector = responseInjector;
@@ -318,7 +353,14 @@ internal sealed class UdpDirectRelay : IDisposable
         {
             if (_remoteSocket.LocalEndPoint is IPEndPoint localEndPoint)
             {
-                _relayOutboundEndpoints.TryRemove(new UdpEndpointKey(localEndPoint.Address, (ushort)localEndPoint.Port), out _);
+                var localPort = (ushort)localEndPoint.Port;
+                _relayOutboundEndpoints.TryRemove(new UdpEndpointKey(localEndPoint.Address, localPort), out _);
+                _relayOutboundEndpoints.TryRemove(new UdpEndpointKey(CreateWildcardAddress(localEndPoint.AddressFamily), localPort), out _);
+            }
+
+            if (_outboundBypassFlow is { } outboundBypassFlow)
+            {
+                _outboundBypassUnregister?.Invoke(outboundBypassFlow);
             }
 
             _remoteSocket.Dispose();
