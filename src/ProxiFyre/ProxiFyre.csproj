@@ -20,7 +20,7 @@
     <Description>Pure C# direct traffic relay for selected Windows applications.</Description>
     <Company>NT KERNEL</Company>
     <Product>ProxiFyre</Product>
-    <Version>3.0.1</Version>
+    <Version>3.0.2</Version>
   </PropertyGroup>
   <ItemGroup>
     <Using Remove='System.Drawing' />
