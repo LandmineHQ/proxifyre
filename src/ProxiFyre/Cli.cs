@@ -67,7 +67,8 @@ internal static class Cli
             logger.Info($"Configuration path: {configPath}");
             logger.Info($"Relay network activity process: {System.Diagnostics.Process.GetCurrentProcess().ProcessName}.exe");
             logger.Info($"Detailed logging: {(detailedLogging ? "enabled" : "disabled")}");
-            await WinpkFilterDependency.EnsureInstalledAsync(logger.Info).ConfigureAwait(false);
+            var winpkFilterManager = new WinpkFilterManager(logger.Info);
+            await winpkFilterManager.EnsureInstalledAsync().ConfigureAwait(false);
             using var cts = new CancellationTokenSource();
             Console.CancelKeyPress += (_, e) =>
             {

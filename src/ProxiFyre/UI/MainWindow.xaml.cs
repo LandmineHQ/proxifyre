@@ -1,19 +1,11 @@
 using System.Collections.ObjectModel;
-using System.ComponentModel;
 using System.Diagnostics;
 using System.Globalization;
-using System.Runtime.InteropServices;
 using System.IO;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Windows;
-using System.Windows.Controls;
-using System.Windows.Data;
-using System.Windows.Input;
-using System.Windows.Interop;
-using System.Windows.Media;
-using System.Windows.Media.Imaging;
 using Microsoft.Win32;
 using Forms = System.Windows.Forms;
 
@@ -27,13 +19,13 @@ public partial class MainWindow : Window
         @"(?:^|\s)TRAFFIC up=(?<up>\d+) down=(?<down>\d+) upRate=(?<upRate>\d+) downRate=(?<downRate>\d+)",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
-    private readonly ObservableCollection<ConfiguredApplication> _apps = [];
-    private readonly ICollectionView _appsView;
+    private readonly ApplicationRulesManager _rulesManager = new();
     private readonly ObservableCollection<string> _logs = [];
-    private readonly string _configPath = Path.Combine(AppContext.BaseDirectory, "app-config.json");
-    private readonly CoreProcessHost _coreProcessHost;
+    private readonly ConfigurationStore _configurationStore = new(Path.Combine(AppContext.BaseDirectory, "app-config.json"));
+    private readonly SettingsViewModel _settingsViewModel = new();
+    private readonly WinpkFilterManager _winpkFilterManager;
+    private readonly CoreRelayController _coreRelayController;
     private readonly Forms.NotifyIcon _trayIcon;
-    private string _lastSavedConfigurationKey = string.Empty;
     private bool _hasShownTrayHint;
     private bool _hasCheckedForUpdates;
     private bool _isAnnouncementDismissed;
@@ -43,22 +35,34 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
         _trayIcon = CreateTrayIcon();
-        _appsView = CollectionViewSource.GetDefaultView(_apps);
-        _appsView.Filter = FilterApp;
-        _appsView.SortDescriptions.Add(new SortDescription(nameof(ConfiguredApplication.Kind), ListSortDirection.Ascending));
-        _appsView.SortDescriptions.Add(new SortDescription(nameof(ConfiguredApplication.Name), ListSortDirection.Ascending));
-        AppsList.ItemsSource = _appsView;
-        LogList.ItemsSource = _logs;
-        ConfigPathText.Text = _configPath;
-        CoreProcessNameInput.Text = AppConfiguration.DefaultCoreProcessName;
-        LoadLocalManifestInfo();
-        SetVersionStatusChecking();
-        UpdateCoreProcessInfo();
-        ClearCoreLog();
-        _coreProcessHost = new CoreProcessHost(AppendLog, () =>
+        Tabs.Apps.ItemsSource = _rulesManager.View;
+        Tabs.Logs.ItemsSource = _logs;
+        Tabs.SetSettingsViewModel(_settingsViewModel);
+        Tabs.SetConfigPath(_configurationStore.Path);
+        Tabs.SearchChanged += (_, _) => _rulesManager.SetSearchText(Tabs.SearchText);
+        Tabs.EditAppRequested += Tabs_EditAppRequested;
+        Tabs.RemoveAppRequested += Tabs_RemoveAppRequested;
+        Tabs.ReloadRequested += (_, _) => LoadConfig();
+        Tabs.WinpkFilterActionRequested += Tabs_WinpkFilterActionRequested;
+        Header.OpenSourceRequested += (_, _) => OpenSource();
+        Header.StartStopRequested += Header_StartStopRequested;
+        Announcement.DismissRequested += (_, _) => DismissAnnouncement();
+        RuleEntry.AddRuleRequested += (_, e) => AddApp(e.Text);
+        RuleEntry.BrowseApplicationRequested += (_, _) => BrowseApplication();
+        RuleEntry.BrowseDirectoryRequested += (_, _) => BrowseDirectory();
+        RuleEntry.CoreProcessNameChanged += (_, _) => SaveCoreProcessName();
+        RuleEntry.CoreProcessName = AppConfiguration.DefaultCoreProcessName;
+        _winpkFilterManager = new WinpkFilterManager(AppendLog);
+        _winpkFilterManager.StatusChanged += WinpkFilterManager_StatusChanged;
+        _coreRelayController = new CoreRelayController(_configurationStore, _winpkFilterManager, AppendLog, () =>
         {
             Dispatcher.InvokeAsync(() => SetRunning(false));
         });
+        LoadLocalManifestInfo();
+        SetVersionStatusChecking();
+        UpdateCoreProcessInfo();
+        RefreshSettingsInfo();
+        ClearCoreLog();
         LoadConfig();
         Loaded += MainWindow_Loaded;
     }
@@ -177,39 +181,32 @@ public partial class MainWindow : Window
         var text = announcement?.Trim();
         if (_isAnnouncementDismissed || string.IsNullOrWhiteSpace(text))
         {
-            AnnouncementText.Text = string.Empty;
-            AnnouncementBorder.Visibility = Visibility.Collapsed;
+            Announcement.HideAnnouncement();
             return;
         }
 
-        AnnouncementText.Text = text;
-        AnnouncementBorder.Visibility = Visibility.Visible;
+        Announcement.ShowAnnouncement(text);
     }
 
-    private void CloseAnnouncementButton_Click(object sender, RoutedEventArgs e)
+    private void DismissAnnouncement()
     {
         _isAnnouncementDismissed = true;
-        AnnouncementText.Text = string.Empty;
-        AnnouncementBorder.Visibility = Visibility.Collapsed;
+        Announcement.HideAnnouncement();
     }
 
     private void SetVersionStatusChecking()
     {
-        LocalVersionText.Text = UpdateChecker.CurrentVersion;
-        RemoteVersionText.Text = "检查中";
-        RemoteVersionText.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#667085"));
+        Header.SetVersionChecking(UpdateChecker.CurrentVersion);
     }
 
     private void SetVersionStatusRemote(string version, bool hasUpdate)
     {
-        RemoteVersionText.Text = version;
-        RemoteVersionText.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString(hasUpdate ? "#B54708" : "#067647"));
+        Header.SetRemoteVersion(version, hasUpdate);
     }
 
     private void SetVersionStatusFailed()
     {
-        RemoteVersionText.Text = "获取失败";
-        RemoteVersionText.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#C73535"));
+        Header.SetVersionFailed();
     }
 
     private void ClearCoreLog()
@@ -228,25 +225,20 @@ public partial class MainWindow : Window
 
     private void LoadConfig()
     {
-        _apps.Clear();
+        _rulesManager.Clear();
         try
         {
-            if (!File.Exists(_configPath))
-            {
-                SaveConfig();
-                return;
-            }
-
-            var configuration = AppConfiguration.Load(_configPath);
-            CoreProcessNameInput.Text = configuration.CoreProcessName;
+            var configuration = _configurationStore.LoadOrCreate(RuleEntry.CoreProcessName, _rulesManager.BuildApps());
+            RuleEntry.CoreProcessName = configuration.CoreProcessName;
+            _settingsViewModel.SetLicenseKey(configuration.LicenseKey);
 
             foreach (var app in configuration.Apps)
             {
-                AddLoadedApp(app);
+                _rulesManager.AddLoadedRule(app);
             }
 
-            AppendLog($"Loaded {_apps.Count} app rule(s).");
-            _lastSavedConfigurationKey = BuildLocalConfigurationKey();
+            AppendLog($"Loaded {_rulesManager.Rules.Count} app rule(s).");
+            _configurationStore.MarkLoaded(RuleEntry.CoreProcessName, _rulesManager.BuildApps());
         }
         catch (Exception ex)
         {
@@ -256,53 +248,27 @@ public partial class MainWindow : Window
 
     private bool SaveConfig()
     {
-        CoreProcessNameInput.Text = AppConfiguration.NormalizeCoreProcessName(CoreProcessNameInput.Text);
-        var configurationKey = BuildLocalConfigurationKey();
-        if (string.Equals(configurationKey, _lastSavedConfigurationKey, StringComparison.Ordinal))
-        {
-            return false;
-        }
-
-        AppConfiguration.SaveApps(_configPath, BuildApps(), CoreProcessNameInput.Text, GetSavedLicenseKey());
-        _lastSavedConfigurationKey = configurationKey;
-        return true;
+        RuleEntry.NormalizeCoreProcessName();
+        return _configurationStore.Save(RuleEntry.CoreProcessName, _rulesManager.BuildApps());
     }
 
     private string? GetSavedLicenseKey()
     {
-        try
-        {
-            return File.Exists(_configPath)
-                ? AppConfiguration.Load(_configPath).LicenseKey
-                : null;
-        }
-        catch
-        {
-            return null;
-        }
+        return _configurationStore.GetLicenseKey();
     }
 
-    private void SaveLicenseKey(string licenseKey)
+    private void RefreshSettingsInfo()
     {
-        CoreProcessNameInput.Text = AppConfiguration.NormalizeCoreProcessName(CoreProcessNameInput.Text);
-        AppConfiguration.SaveApps(_configPath, BuildApps(), CoreProcessNameInput.Text, licenseKey);
-        _lastSavedConfigurationKey = BuildLocalConfigurationKey();
+        _settingsViewModel.SetLicenseKey(GetSavedLicenseKey());
+        _settingsViewModel.ApplyWinpkFilterStatus(_winpkFilterManager.RefreshStatus());
     }
 
-    private string BuildLocalConfigurationKey()
+    private void WinpkFilterManager_StatusChanged(object? sender, WinpkFilterStatus status)
     {
-        return AppConfiguration.NormalizeCoreProcessName(CoreProcessNameInput.Text)
-            + "\n"
-            + string.Join("\n", BuildApps().Order(StringComparer.OrdinalIgnoreCase));
+        Dispatcher.InvokeAsync(() => _settingsViewModel.ApplyWinpkFilterStatus(status));
     }
 
-    private void AddButton_Click(object sender, RoutedEventArgs e)
-    {
-        AddApp(AppInput.Text.Trim());
-        AppInput.Clear();
-    }
-
-    private void BrowseButton_Click(object sender, RoutedEventArgs e)
+    private void BrowseApplication()
     {
         var dialog = new OpenFileDialog
         {
@@ -316,7 +282,7 @@ public partial class MainWindow : Window
         }
     }
 
-    private void BrowseDirectoryButton_Click(object sender, RoutedEventArgs e)
+    private void BrowseDirectory()
     {
         var dialog = new OpenFolderDialog
         {
@@ -329,20 +295,23 @@ public partial class MainWindow : Window
         }
     }
 
-    private void EditAppButton_Click(object sender, RoutedEventArgs e)
+    private void Tabs_EditAppRequested(object? sender, ItemRequestedEventArgs e)
     {
-        if ((sender as FrameworkElement)?.DataContext is not ConfiguredApplication selected)
+        if (e.Item is ConfiguredApplication selected)
         {
-            return;
+            EditApplication(selected);
         }
+    }
 
-        if (selected.Kind == AppRuleKind.ExecutablePath)
+    private void EditApplication(ConfiguredApplication selected)
+    {
+        if (selected.Kind == ApplicationRuleKind.ExecutablePath)
         {
             ReselectApplicationPath(selected);
             return;
         }
 
-        if (selected.Kind == AppRuleKind.DirectoryPath)
+        if (selected.Kind == ApplicationRuleKind.DirectoryPath)
         {
             ReselectDirectory(selected);
             return;
@@ -351,20 +320,62 @@ public partial class MainWindow : Window
         EditCustomRule(selected);
     }
 
-    private void RemoveAppButton_Click(object sender, RoutedEventArgs e)
+    private void Tabs_RemoveAppRequested(object? sender, ItemRequestedEventArgs e)
     {
-        if ((sender as FrameworkElement)?.DataContext is ConfiguredApplication selected)
+        if (e.Item is ConfiguredApplication selected)
         {
             RemoveApplication(selected);
         }
     }
 
-    private void ReloadButton_Click(object sender, RoutedEventArgs e)
+    private async void Tabs_WinpkFilterActionRequested(object? sender, EventArgs e)
     {
-        LoadConfig();
+        if (_coreRelayController.IsRunning)
+        {
+            MessageBox.Show(this, "请先暂停核心，再修改 WinpkFilter 安装状态。", "ProxiFyre", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        var status = _winpkFilterManager.RefreshStatus();
+        if (status.IsInstalled)
+        {
+            var result = MessageBox.Show(
+                this,
+                "确定要卸载 WinpkFilter 吗？卸载后需要重新安装才能启用 relay。",
+                "卸载 WinpkFilter",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Warning);
+            if (result != MessageBoxResult.Yes)
+            {
+                return;
+            }
+        }
+
+        try
+        {
+            _settingsViewModel.SetWinpkFilterBusy(status.IsInstalled ? "正在卸载 WinpkFilter..." : "正在安装 WinpkFilter...");
+            if (status.IsInstalled)
+            {
+                await _winpkFilterManager.UninstallAsync();
+            }
+            else
+            {
+                await _winpkFilterManager.EnsureInstalledAsync();
+            }
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"WinpkFilter action failed: {ex.Message}");
+            MessageBox.Show(this, ex.Message, "WinpkFilter", MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+        finally
+        {
+            _settingsViewModel.ApplyWinpkFilterStatus(_winpkFilterManager.RefreshStatus());
+            _settingsViewModel.SetWinpkFilterIdle();
+        }
     }
 
-    private void OpenSourceButton_Click(object sender, RoutedEventArgs e)
+    private void OpenSource()
     {
         try
         {
@@ -380,39 +391,29 @@ public partial class MainWindow : Window
         }
     }
 
-    private async void StartStopButton_Click(object sender, RoutedEventArgs e)
+    private async void Header_StartStopRequested(object? sender, EventArgs e)
     {
-        if (_coreProcessHost.IsRunning)
+        if (_coreRelayController.IsRunning)
         {
-            await _coreProcessHost.StopAsync();
+            await _coreRelayController.StopAsync();
             SetRunning(false);
             return;
         }
 
         try
         {
-            SaveConfig();
-            var configuration = AppConfiguration.Load(_configPath);
-            var deviceId = LicenseKey.GetCurrentDeviceId();
-            if (!LicenseKey.IsValid(deviceId, configuration.LicenseKey))
+            Header.StartStopEnabled = false;
+            var result = await _coreRelayController.StartAsync(
+                RuleEntry.CoreProcessName,
+                _rulesManager.BuildApps(),
+                (deviceId, currentKey) => RegistrationDialog.Show(this, deviceId, currentKey));
+            if (result == CoreRelayStartResult.Canceled)
             {
-                var licenseKey = RegistrationDialog.Show(this, deviceId, configuration.LicenseKey);
-                if (licenseKey is null)
-                {
-                    AppendLog("Start canceled: license key is missing or invalid.");
-                    return;
-                }
-
-                SaveLicenseKey(licenseKey);
-                configuration = AppConfiguration.Load(_configPath);
-                AppendLog("License key saved.");
+                return;
             }
 
-            StartStopButton.IsEnabled = false;
-            await WinpkFilterDependency.EnsureInstalledAsync(AppendLog);
-            _coreProcessHost.Start(_configPath, configuration.CoreProcessName);
+            _settingsViewModel.SetLicenseKey(_configurationStore.GetLicenseKey());
             SetRunning(true);
-            AppendLog("Started direct relay core.");
             UpdateCoreProcessInfo();
         }
         catch (Exception ex)
@@ -422,77 +423,41 @@ public partial class MainWindow : Window
         }
         finally
         {
-            StartStopButton.IsEnabled = true;
+            Header.StartStopEnabled = true;
         }
     }
 
     private void AddApp(string value)
     {
-        if (string.IsNullOrWhiteSpace(value))
+        if (!_rulesManager.AddRule(value, out var app))
         {
+            if (!string.IsNullOrWhiteSpace(value) && _rulesManager.Contains(value.Trim()))
+            {
+                ShowDuplicateRuleMessage(value.Trim());
+            }
+
             return;
         }
 
-        if (!TryCreateApplicationFromInput(value, out var app))
-        {
-            return;
-        }
-
-        if (ContainsApp(app.Value))
-        {
-            ShowDuplicateRuleMessage(app.Value);
-            return;
-        }
-
-        _apps.Add(app);
         var saved = SaveConfig();
         AppendLog($"Added {app.Value}");
         AppendHotReloadHint(saved);
     }
 
-    private void AddLoadedApp(string value)
-    {
-        if (TryCreateBrowsedApplication(value, out var app))
-        {
-            if (!ContainsApp(app.Value))
-            {
-                _apps.Add(app);
-            }
-
-            return;
-        }
-
-        if (TryCreateDirectoryApplication(value, out app))
-        {
-            if (!ContainsApp(app.Value))
-            {
-                _apps.Add(app);
-            }
-
-            return;
-        }
-
-        if (!ContainsApp(value))
-        {
-            _apps.Add(ConfiguredApplication.CreateRule(value));
-        }
-    }
-
     private void AddBrowsedApplication(string filePath)
     {
-        if (!TryCreateBrowsedApplication(filePath, out var app))
+        if (!ApplicationRulesManager.TryCreateApplicationPath(filePath, out var app))
         {
             AppendLog($"Invalid application path: {filePath}");
             return;
         }
 
-        if (ContainsApp(app.FilePath))
+        if (!_rulesManager.AddApplicationPath(filePath, out app))
         {
             ShowDuplicateRuleMessage(app.FilePath);
             return;
         }
 
-        _apps.Add(app);
         var saved = SaveConfig();
         AppendLog($"Added {app.FilePath}");
         AppendHotReloadHint(saved);
@@ -500,48 +465,33 @@ public partial class MainWindow : Window
 
     private void AddBrowsedDirectory(string directoryPath)
     {
-        if (!TryCreateDirectoryApplication(directoryPath, out var app))
+        if (!ApplicationRulesManager.TryCreateDirectoryPath(directoryPath, out var app))
         {
             AppendLog($"Invalid directory path: {directoryPath}");
             return;
         }
 
-        if (ContainsApp(app.Value))
+        if (!_rulesManager.AddDirectoryPath(directoryPath, out app))
         {
             ShowDuplicateRuleMessage(app.Value);
             return;
         }
 
-        _apps.Add(app);
         var saved = SaveConfig();
         AppendLog($"Added {app.Value}");
         AppendHotReloadHint(saved);
     }
 
-    private void CoreProcessNameInput_LostFocus(object sender, RoutedEventArgs e)
+    private void SaveCoreProcessName()
     {
         var saved = SaveConfig();
         UpdateCoreProcessInfo();
         AppendCoreProcessNameHintIfRunning(saved);
-    }
-
-    private void CoreProcessNameInput_KeyDown(object sender, System.Windows.Input.KeyEventArgs e)
-    {
-        if (e.Key != Key.Enter)
-        {
-            return;
-        }
-
-        e.Handled = true;
-        var saved = SaveConfig();
-        UpdateCoreProcessInfo();
-        AppendCoreProcessNameHintIfRunning(saved);
-        Keyboard.ClearFocus();
     }
 
     private void AppendHotReloadHint(bool saved)
     {
-        if (saved && _coreProcessHost.IsRunning)
+        if (saved && _coreRelayController.IsRunning)
         {
             AppendLog("配置已保存，核心将热加载规则；已有连接不会被重启。");
         }
@@ -549,93 +499,10 @@ public partial class MainWindow : Window
 
     private void AppendCoreProcessNameHintIfRunning(bool saved)
     {
-        if (saved && _coreProcessHost.IsRunning)
+        if (saved && _coreRelayController.IsRunning)
         {
             AppendLog("核心进程名已保存；当前核心进程文件名会在下次启动时生效，应用规则已热加载。");
         }
-    }
-
-    private bool ContainsApp(string value)
-    {
-        return ContainsApp(value, except: null);
-    }
-
-    private bool ContainsApp(string value, ConfiguredApplication? except)
-    {
-        return _apps.Any(app =>
-            !ReferenceEquals(app, except)
-            && string.Equals(app.Value, value, StringComparison.OrdinalIgnoreCase));
-    }
-
-    private IEnumerable<string> BuildApps()
-    {
-        foreach (var app in _apps
-            .OrderBy(app => app.Kind)
-            .ThenBy(app => app.Name, StringComparer.OrdinalIgnoreCase))
-        {
-            yield return app.Value;
-        }
-    }
-
-    private static bool TryCreateBrowsedApplication(string value, out ConfiguredApplication app)
-    {
-        app = default!;
-        if (string.IsNullOrWhiteSpace(value))
-        {
-            return false;
-        }
-
-        var trimmed = value.Trim();
-        if (!trimmed.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
-        {
-            return false;
-        }
-
-        if (!Path.IsPathFullyQualified(trimmed))
-        {
-            return false;
-        }
-
-        var fullPath = Path.GetFullPath(trimmed);
-        app = ConfiguredApplication.CreateExecutable(
-            fullPath,
-            IconLoader.ExtractIcon(fullPath));
-        return true;
-    }
-
-    private static bool TryCreateApplicationFromInput(string value, out ConfiguredApplication app)
-    {
-        app = default!;
-        if (string.IsNullOrWhiteSpace(value))
-        {
-            return false;
-        }
-
-        var trimmed = value.Trim();
-        if (TryCreateBrowsedApplication(trimmed, out app))
-        {
-            return true;
-        }
-
-        if (TryCreateDirectoryApplication(trimmed, out app))
-        {
-            return true;
-        }
-
-        app = ConfiguredApplication.CreateRule(trimmed);
-        return true;
-    }
-
-    private static bool TryCreateDirectoryApplication(string value, out ConfiguredApplication app)
-    {
-        app = default!;
-        if (!ProcessMatcher.TryNormalizeDirectoryPattern(value, out var directoryPath))
-        {
-            return false;
-        }
-
-        app = ConfiguredApplication.CreateDirectory(directoryPath);
-        return true;
     }
 
     private void ReselectApplicationPath(ConfiguredApplication selected)
@@ -657,7 +524,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (!TryCreateBrowsedApplication(dialog.FileName, out var replacement))
+        if (!ApplicationRulesManager.TryCreateApplicationPath(dialog.FileName, out var replacement))
         {
             AppendLog($"Invalid application path: {dialog.FileName}");
             return;
@@ -683,7 +550,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (!TryCreateDirectoryApplication(dialog.FolderName, out var replacement))
+        if (!ApplicationRulesManager.TryCreateDirectoryPath(dialog.FolderName, out var replacement))
         {
             AppendLog($"Invalid directory path: {dialog.FolderName}");
             return;
@@ -700,7 +567,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (!TryCreateApplicationFromInput(updatedValue, out var replacement))
+        if (!ApplicationRulesManager.TryCreateApplication(updatedValue, out var replacement))
         {
             return;
         }
@@ -715,20 +582,17 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (ContainsApp(replacement.Value, selected))
+        if (_rulesManager.Contains(replacement.Value, selected))
         {
             ShowDuplicateRuleMessage(replacement.Value);
             return;
         }
 
-        var index = _apps.IndexOf(selected);
-        if (index < 0)
+        if (!_rulesManager.Replace(selected, replacement))
         {
             return;
         }
 
-        _apps[index] = replacement;
-        _appsView.Refresh();
         var saved = SaveConfig();
         AppendLog($"Updated {selected.Value} -> {replacement.Value}");
         AppendHotReloadHint(saved);
@@ -736,7 +600,7 @@ public partial class MainWindow : Window
 
     private void RemoveApplication(ConfiguredApplication selected)
     {
-        if (!_apps.Remove(selected))
+        if (!_rulesManager.Remove(selected))
         {
             return;
         }
@@ -751,31 +615,9 @@ public partial class MainWindow : Window
         MessageBox.Show(this, $"规则已存在：{value}", "ProxiFyre", MessageBoxButton.OK, MessageBoxImage.Information);
     }
 
-    private void SearchBox_TextChanged(object sender, System.Windows.Controls.TextChangedEventArgs e)
-    {
-        _appsView.Refresh();
-    }
-
-    private bool FilterApp(object item)
-    {
-        if (item is not ConfiguredApplication app)
-        {
-            return false;
-        }
-
-        return FuzzyMatcher.IsMatch(SearchBox?.Text, app.SearchText);
-    }
-
     private void SetRunning(bool running)
     {
-        StatusText.Text = running ? "运行中" : "已暂停";
-        StatusText.Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString(running ? "#067647" : "#475467"));
-        StatusDot.Fill = new SolidColorBrush((Color)ColorConverter.ConvertFromString(running ? "#17B26A" : "#98A2B3"));
-        StatusBadge.Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString(running ? "#ECFDF3" : "#EEF2F7"));
-
-        StartStopButton.Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString(running ? "#C73535" : "#16803C"));
-        StartStopButtonText.Text = running ? "暂停" : "启用";
-        StartStopIcon.Data = Geometry.Parse(running ? "M 2 1 H 6 V 13 H 2 Z M 9 1 H 13 V 13 H 9 Z" : "M 2 1 L 13 7 L 2 13 Z");
+        Header.SetRunning(running);
         if (!running)
         {
             UpdateTrafficStatus(TrafficSnapshot.Empty);
@@ -786,20 +628,8 @@ public partial class MainWindow : Window
 
     private void UpdateCoreProcessInfo()
     {
-        if (_coreProcessHost is not null && _coreProcessHost.IsRunning)
-        {
-            var processName = _coreProcessHost.ProcessName ?? AppConfiguration.NormalizeCoreProcessName(CoreProcessNameInput.Text);
-            var processId = _coreProcessHost.ProcessId;
-            CoreProcessText.Text = processId is null
-                ? processName
-                : $"{processName}  pid={processId}";
-            NetworkOwnerHintText.Text = $"任务管理器中请观察 {processName}，relay 出站 socket 归属于该进程。";
-            return;
-        }
-
-        var configuredName = AppConfiguration.NormalizeCoreProcessName(CoreProcessNameInput.Text);
-        CoreProcessText.Text = $"未运行，启动后为 {configuredName}";
-        NetworkOwnerHintText.Text = "启动后查看核心进程，而不是 UI 的 ProxiFyre 进程。";
+        var info = _coreRelayController.GetDisplayInfo(RuleEntry.CoreProcessName);
+        Tabs.SetCoreProcessInfo(info.Text, info.NetworkOwnerHint);
     }
 
     private void AppendLog(string message)
@@ -818,7 +648,7 @@ public partial class MainWindow : Window
                 _logs.RemoveAt(0);
             }
 
-            LogList.ScrollIntoView(_logs.LastOrDefault());
+            Tabs.ScrollLogToEnd();
         });
     }
 
@@ -841,8 +671,9 @@ public partial class MainWindow : Window
 
     private void UpdateTrafficStatus(TrafficSnapshot snapshot)
     {
-        TrafficUploadText.Text = $"↑ {FormatBytes(snapshot.UploadBytesPerSecond)}/s · {FormatBytes(snapshot.UploadBytes)}";
-        TrafficDownloadText.Text = $"↓ {FormatBytes(snapshot.DownloadBytesPerSecond)}/s · {FormatBytes(snapshot.DownloadBytes)}";
+        Tabs.SetTrafficStatus(
+            $"↑ {FormatBytes(snapshot.UploadBytesPerSecond)}/s · {FormatBytes(snapshot.UploadBytes)}",
+            $"↓ {FormatBytes(snapshot.DownloadBytesPerSecond)}/s · {FormatBytes(snapshot.DownloadBytes)}");
     }
 
     private static string FormatBytes(long bytes)
@@ -874,7 +705,7 @@ public partial class MainWindow : Window
     {
         _trayIcon.Visible = false;
         _trayIcon.Dispose();
-        _coreProcessHost.Dispose();
+        _coreRelayController.Dispose();
         base.OnClosed(e);
     }
 
@@ -928,492 +759,4 @@ public partial class MainWindow : Window
         Activate();
     }
 
-    private sealed record ConfiguredApplication(
-        string Name,
-        string Value,
-        string Detail,
-        AppRuleKind Kind,
-        ImageSource? Icon)
-    {
-        public string FilePath => Kind == AppRuleKind.ExecutablePath ? Value : string.Empty;
-
-        public string DirectoryPath => Kind == AppRuleKind.DirectoryPath ? Value : string.Empty;
-
-        public string KindText => Kind switch
-        {
-            AppRuleKind.ExecutablePath => "应用",
-            AppRuleKind.DirectoryPath => "目录",
-            _ => "规则"
-        };
-
-        public string PrimaryActionText => Kind == AppRuleKind.CustomRule ? "编辑" : "重选";
-
-        public string IconText => Kind switch
-        {
-            AppRuleKind.ExecutablePath => string.Empty,
-            AppRuleKind.DirectoryPath => "D",
-            _ => "*"
-        };
-
-        public string SearchText => $"{Name} {Value} {Detail}";
-
-        public static ConfiguredApplication CreateExecutable(string filePath, ImageSource? icon)
-        {
-            return new ConfiguredApplication(
-                System.IO.Path.GetFileName(filePath),
-                filePath,
-                filePath,
-                AppRuleKind.ExecutablePath,
-                icon);
-        }
-
-        public static ConfiguredApplication CreateDirectory(string directoryPath)
-        {
-            var normalized = ProcessMatcher.TryNormalizeDirectoryPattern(directoryPath, out var normalizedDirectory)
-                ? normalizedDirectory
-                : directoryPath;
-            var trimmed = Path.TrimEndingDirectorySeparator(normalized);
-            var name = Path.GetFileName(trimmed);
-            if (string.IsNullOrWhiteSpace(name))
-            {
-                name = normalized;
-            }
-
-            return new ConfiguredApplication(
-                name,
-                normalized,
-                normalized,
-                AppRuleKind.DirectoryPath,
-                null);
-        }
-
-        public static ConfiguredApplication CreateRule(string rule)
-        {
-            return new ConfiguredApplication(
-                rule,
-                rule,
-                "自定义 apps 规则",
-                AppRuleKind.CustomRule,
-                null);
-        }
-    }
-
-    private enum AppRuleKind
-    {
-        ExecutablePath = 0,
-        DirectoryPath = 1,
-        CustomRule = 2
-    }
-
-    private static class FuzzyMatcher
-    {
-        public static bool IsMatch(string? query, string text)
-        {
-            var normalizedQuery = Normalize(query);
-            if (normalizedQuery.Length == 0)
-            {
-                return true;
-            }
-
-            var normalizedText = Normalize(text);
-            if (normalizedText.Contains(normalizedQuery, StringComparison.Ordinal))
-            {
-                return true;
-            }
-
-            var queryIndex = 0;
-            foreach (var character in normalizedText)
-            {
-                if (character != normalizedQuery[queryIndex])
-                {
-                    continue;
-                }
-
-                queryIndex++;
-                if (queryIndex == normalizedQuery.Length)
-                {
-                    return true;
-                }
-            }
-
-            return false;
-        }
-
-        private static string Normalize(string? value)
-        {
-            if (string.IsNullOrWhiteSpace(value))
-            {
-                return string.Empty;
-            }
-
-            var builder = new StringBuilder(value.Length);
-            foreach (var character in value.Normalize(NormalizationForm.FormKC))
-            {
-                if (character is '-' or '_' or ' ' || char.IsWhiteSpace(character))
-                {
-                    continue;
-                }
-
-                builder.Append(char.ToLower(character, CultureInfo.InvariantCulture));
-            }
-
-            return builder.ToString();
-        }
-    }
-
-    private static class IconLoader
-    {
-        public static ImageSource? ExtractIcon(string path)
-        {
-            var iconHandle = IntPtr.Zero;
-            try
-            {
-                iconHandle = ExtractAssociatedIcon(IntPtr.Zero, path, out _);
-                if (iconHandle == IntPtr.Zero)
-                {
-                    return null;
-                }
-
-                var source = Imaging.CreateBitmapSourceFromHIcon(
-                    iconHandle,
-                    Int32Rect.Empty,
-                    BitmapSizeOptions.FromWidthAndHeight(32, 32));
-                source.Freeze();
-                return source;
-            }
-            catch
-            {
-                return null;
-            }
-            finally
-            {
-                if (iconHandle != IntPtr.Zero)
-                {
-                    DestroyIcon(iconHandle);
-                }
-            }
-        }
-
-        [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
-        private static extern IntPtr ExtractAssociatedIcon(IntPtr hInst, string pszIconPath, out ushort piIcon);
-
-        [DllImport("user32.dll", SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool DestroyIcon(IntPtr hIcon);
-    }
-
-    private sealed class RegistrationDialog : Window
-    {
-        private readonly string _deviceId;
-        private readonly System.Windows.Controls.TextBox _keyInput;
-
-        private RegistrationDialog(string deviceId, string? currentKey)
-        {
-            _deviceId = deviceId;
-            Title = "注册 ProxiFyre";
-            Owner = System.Windows.Application.Current.MainWindow;
-            Width = 520;
-            MinWidth = 460;
-            MinHeight = 300;
-            SizeToContent = SizeToContent.Height;
-            ResizeMode = ResizeMode.NoResize;
-            WindowStartupLocation = WindowStartupLocation.CenterOwner;
-            Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#F3F6FA"));
-
-            var root = new Grid
-            {
-                Margin = new Thickness(18)
-            };
-            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-
-            var title = new TextBlock
-            {
-                Text = "需要注册后才能启用核心",
-                FontSize = 16,
-                FontWeight = FontWeights.SemiBold,
-                Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#111827"))
-            };
-            root.Children.Add(title);
-
-            var subtitle = new TextBlock
-            {
-                Text = "请复制当前设备码，并输入对应注册码。",
-                Margin = new Thickness(0, 6, 0, 16),
-                Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#667085"))
-            };
-            Grid.SetRow(subtitle, 1);
-            root.Children.Add(subtitle);
-
-            var deviceLabel = new TextBlock
-            {
-                Text = "当前设备码",
-                FontWeight = FontWeights.SemiBold,
-                Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#1F2937"))
-            };
-            Grid.SetRow(deviceLabel, 2);
-            root.Children.Add(deviceLabel);
-
-            var deviceRow = new Grid
-            {
-                Margin = new Thickness(0, 8, 0, 14)
-            };
-            deviceRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-            deviceRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-
-            var deviceInput = new System.Windows.Controls.TextBox
-            {
-                Text = deviceId,
-                IsReadOnly = true,
-                MinHeight = 34,
-                Padding = new Thickness(9, 6, 9, 6),
-                VerticalContentAlignment = VerticalAlignment.Center
-            };
-            deviceRow.Children.Add(deviceInput);
-
-            var copyButton = new Button
-            {
-                Content = "复制",
-                MinWidth = 72,
-                Margin = new Thickness(8, 0, 0, 0),
-                Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#EEF2F7")),
-                Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#1F2937"))
-            };
-            copyButton.Click += (_, _) =>
-            {
-                Clipboard.SetText(_deviceId);
-                copyButton.Content = "已复制";
-            };
-            Grid.SetColumn(copyButton, 1);
-            deviceRow.Children.Add(copyButton);
-
-            Grid.SetRow(deviceRow, 3);
-            root.Children.Add(deviceRow);
-
-            var keyLabel = new TextBlock
-            {
-                Text = "注册码",
-                FontWeight = FontWeights.SemiBold,
-                Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#1F2937"))
-            };
-            Grid.SetRow(keyLabel, 4);
-            root.Children.Add(keyLabel);
-
-            var keyArea = new StackPanel
-            {
-                Margin = new Thickness(0, 8, 0, 0)
-            };
-
-            _keyInput = new System.Windows.Controls.TextBox
-            {
-                Text = currentKey ?? string.Empty,
-                MinHeight = 34,
-                Padding = new Thickness(9, 6, 9, 6),
-                VerticalContentAlignment = VerticalAlignment.Center
-            };
-            _keyInput.SelectAll();
-            _keyInput.KeyDown += Input_KeyDown;
-            keyArea.Children.Add(_keyInput);
-
-            var buttons = new StackPanel
-            {
-                Orientation = Orientation.Horizontal,
-                HorizontalAlignment = HorizontalAlignment.Right,
-                Margin = new Thickness(0, 16, 0, 0)
-            };
-
-            var cancel = new Button
-            {
-                Content = "取消",
-                MinWidth = 72,
-                Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#EEF2F7")),
-                Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#1F2937")),
-                Margin = new Thickness(0, 0, 8, 0)
-            };
-            cancel.Click += (_, _) => DialogResult = false;
-            buttons.Children.Add(cancel);
-
-            var confirm = new Button
-            {
-                Content = "确定",
-                MinWidth = 72,
-                Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#2563EB")),
-                Foreground = Brushes.White
-            };
-            confirm.Click += (_, _) => Confirm();
-            buttons.Children.Add(confirm);
-            keyArea.Children.Add(buttons);
-
-            Grid.SetRow(keyArea, 5);
-            root.Children.Add(keyArea);
-
-            Content = root;
-            Loaded += (_, _) => _keyInput.Focus();
-        }
-
-        public string KeyText => _keyInput.Text.Trim();
-
-        public static string? Show(Window owner, string deviceId, string? currentKey)
-        {
-            var dialog = new RegistrationDialog(deviceId, currentKey)
-            {
-                Owner = owner
-            };
-
-            return dialog.ShowDialog() == true
-                ? dialog.KeyText
-                : null;
-        }
-
-        private void Input_KeyDown(object sender, System.Windows.Input.KeyEventArgs e)
-        {
-            if (e.Key == Key.Enter)
-            {
-                e.Handled = true;
-                Confirm();
-            }
-        }
-
-        private void Confirm()
-        {
-            if (!LicenseKey.IsValid(_deviceId, _keyInput.Text))
-            {
-                MessageBox.Show(this, "注册码无效。", "ProxiFyre", MessageBoxButton.OK, MessageBoxImage.Warning);
-                _keyInput.Focus();
-                _keyInput.SelectAll();
-                return;
-            }
-
-            DialogResult = true;
-        }
-    }
-
-    private sealed class RuleEditDialog : Window
-    {
-        private readonly System.Windows.Controls.TextBox _input;
-
-        private RuleEditDialog(string currentValue)
-        {
-            Title = "编辑应用规则";
-            Owner = System.Windows.Application.Current.MainWindow;
-            Width = 460;
-            MinHeight = 210;
-            MinWidth = 420;
-            SizeToContent = SizeToContent.Height;
-            ResizeMode = ResizeMode.NoResize;
-            WindowStartupLocation = WindowStartupLocation.CenterOwner;
-            Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#F3F6FA"));
-
-            var root = new Grid
-            {
-                Margin = new Thickness(16)
-            };
-            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-
-            var label = new TextBlock
-            {
-                Text = "应用规则",
-                FontWeight = FontWeights.SemiBold,
-                Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#1F2937"))
-            };
-            root.Children.Add(label);
-
-            _input = new System.Windows.Controls.TextBox
-            {
-                Text = currentValue,
-                MinHeight = 32,
-                Margin = new Thickness(0, 8, 0, 6),
-                Padding = new Thickness(9, 5, 9, 5),
-                VerticalContentAlignment = VerticalAlignment.Center
-            };
-            _input.SelectAll();
-            _input.KeyDown += Input_KeyDown;
-            Grid.SetRow(_input, 1);
-            root.Children.Add(_input);
-
-            var hint = new TextBlock
-            {
-                Text = "例如 chrome.exe、完整 exe 路径，或目录路径。",
-                FontSize = 12,
-                Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#667085"))
-            };
-            Grid.SetRow(hint, 2);
-            root.Children.Add(hint);
-
-            var buttons = new StackPanel
-            {
-                Orientation = Orientation.Horizontal,
-                HorizontalAlignment = HorizontalAlignment.Right,
-                Margin = new Thickness(0, 14, 0, 0)
-            };
-
-            var cancel = new Button
-            {
-                Content = "取消",
-                MinWidth = 72,
-                Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#EEF2F7")),
-                Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#1F2937")),
-                Margin = new Thickness(0, 0, 8, 0)
-            };
-            cancel.Click += (_, _) => DialogResult = false;
-            buttons.Children.Add(cancel);
-
-            var confirm = new Button
-            {
-                Content = "保存",
-                MinWidth = 72,
-                Background = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#2563EB")),
-                Foreground = Brushes.White
-            };
-            confirm.Click += (_, _) => Confirm();
-            buttons.Children.Add(confirm);
-
-            Grid.SetRow(buttons, 3);
-            root.Children.Add(buttons);
-
-            Content = root;
-            Loaded += (_, _) => _input.Focus();
-        }
-
-        public string RuleText => _input.Text.Trim();
-
-        public static string? Show(Window owner, string currentValue)
-        {
-            var dialog = new RuleEditDialog(currentValue)
-            {
-                Owner = owner
-            };
-
-            return dialog.ShowDialog() == true
-                ? dialog.RuleText
-                : null;
-        }
-
-        private void Input_KeyDown(object sender, System.Windows.Input.KeyEventArgs e)
-        {
-            if (e.Key == Key.Enter)
-            {
-                e.Handled = true;
-                Confirm();
-            }
-        }
-
-        private void Confirm()
-        {
-            if (string.IsNullOrWhiteSpace(_input.Text))
-            {
-                MessageBox.Show(this, "请输入应用规则。", "ProxiFyre", MessageBoxButton.OK, MessageBoxImage.Information);
-                return;
-            }
-
-            DialogResult = true;
-        }
-    }
 }

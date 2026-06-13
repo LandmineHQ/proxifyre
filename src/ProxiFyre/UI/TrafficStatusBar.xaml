@@ -1,0 +1,19 @@
+<UserControl x:Class="ProxiFyre.TrafficStatusBar"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <DockPanel Margin="12,0,12,12" LastChildFill="False">
+        <StackPanel Orientation="Horizontal" DockPanel.Dock="Right" HorizontalAlignment="Right">
+            <TextBlock x:Name="TrafficUploadText"
+                       Text="↑ 0 B/s · 0 B"
+                       FontFamily="Consolas"
+                       FontSize="12"
+                       Foreground="#475467"
+                       Margin="0,0,16,0" />
+            <TextBlock x:Name="TrafficDownloadText"
+                       Text="↓ 0 B/s · 0 B"
+                       FontFamily="Consolas"
+                       FontSize="12"
+                       Foreground="#475467" />
+        </StackPanel>
+    </DockPanel>
+</UserControl>

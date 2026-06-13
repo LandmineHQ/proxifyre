@@ -1,0 +1,19 @@
+<UserControl x:Class="ProxiFyre.LogsTab"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <UserControl.Resources>
+        <SolidColorBrush x:Key="BorderBrush" Color="#D8DEE8" />
+
+        <Style TargetType="ListBox">
+            <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="Padding" Value="0" />
+        </Style>
+    </UserControl.Resources>
+
+    <Grid Margin="12">
+        <ListBox x:Name="LogList"
+                 FontFamily="Consolas"
+                 FontSize="12" />
+    </Grid>
+</UserControl>

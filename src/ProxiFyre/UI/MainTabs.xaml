@@ -1,0 +1,51 @@
+<UserControl x:Class="ProxiFyre.MainTabs"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:local="clr-namespace:ProxiFyre"
+             Background="Transparent">
+    <UserControl.Resources>
+        <SolidColorBrush x:Key="PanelBrush" Color="#FFFFFF" />
+        <SolidColorBrush x:Key="BorderBrush" Color="#D8DEE8" />
+
+        <Style TargetType="TabControl">
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderThickness" Value="0" />
+        </Style>
+
+        <Style TargetType="TabItem">
+            <Setter Property="Padding" Value="14,7" />
+            <Setter Property="Margin" Value="0,0,4,0" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+        </Style>
+    </UserControl.Resources>
+
+    <Border Background="{StaticResource PanelBrush}"
+            BorderBrush="{StaticResource BorderBrush}"
+            BorderThickness="1"
+            CornerRadius="8"
+            Padding="0">
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="*" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+
+            <TabControl>
+                <TabItem Header="应用规则">
+                    <local:ApplicationRulesTab x:Name="ApplicationRulesTab" />
+                </TabItem>
+                <TabItem Header="运行信息">
+                    <local:RuntimeInfoTab x:Name="RuntimeInfoTab" />
+                </TabItem>
+                <TabItem Header="设置">
+                    <local:SettingsTab x:Name="SettingsTab" />
+                </TabItem>
+                <TabItem Header="日志">
+                    <local:LogsTab x:Name="LogsTab" />
+                </TabItem>
+            </TabControl>
+
+            <local:TrafficStatusBar x:Name="TrafficStatusBar" Grid.Row="1" />
+        </Grid>
+    </Border>
+</UserControl>
