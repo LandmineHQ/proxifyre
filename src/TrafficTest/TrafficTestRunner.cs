@@ -7,6 +7,11 @@ internal static class TrafficTestRunner
 {
     public static async Task<int> RunAsync(string[] args)
     {
+        if (TestHelp.TryRun(args, out var helpExitCode))
+        {
+            return helpExitCode;
+        }
+
         if (LicenseCommand.TryRun(args, out var licenseExitCode))
         {
             return licenseExitCode;

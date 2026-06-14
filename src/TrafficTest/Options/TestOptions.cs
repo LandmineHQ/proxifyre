@@ -14,6 +14,8 @@ internal sealed record TestOptions(
     int StunPreflightSamples = 3,
     int StunIntervalMilliseconds = 100,
     int StunTimeoutMilliseconds = 1500,
+    string? CurlUrl = null,
+    string[]? CurlOptions = null,
     string[]? StunCandidates = null)
 {
     public bool RequiresStunEndPoint => Kind is TestKind.Stun or TestKind.StunBenchmark;
@@ -28,6 +30,8 @@ internal sealed record TestOptions(
         int? preflightSamples = null;
         int? intervalMilliseconds = null;
         int? timeoutMilliseconds = null;
+        string? curlUrl = null;
+        var curlOptions = new List<string>();
         var stunCandidates = new List<string>();
 
         for (var i = 0; i < args.Length; i++)
@@ -43,6 +47,18 @@ internal sealed record TestOptions(
             if (TryReadOptionValue(args, ref i, arg, "--stun-host", out var hostValue))
             {
                 stunHost = hostValue;
+                continue;
+            }
+
+            if (TryReadOptionValue(args, ref i, arg, "--curl-url", out var curlUrlValue))
+            {
+                curlUrl = curlUrlValue;
+                continue;
+            }
+
+            if (TryReadOptionValue(args, ref i, arg, "--curl-option", out var curlOptionValue))
+            {
+                curlOptions.Add(curlOptionValue);
                 continue;
             }
 
@@ -102,13 +118,16 @@ internal sealed record TestOptions(
         var common = "--http1.1 --noproxy \"*\" --proxy \"\" --connect-timeout 8 --max-time 20 -L -sS -o NUL -w \"status=%{http_code} bytes=%{size_download} remote=%{remote_ip} time=%{time_total}\\n\"";
         var largeCommon = "--http1.1 --noproxy \"*\" --proxy \"\" --connect-timeout 8 --max-time 90 --limit-rate 1M -L -sS -o NUL -w \"status=%{http_code} bytes=%{size_download} remote=%{remote_ip} time=%{time_total}\\n\"";
         var normalizedMode = mode.ToLowerInvariant();
+        var curlOptionText = curlOptions.Count == 0
+            ? string.Empty
+            : " " + string.Join(" ", curlOptions.Select(QuoteArgument));
         var defaults = normalizedMode switch
         {
-            "curl-ipv4" => new TestOptions(mode, TestKind.Curl, $"--ipv4 {common} https://www.bing.com/", detailed, string.Empty, 0, AddressFamily.Unspecified),
-            "curl-ipv6" => new TestOptions(mode, TestKind.Curl, $"--ipv6 {common} https://ipv6.test-ipv6.com/", detailed, string.Empty, 0, AddressFamily.Unspecified),
-            "curl-http-ipv4" => new TestOptions(mode, TestKind.Curl, $"--ipv4 {common} http://www.bing.com/", detailed, string.Empty, 0, AddressFamily.Unspecified),
-            "curl-large-ipv4" => new TestOptions(mode, TestKind.Curl, $"--ipv4 {largeCommon} https://speed.cloudflare.com/__down?bytes=26214400", detailed, string.Empty, 0, AddressFamily.Unspecified),
-            "curl-large-ipv6" => new TestOptions(mode, TestKind.Curl, $"--ipv6 {largeCommon} https://speed.cloudflare.com/__down?bytes=26214400", detailed, string.Empty, 0, AddressFamily.Unspecified),
+            "curl-ipv4" => new TestOptions(mode, TestKind.Curl, $"--ipv4 {common}{curlOptionText} {QuoteArgument(curlUrl ?? "https://www.bing.com/")}", detailed, string.Empty, 0, AddressFamily.Unspecified),
+            "curl-ipv6" => new TestOptions(mode, TestKind.Curl, $"--ipv6 {common}{curlOptionText} {QuoteArgument(curlUrl ?? "https://ipv6.test-ipv6.com/")}", detailed, string.Empty, 0, AddressFamily.Unspecified),
+            "curl-http-ipv4" => new TestOptions(mode, TestKind.Curl, $"--ipv4 {common}{curlOptionText} {QuoteArgument(curlUrl ?? "http://www.bing.com/")}", detailed, string.Empty, 0, AddressFamily.Unspecified),
+            "curl-large-ipv4" => new TestOptions(mode, TestKind.Curl, $"--ipv4 {largeCommon}{curlOptionText} {QuoteArgument(curlUrl ?? "https://speed.cloudflare.com/__down?bytes=26214400")}", detailed, string.Empty, 0, AddressFamily.Unspecified),
+            "curl-large-ipv6" => new TestOptions(mode, TestKind.Curl, $"--ipv6 {largeCommon}{curlOptionText} {QuoteArgument(curlUrl ?? "https://speed.cloudflare.com/__down?bytes=26214400")}", detailed, string.Empty, 0, AddressFamily.Unspecified),
             "stun-ipv4" => new TestOptions(mode, TestKind.Stun, null, detailed, "stun.l.google.com", 19302, AddressFamily.InterNetwork),
             "stun-ipv6" => new TestOptions(mode, TestKind.Stun, null, detailed, "stun.l.google.com", 19302, AddressFamily.InterNetworkV6),
             "stun-bench-ipv4" => new TestOptions(mode, TestKind.StunBenchmark, null, detailed, "stun.l.google.com", 19302, AddressFamily.InterNetwork),
@@ -135,6 +154,8 @@ internal sealed record TestOptions(
             StunPreflightSamples = preflightSamples ?? defaults.StunPreflightSamples,
             StunIntervalMilliseconds = intervalMilliseconds ?? defaults.StunIntervalMilliseconds,
             StunTimeoutMilliseconds = timeoutMilliseconds ?? defaults.StunTimeoutMilliseconds,
+            CurlUrl = curlUrl,
+            CurlOptions = curlOptions.ToArray(),
             StunCandidates = stunCandidates.ToArray()
         };
     }
@@ -221,5 +242,17 @@ internal sealed record TestOptions(
         }
 
         return parsed;
+    }
+
+    private static string QuoteArgument(string argument)
+    {
+        if (argument.Length == 0)
+        {
+            return "\"\"";
+        }
+
+        return argument.Any(char.IsWhiteSpace) || argument.Contains('"', StringComparison.Ordinal)
+            ? "\"" + argument.Replace("\\", "\\\\", StringComparison.Ordinal).Replace("\"", "\\\"", StringComparison.Ordinal) + "\""
+            : argument;
     }
 }

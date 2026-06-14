@@ -260,20 +260,7 @@ internal sealed class TcpDirectRelay : IDisposable
             try
             {
                 client = CreateRelayTcpClient(remoteEndPoint.AddressFamily);
-                var bindEndPoint = NetworkEndpointResolver.CreateBindEndPoint(_target);
-                try
-                {
-                    client.Client.Bind(bindEndPoint is not null && bindEndPoint.AddressFamily == remoteEndPoint.AddressFamily
-                        ? bindEndPoint
-                        : NetworkEndpointResolver.CreateAnyEndPoint(remoteEndPoint.AddressFamily));
-                }
-                catch (SocketException ex)
-                {
-                    _errorLog($"DIRECT TCP bind failed, retrying any app={_target.AppLabel} appLocal={_target.ClientEndpoint} target={_target.RemoteEndpoint} bind={bindEndPoint}: {ex.Message}");
-                    client.Dispose();
-                    client = CreateRelayTcpClient(remoteEndPoint.AddressFamily);
-                    client.Client.Bind(NetworkEndpointResolver.CreateAnyEndPoint(remoteEndPoint.AddressFamily));
-                }
+                client.Client.Bind(NetworkEndpointResolver.CreateAnyEndPoint(remoteEndPoint.AddressFamily));
 
                 if (client.Client.LocalEndPoint is IPEndPoint localEndPoint)
                 {
@@ -336,8 +323,8 @@ internal sealed class TcpDirectRelay : IDisposable
                     _untrackOutboundFlow(flowKey);
                 }
 
+                _errorLog($"DIRECT TCP connect failed app={_target.AppLabel} appLocal={_target.ClientEndpoint} client={_clientKey.ClientAddress}:{_clientKey.ClientPort} target={_target.RemoteEndpoint} relayProcess={Environment.ProcessId} relayLocal={TryGetLocalEndPoint(client)}: {ex.Message}");
                 client?.Dispose();
-                _errorLog($"DIRECT TCP connect failed app={_target.AppLabel} appLocal={_target.ClientEndpoint} client={_clientKey.ClientAddress}:{_clientKey.ClientPort} target={_target.RemoteEndpoint} relayProcess={Environment.ProcessId}: {ex.Message}");
                 CloseNetwork();
             }
         }
@@ -348,6 +335,23 @@ internal sealed class TcpDirectRelay : IDisposable
             {
                 NoDelay = true
             };
+        }
+
+        private static string TryGetLocalEndPoint(TcpClient? client)
+        {
+            if (client is null)
+            {
+                return "unknown";
+            }
+
+            try
+            {
+                return client.Client.LocalEndPoint?.ToString() ?? "unknown";
+            }
+            catch
+            {
+                return "unknown";
+            }
         }
 
         public async Task SendClientPayloadAsync(uint sequenceNumber, uint acknowledgmentNumber, ushort window, ReadOnlyMemory<byte> payload, bool fin, bool rst, CancellationToken cancellationToken)
