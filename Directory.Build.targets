@@ -1,0 +1,8 @@
+<Project>
+  <Target Name="RemoveWpfTemporaryArtifactOutputs" AfterTargets="Build" Condition="'$(ArtifactsPath)' != '' and '$(UseWPF)' == 'true' and !$([System.String]::Copy('$(MSBuildProjectName)').EndsWith('_wpftmp'))">
+    <ItemGroup>
+      <WpfTemporaryArtifactOutputDirectories Include="$([System.IO.Directory]::GetDirectories('$(ArtifactsPath)\bin', '$(MSBuildProjectName)_*_wpftmp'))" Condition="Exists('$(ArtifactsPath)\bin')" />
+    </ItemGroup>
+    <RemoveDir Directories="@(WpfTemporaryArtifactOutputDirectories)" />
+  </Target>
+</Project>

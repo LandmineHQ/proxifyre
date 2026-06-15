@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Text.Json;
+using ProxiFyre;
 
 namespace TrafficTest;
 
@@ -7,21 +8,49 @@ internal static class TrafficTestRunner
 {
     public static async Task<int> RunAsync(string[] args)
     {
-        if (TestHelp.TryRun(args, out var helpExitCode))
+        try
         {
-            return helpExitCode;
-        }
+            if (TestHelp.TryRun(args, out var helpExitCode))
+            {
+                return helpExitCode;
+            }
 
-        if (LicenseCommand.TryRun(args, out var licenseExitCode))
+            if (args.Length > 0 && args[0].Equals("uu", StringComparison.OrdinalIgnoreCase))
+            {
+                return await ProcessNetworkDiagnostic.RunAsync("UU", "uu.exe", args.Skip(1).ToArray());
+            }
+
+            if (args.Length > 0 && args[0].Equals("steam", StringComparison.OrdinalIgnoreCase))
+            {
+                return await ProcessNetworkDiagnostic.RunAsync("Steam", "steamwebhelper.exe", args.Skip(1).ToArray());
+            }
+
+            var options = TestOptions.Parse(args);
+            return await RunRelayTestAsync(options);
+        }
+        catch (ArgumentException ex)
         {
-            return licenseExitCode;
+            Console.Error.WriteLine(ex.Message);
+            Console.WriteLine();
+            TestHelp.Print();
+            return 2;
         }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(ex.ToString());
+            return 1;
+        }
+    }
 
-        var options = TestOptions.Parse(args);
+    private static async Task<int> RunRelayTestAsync(TestOptions options)
+    {
         var root = RepositoryPaths.FindRepositoryRoot(AppContext.BaseDirectory);
-        var coreDir = Path.Combine(root, "artifacts", "bin", "ProxiFyre", "debug_win-x64");
-        var coreExe = Path.Combine(coreDir, "ProxiFyre.exe");
-        var coreAlias = Path.Combine(coreDir, TrafficTestConstants.DefaultCoreProcessName);
+        var artifactMoniker = GetCurrentArtifactMoniker();
+        var configuration = GetConfigurationName(artifactMoniker);
+        var coreDir = Path.Combine(root, "artifacts", "bin", "ProxiFyre", artifactMoniker);
+        var testHostSource = Path.Combine(root, "artifacts", "bin", "TrafficTestHost", artifactMoniker, "TrafficTestHost.exe");
+        var testHostDir = Path.Combine(root, "artifacts", "tmp", "aot-test-host", DateTime.Now.ToString("yyyyMMdd_HHmmss_fff"));
+        var testHostExe = Path.Combine(testHostDir, TrafficTestConstants.DefaultCoreProcessName);
         var configPath = Path.Combine(coreDir, "traffic-test-config.json");
         var logPath = Path.Combine(coreDir, "proxifyre-core.log");
 
@@ -32,85 +61,62 @@ internal static class TrafficTestRunner
             cts.Cancel();
         };
 
-        if (options.Kind == TestKind.StunScan)
+        if (!File.Exists(testHostSource))
         {
-            return await StunScanTest.RunAsync(options, cts.Token);
-        }
-
-        if (options.Kind == TestKind.StunSeriesChild)
-        {
-            return await StunSeriesTest.RunChildAsync(options, cts.Token);
-        }
-
-        if (!File.Exists(coreExe))
-        {
-            Console.Error.WriteLine($"Core executable not found: {coreExe}");
+            Console.Error.WriteLine($"AOT test host executable not found: {testHostSource}");
+            Console.Error.WriteLine($"Run .\\scripts\\proxifyre.ps1 build -Configuration {configuration} before test.");
             return 1;
         }
 
-        var appPatterns = BuildAppPatterns(options);
-        var stunEndPoint = options.RequiresStunEndPoint
+        if (!Directory.Exists(coreDir))
+        {
+            Console.Error.WriteLine($"ProxiFyre build output not found: {coreDir}");
+            Console.Error.WriteLine($"Run .\\scripts\\proxifyre.ps1 build -Configuration {configuration} before test.");
+            return 1;
+        }
+
+        var moduleDll = Path.Combine(root, "artifacts", "native", configuration, "ProxiFyre.Module.dll");
+        if (!File.Exists(moduleDll))
+        {
+            Console.Error.WriteLine($"AOT module DLL not found: {moduleDll}");
+            Console.Error.WriteLine($"Run .\\scripts\\proxifyre.ps1 build -Configuration {configuration} before test.");
+            return 1;
+        }
+
+        var stunEndPoint = options.Kind == TestKind.Stun
             ? await StunClient.ResolveEndPointAsync(options.StunHost, options.StunPort, options.StunAddressFamily, cts.Token)
             : null;
 
-        File.Copy(coreExe, coreAlias, overwrite: true);
+        Directory.CreateDirectory(testHostDir);
+        CopyTestHostFiles(Path.GetDirectoryName(testHostSource)!, testHostDir);
+        File.Copy(testHostSource, testHostExe, overwrite: true);
         File.WriteAllText(logPath, string.Empty);
         File.WriteAllText(
             configPath,
             JsonSerializer.Serialize(
                 new
                 {
-                    coreProcessName = Path.GetFileName(coreAlias),
-                    apps = appPatterns
+                    coreProcessName = Path.GetFileName(testHostExe),
+                    apps = BuildAppPatterns(options)
                 },
                 new JsonSerializerOptions { WriteIndented = true }));
 
-        Process? core = null;
-        Task? coreOutputPump = null;
-        var coreOutput = new BoundedLog(160);
+        Process? testHost = null;
         try
         {
-            if (options.Kind == TestKind.StunBenchmark)
-            {
-                var directAlias = ProcessIdentity.CreateTrafficTestAlias();
-                var direct = await StunSeriesTest.RunNamedDirectAsync(directAlias, options, cts.Token);
-                if (!direct.HasSamples)
-                {
-                    Console.WriteLine("Skipping relay benchmark because named direct baseline did not produce samples.");
-                    return 1;
-                }
+            testHost = StartTestHost(testHostExe, testHostDir);
+            await WaitForMainWindowAsync(testHost, cts.Token);
+            Console.WriteLine($"AOT test host: {Path.GetFileName(testHostExe)} pid={testHost.Id}");
 
-                core = StartCore(coreAlias, configPath, coreDir, options, coreOutput, cts.Token, out coreOutputPump);
-                await WaitForCoreReadyAsync(logPath, cts.Token);
-
-                var relayProbe = await StunSeriesTest.RunProbeAsync("proxifyre relay preflight", options, stunEndPoint!, cts.Token);
-                if (!relayProbe.Success)
-                {
-                    Console.WriteLine($"Skipping benchmark because relay STUN preflight failed: {relayProbe.Error}");
-                    CoreLogReporter.PrintLogSummary(logPath, includeRelevantLines: true);
-                    CoreLogReporter.PrintTrafficSummary(coreOutput.Snapshot());
-                    return 1;
-                }
-
-                var relay = await StunSeriesTest.RunAsync("proxifyre relay", options, stunEndPoint!, cts.Token);
-                await Task.Delay(TimeSpan.FromSeconds(1), cts.Token);
-                StunSeriesTest.PrintBenchmarkSummary(direct, relay);
-                CoreLogReporter.PrintLogSummary(logPath, includeRelevantLines: options.Detailed || !relay.HasSamples);
-                CoreLogReporter.PrintTrafficSummary(coreOutput.Snapshot());
-                return direct.HasSamples && relay.HasSamples ? 0 : 1;
-            }
-
-            core = StartCore(coreAlias, configPath, coreDir, options, coreOutput, cts.Token, out coreOutputPump);
+            using var module = new AotModuleTestController(configPath, logPath, Console.WriteLine);
+            await module.LoadAndRunAsync(
+                testHost.Id,
+                Path.GetFileName(testHostExe),
+                testHostExe,
+                BuildAppPatterns(options),
+                LicenseKey.CreateKey(LicenseKey.GetCurrentDeviceId()),
+                cts.Token).ConfigureAwait(false);
             await WaitForCoreReadyAsync(logPath, cts.Token);
-
-            if (options.Kind == TestKind.StunRelayScan)
-            {
-                var relayScanExitCode = await StunScanTest.RunAsync(options, cts.Token);
-                await Task.Delay(TimeSpan.FromSeconds(1), cts.Token);
-                CoreLogReporter.PrintLogSummary(logPath, includeRelevantLines: options.Detailed || relayScanExitCode != 0);
-                CoreLogReporter.PrintTrafficSummary(coreOutput.Snapshot());
-                return relayScanExitCode;
-            }
 
             var result = options.Kind == TestKind.Curl
                 ? await CurlTest.RunAsync(options, root, cts.Token)
@@ -119,15 +125,6 @@ internal static class TrafficTestRunner
             await Task.Delay(TimeSpan.FromSeconds(1), cts.Token);
             var failed = !result.Success;
             CoreLogReporter.PrintLogSummary(logPath, includeRelevantLines: options.Detailed || failed);
-            CoreLogReporter.PrintTrafficSummary(coreOutput.Snapshot());
-            if (failed && !options.Detailed)
-            {
-                Console.WriteLine("captured core output tail:");
-                foreach (var line in coreOutput.Snapshot())
-                {
-                    Console.WriteLine(line);
-                }
-            }
 
             return result.Success ? 0 : 1;
         }
@@ -137,45 +134,52 @@ internal static class TrafficTestRunner
         }
         finally
         {
-            if (core is { HasExited: false })
+            if (testHost is { HasExited: false })
             {
-                core.Kill(entireProcessTree: true);
-                await core.WaitForExitAsync();
+                testHost.Kill(entireProcessTree: true);
+                await testHost.WaitForExitAsync();
             }
 
-            if (coreOutputPump is not null)
-            {
-                try
-                {
-                    await coreOutputPump.WaitAsync(TimeSpan.FromSeconds(2));
-                }
-                catch
-                {
-                }
-            }
-
-            core?.Dispose();
+            testHost?.Dispose();
+            TryDeleteDirectory(testHostDir);
         }
     }
 
-    private static Process StartCore(
-        string coreAlias,
-        string configPath,
-        string coreDir,
-        TestOptions options,
-        BoundedLog coreOutput,
-        CancellationToken cancellationToken,
-        out Task coreOutputPump)
+    private static string GetCurrentArtifactMoniker()
     {
-        var core = ProcessRunner.Start(
-            coreAlias,
-            $"--run --config \"{configPath}\"{(options.Detailed ? " --detailed" : string.Empty)}",
-            coreDir,
-            redirect: true);
-        Console.WriteLine($"Core process: {Path.GetFileName(coreAlias)} pid={core.Id}");
-        Console.WriteLine($"Observe network usage on this process, not on ProxiFyre.exe: {Path.GetFileName(coreAlias)}");
-        coreOutputPump = ProcessRunner.CaptureProcessOutputAsync(core, coreOutput, options.Detailed, cancellationToken);
-        return core;
+        var baseDirectory = AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var directoryName = Path.GetFileName(baseDirectory);
+        return string.IsNullOrWhiteSpace(directoryName)
+            ? "debug_win-x64"
+            : directoryName;
+    }
+
+    private static string GetConfigurationName(string artifactMoniker)
+    {
+        return artifactMoniker.StartsWith("release_", StringComparison.OrdinalIgnoreCase)
+            ? "Release"
+            : "Debug";
+    }
+
+    private static Process StartTestHost(string testHostExe, string testHostDir)
+    {
+        var process = new Process
+        {
+            StartInfo = new ProcessStartInfo
+            {
+                FileName = testHostExe,
+                WorkingDirectory = testHostDir,
+                UseShellExecute = false
+            }
+        };
+
+        if (!process.Start())
+        {
+            process.Dispose();
+            throw new InvalidOperationException($"Failed to start AOT test host: {testHostExe}");
+        }
+
+        return process;
     }
 
     private static async Task WaitForCoreReadyAsync(string logPath, CancellationToken cancellationToken)
@@ -184,12 +188,63 @@ internal static class TrafficTestRunner
         await Task.Delay(TimeSpan.FromMilliseconds(500), cancellationToken);
     }
 
+    private static async Task WaitForMainWindowAsync(Process process, CancellationToken cancellationToken)
+    {
+        var deadline = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(10);
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (process.HasExited)
+            {
+                throw new InvalidOperationException($"AOT test host exited early with code {process.ExitCode}.");
+            }
+
+            process.Refresh();
+            if (process.MainWindowHandle != nint.Zero)
+            {
+                return;
+            }
+
+            await Task.Delay(100, cancellationToken);
+        }
+
+        throw new TimeoutException("Timed out waiting for AOT test host window.");
+    }
+
+    private static void CopyTestHostFiles(string sourceDirectory, string targetDirectory)
+    {
+        foreach (var file in Directory.EnumerateFiles(sourceDirectory))
+        {
+            var fileName = Path.GetFileName(file);
+            if (fileName.Equals("TrafficTestHost.exe", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            File.Copy(file, Path.Combine(targetDirectory, fileName), overwrite: true);
+        }
+    }
+
+    private static void TryDeleteDirectory(string directory)
+    {
+        try
+        {
+            if (Directory.Exists(directory))
+            {
+                Directory.Delete(directory, recursive: true);
+            }
+        }
+        catch
+        {
+        }
+    }
+
     private static string[] BuildAppPatterns(TestOptions options)
     {
         return options.Kind switch
         {
             TestKind.Curl => ["curl.exe"],
-            TestKind.Stun or TestKind.StunBenchmark or TestKind.StunRelayScan => [ProcessIdentity.GetCurrentExecutableName()],
+            TestKind.Stun => [ProcessIdentity.GetCurrentExecutableName()],
             _ => throw new ArgumentOutOfRangeException(nameof(options))
         };
     }

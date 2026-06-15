@@ -8,15 +8,6 @@ internal sealed class AppConfiguration
 {
     public const string DefaultCoreProcessName = "steamwebhelper.exe";
 
-    private static readonly JsonSerializerOptions JsonOptions = new()
-    {
-        AllowTrailingCommas = true,
-        ReadCommentHandling = JsonCommentHandling.Skip,
-        PropertyNameCaseInsensitive = true,
-        WriteIndented = true,
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
-    };
-
     public required IReadOnlyList<string> Apps { get; init; }
 
     public string CoreProcessName { get; init; } = DefaultCoreProcessName;
@@ -132,7 +123,7 @@ internal sealed class AppConfiguration
             ]
         };
 
-        File.WriteAllText(path, JsonSerializer.Serialize(sample, JsonOptions));
+        File.WriteAllText(path, JsonSerializer.Serialize(sample, AppConfigurationJsonContext.Default.SampleConfiguration));
     }
 
     public static IReadOnlyList<string> AddApp(string path, string appPattern)
@@ -154,7 +145,7 @@ internal sealed class AppConfiguration
             LicenseKey = existingConfiguration?.LicenseKey,
             Apps = apps
         };
-        File.WriteAllText(path, JsonSerializer.Serialize(simpleConfiguration, JsonOptions));
+        File.WriteAllText(path, JsonSerializer.Serialize(simpleConfiguration, AppConfigurationJsonContext.Default.SimpleConfiguration));
         return apps;
     }
 
@@ -176,7 +167,7 @@ internal sealed class AppConfiguration
                 .ToList()
         };
 
-        File.WriteAllText(path, JsonSerializer.Serialize(simpleConfiguration, JsonOptions));
+        File.WriteAllText(path, JsonSerializer.Serialize(simpleConfiguration, AppConfigurationJsonContext.Default.SimpleConfiguration));
     }
 
     public static string NormalizeCoreProcessName(string? value)
@@ -205,7 +196,7 @@ internal sealed class AppConfiguration
         }
     }
 
-    private sealed class SampleConfiguration
+    internal sealed class SampleConfiguration
     {
         [JsonPropertyName("coreProcessName")]
         public required string CoreProcessName { get; init; }
@@ -220,7 +211,7 @@ internal sealed class AppConfiguration
         public required List<SampleProxy> Proxies { get; init; }
     }
 
-    private sealed class SampleProxy
+    internal sealed class SampleProxy
     {
         [JsonPropertyName("appNames")]
         public required List<string> AppNames { get; init; }
@@ -232,7 +223,7 @@ internal sealed class AppConfiguration
         public required List<string> SupportedProtocols { get; init; }
     }
 
-    private sealed class SimpleConfiguration
+    internal sealed class SimpleConfiguration
     {
         [JsonPropertyName("coreProcessName")]
         public required string CoreProcessName { get; init; }
@@ -243,4 +234,11 @@ internal sealed class AppConfiguration
         [JsonPropertyName("apps")]
         public required List<string> Apps { get; init; }
     }
+}
+
+[JsonSourceGenerationOptions(WriteIndented = true, DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull)]
+[JsonSerializable(typeof(AppConfiguration.SampleConfiguration))]
+[JsonSerializable(typeof(AppConfiguration.SimpleConfiguration))]
+internal sealed partial class AppConfigurationJsonContext : JsonSerializerContext
+{
 }

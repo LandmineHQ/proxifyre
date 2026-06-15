@@ -42,12 +42,12 @@ public partial class HeaderBar : UserControl
 
     public void SetRunning(bool running)
     {
-        StatusText.Text = running ? "运行中" : "已暂停";
+        StatusText.Text = running ? "模组运行中" : "未运行";
         StatusText.Foreground = BrushFromHex(running ? "#067647" : "#475467");
         StatusDot.Fill = BrushFromHex(running ? "#17B26A" : "#98A2B3");
         StatusBadge.Background = BrushFromHex(running ? "#ECFDF3" : "#EEF2F7");
         StartStopButton.Background = BrushFromHex(running ? "#C73535" : "#16803C");
-        StartStopButtonText.Text = running ? "暂停" : "启用";
+        StartStopButtonText.Text = running ? "停止转发" : "载入模组";
         StartStopIcon.Data = Geometry.Parse(running ? "M 2 1 H 6 V 13 H 2 Z M 9 1 H 13 V 13 H 9 Z" : "M 2 1 L 13 7 L 2 13 Z");
     }
 

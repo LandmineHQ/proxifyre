@@ -42,12 +42,12 @@
             </Grid.ColumnDefinitions>
 
             <StackPanel Grid.Column="0">
-                <TextBlock Text="核心进程名"
+                <TextBlock Text="模组目标进程名"
                            FontSize="12"
                            Foreground="{StaticResource MutedTextBrush}"
                            Margin="0,0,0,4" />
                 <TextBox x:Name="CoreProcessNameInput"
-                         ToolTip="用于核心进程自排除；默认 steamwebhelper.exe"
+                         ToolTip="从 app-config.json 的 coreProcessName 读取；同名多个进程时选择第一个可触发 WH_GETMESSAGE 的 GUI 进程"
                          LostFocus="CoreProcessNameInput_LostFocus"
                          KeyDown="CoreProcessNameInput_KeyDown" />
             </StackPanel>

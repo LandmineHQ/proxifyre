@@ -10,249 +10,152 @@ internal sealed record TestOptions(
     string StunHost,
     int StunPort,
     AddressFamily StunAddressFamily,
-    int StunSamples = 20,
-    int StunPreflightSamples = 3,
-    int StunIntervalMilliseconds = 100,
-    int StunTimeoutMilliseconds = 1500,
+    int StunTimeoutMilliseconds,
     string? CurlUrl = null,
-    string[]? CurlOptions = null,
-    string[]? StunCandidates = null)
+    string[]? CurlOptions = null)
 {
-    public bool RequiresStunEndPoint => Kind is TestKind.Stun or TestKind.StunBenchmark;
-
     public static TestOptions Parse(string[] args)
     {
-        var mode = "curl-ipv4";
+        if (args.Length == 0)
+        {
+            throw new ArgumentException("test requires a mode: tcp, udp, uu, or steam.");
+        }
+
+        var mode = args[0].Trim().ToLowerInvariant();
+        return mode switch
+        {
+            "tcp" => ParseTcp(args.Skip(1).ToArray()),
+            "udp" => ParseUdp(args.Skip(1).ToArray()),
+            _ => throw new ArgumentException($"Unknown test mode '{args[0]}'. Supported modes: tcp, udp, uu, steam.")
+        };
+    }
+
+    private static TestOptions ParseTcp(string[] args)
+    {
         var detailed = false;
-        string? stunHost = null;
-        int? stunPort = null;
-        int? samples = null;
-        int? preflightSamples = null;
-        int? intervalMilliseconds = null;
-        int? timeoutMilliseconds = null;
+        var useIpv6 = false;
         string? curlUrl = null;
         var curlOptions = new List<string>();
-        var stunCandidates = new List<string>();
 
         for (var i = 0; i < args.Length; i++)
         {
-            var arg = args[i];
-            if (string.Equals(arg, "--verbose", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(arg, "--detailed", StringComparison.OrdinalIgnoreCase))
+            if (IsDetailed(args[i]))
             {
                 detailed = true;
                 continue;
             }
 
-            if (TryReadOptionValue(args, ref i, arg, "--stun-host", out var hostValue))
+            if (args[i].Equals("--ipv6", StringComparison.OrdinalIgnoreCase))
             {
-                stunHost = hostValue;
+                useIpv6 = true;
                 continue;
             }
 
-            if (TryReadOptionValue(args, ref i, arg, "--curl-url", out var curlUrlValue))
+            if (args[i].Equals("--ipv4", StringComparison.OrdinalIgnoreCase))
             {
-                curlUrl = curlUrlValue;
+                useIpv6 = false;
                 continue;
             }
 
-            if (TryReadOptionValue(args, ref i, arg, "--curl-option", out var curlOptionValue))
+            if (CliOptions.TryReadValue(args, ref i, "--url", out var urlValue)
+                || CliOptions.TryReadValue(args, ref i, "--curl-url", out urlValue))
+            {
+                curlUrl = urlValue;
+                continue;
+            }
+
+            if (CliOptions.TryReadValue(args, ref i, "--curl-option", out var curlOptionValue))
             {
                 curlOptions.Add(curlOptionValue);
                 continue;
             }
 
-            if (TryReadOptionValue(args, ref i, arg, "--stun-port", out var portValue))
-            {
-                stunPort = ParsePositiveInt("--stun-port", portValue);
-                continue;
-            }
-
-            if (TryReadOptionValue(args, ref i, arg, "--samples", out var samplesValue))
-            {
-                samples = ParsePositiveInt("--samples", samplesValue);
-                continue;
-            }
-
-            if (TryReadOptionValue(args, ref i, arg, "--preflight-samples", out var preflightSamplesValue))
-            {
-                preflightSamples = ParsePositiveInt("--preflight-samples", preflightSamplesValue);
-                continue;
-            }
-
-            if (TryReadOptionValue(args, ref i, arg, "--interval-ms", out var intervalValue))
-            {
-                intervalMilliseconds = ParseNonNegativeInt("--interval-ms", intervalValue);
-                continue;
-            }
-
-            if (TryReadOptionValue(args, ref i, arg, "--timeout-ms", out var timeoutValue))
-            {
-                timeoutMilliseconds = ParsePositiveInt("--timeout-ms", timeoutValue);
-                continue;
-            }
-
-            if (TryReadOptionValue(args, ref i, arg, "--stun", out var stunValue))
-            {
-                stunCandidates.Add(stunValue);
-                if (TryParseStunTarget(stunValue, out var parsedHost, out var parsedPort))
-                {
-                    stunHost ??= parsedHost;
-                    stunPort ??= parsedPort;
-                }
-
-                continue;
-            }
-
-            if (arg.StartsWith("-", StringComparison.Ordinal))
-            {
-                throw new ArgumentException($"Unknown option '{arg}'.");
-            }
-
-            if (!arg.StartsWith("-", StringComparison.Ordinal))
-            {
-                mode = arg;
-            }
+            throw new ArgumentException($"Unknown tcp test option '{args[i]}'.");
         }
 
         var common = "--http1.1 --noproxy \"*\" --proxy \"\" --connect-timeout 8 --max-time 20 -L -sS -o NUL -w \"status=%{http_code} bytes=%{size_download} remote=%{remote_ip} time=%{time_total}\\n\"";
-        var largeCommon = "--http1.1 --noproxy \"*\" --proxy \"\" --connect-timeout 8 --max-time 90 --limit-rate 1M -L -sS -o NUL -w \"status=%{http_code} bytes=%{size_download} remote=%{remote_ip} time=%{time_total}\\n\"";
-        var normalizedMode = mode.ToLowerInvariant();
         var curlOptionText = curlOptions.Count == 0
             ? string.Empty
-            : " " + string.Join(" ", curlOptions.Select(QuoteArgument));
-        var defaults = normalizedMode switch
-        {
-            "curl-ipv4" => new TestOptions(mode, TestKind.Curl, $"--ipv4 {common}{curlOptionText} {QuoteArgument(curlUrl ?? "https://www.bing.com/")}", detailed, string.Empty, 0, AddressFamily.Unspecified),
-            "curl-ipv6" => new TestOptions(mode, TestKind.Curl, $"--ipv6 {common}{curlOptionText} {QuoteArgument(curlUrl ?? "https://ipv6.test-ipv6.com/")}", detailed, string.Empty, 0, AddressFamily.Unspecified),
-            "curl-http-ipv4" => new TestOptions(mode, TestKind.Curl, $"--ipv4 {common}{curlOptionText} {QuoteArgument(curlUrl ?? "http://www.bing.com/")}", detailed, string.Empty, 0, AddressFamily.Unspecified),
-            "curl-large-ipv4" => new TestOptions(mode, TestKind.Curl, $"--ipv4 {largeCommon}{curlOptionText} {QuoteArgument(curlUrl ?? "https://speed.cloudflare.com/__down?bytes=26214400")}", detailed, string.Empty, 0, AddressFamily.Unspecified),
-            "curl-large-ipv6" => new TestOptions(mode, TestKind.Curl, $"--ipv6 {largeCommon}{curlOptionText} {QuoteArgument(curlUrl ?? "https://speed.cloudflare.com/__down?bytes=26214400")}", detailed, string.Empty, 0, AddressFamily.Unspecified),
-            "stun-ipv4" => new TestOptions(mode, TestKind.Stun, null, detailed, "stun.l.google.com", 19302, AddressFamily.InterNetwork),
-            "stun-ipv6" => new TestOptions(mode, TestKind.Stun, null, detailed, "stun.l.google.com", 19302, AddressFamily.InterNetworkV6),
-            "stun-bench-ipv4" => new TestOptions(mode, TestKind.StunBenchmark, null, detailed, "stun.l.google.com", 19302, AddressFamily.InterNetwork),
-            "stun-bench-ipv6" => new TestOptions(mode, TestKind.StunBenchmark, null, detailed, "stun.l.google.com", 19302, AddressFamily.InterNetworkV6),
-            "stun-series-ipv4" => new TestOptions(mode, TestKind.StunSeriesChild, null, detailed, "stun.l.google.com", 19302, AddressFamily.InterNetwork),
-            "stun-series-ipv6" => new TestOptions(mode, TestKind.StunSeriesChild, null, detailed, "stun.l.google.com", 19302, AddressFamily.InterNetworkV6),
-            "stun-scan-ipv4" => new TestOptions(mode, TestKind.StunScan, null, detailed, string.Empty, 0, AddressFamily.InterNetwork),
-            "stun-scan-ipv6" => new TestOptions(mode, TestKind.StunScan, null, detailed, string.Empty, 0, AddressFamily.InterNetworkV6),
-            "stun-relay-scan-ipv4" => new TestOptions(mode, TestKind.StunRelayScan, null, detailed, string.Empty, 0, AddressFamily.InterNetwork),
-            "stun-relay-scan-ipv6" => new TestOptions(mode, TestKind.StunRelayScan, null, detailed, string.Empty, 0, AddressFamily.InterNetworkV6),
-            _ => throw new ArgumentException($"Unknown test mode '{mode}'. Supported modes: curl-ipv4, curl-ipv6, curl-http-ipv4, curl-large-ipv4, curl-large-ipv6, stun-ipv4, stun-ipv6, stun-bench-ipv4, stun-bench-ipv6, stun-scan-ipv4, stun-scan-ipv6, stun-relay-scan-ipv4, stun-relay-scan-ipv6.")
-        };
-
-        if (defaults.RequiresStunEndPoint && string.IsNullOrWhiteSpace(stunHost) != !stunPort.HasValue)
-        {
-            throw new ArgumentException("--stun-host and --stun-port must be supplied together.");
-        }
-
-        return defaults with
-        {
-            StunHost = stunHost ?? defaults.StunHost,
-            StunPort = stunPort ?? defaults.StunPort,
-            StunSamples = samples ?? defaults.StunSamples,
-            StunPreflightSamples = preflightSamples ?? defaults.StunPreflightSamples,
-            StunIntervalMilliseconds = intervalMilliseconds ?? defaults.StunIntervalMilliseconds,
-            StunTimeoutMilliseconds = timeoutMilliseconds ?? defaults.StunTimeoutMilliseconds,
-            CurlUrl = curlUrl,
-            CurlOptions = curlOptions.ToArray(),
-            StunCandidates = stunCandidates.ToArray()
-        };
+            : " " + string.Join(" ", curlOptions.Select(ProcessRunner.QuoteArgument));
+        var familyArg = useIpv6 ? "--ipv6" : "--ipv4";
+        var defaultUrl = useIpv6 ? "https://ipv6.test-ipv6.com/" : "https://www.bing.com/";
+        var effectiveUrl = curlUrl ?? defaultUrl;
+        return new TestOptions(
+            "tcp",
+            TestKind.Curl,
+            $"{familyArg} {common}{curlOptionText} {ProcessRunner.QuoteArgument(effectiveUrl)}",
+            detailed,
+            string.Empty,
+            0,
+            AddressFamily.Unspecified,
+            1500,
+            effectiveUrl,
+            curlOptions.ToArray());
     }
 
-    public static bool TryParseStunTarget(string value, out string host, out int port)
+    private static TestOptions ParseUdp(string[] args)
     {
-        host = string.Empty;
-        port = 0;
-        if (string.IsNullOrWhiteSpace(value))
-        {
-            return false;
-        }
+        var detailed = false;
+        var addressFamily = AddressFamily.InterNetwork;
+        var stunHost = "stun.l.google.com";
+        var stunPort = 19302;
+        var timeoutMilliseconds = 1500;
 
-        var trimmed = value.Trim();
-        var separator = trimmed.LastIndexOf(':');
-        if (separator <= 0 || separator == trimmed.Length - 1)
+        for (var i = 0; i < args.Length; i++)
         {
-            return false;
-        }
-
-        var hostPart = trimmed[..separator].Trim();
-        if (hostPart.StartsWith("[", StringComparison.Ordinal) && hostPart.EndsWith("]", StringComparison.Ordinal))
-        {
-            hostPart = hostPart[1..^1];
-        }
-
-        if (string.IsNullOrWhiteSpace(hostPart)
-            || !int.TryParse(trimmed[(separator + 1)..], out var parsedPort)
-            || parsedPort <= 0
-            || parsedPort > ushort.MaxValue)
-        {
-            return false;
-        }
-
-        host = hostPart;
-        port = parsedPort;
-        return true;
-    }
-
-    private static bool TryReadOptionValue(string[] args, ref int index, string arg, string optionName, out string value)
-    {
-        value = string.Empty;
-        if (arg.Equals(optionName, StringComparison.OrdinalIgnoreCase))
-        {
-            if (index + 1 >= args.Length)
+            if (IsDetailed(args[i]))
             {
-                throw new ArgumentException($"{optionName} requires a value.");
+                detailed = true;
+                continue;
             }
 
-            value = args[++index];
-            return true;
-        }
-
-        var prefix = optionName + "=";
-        if (arg.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-        {
-            value = arg[prefix.Length..];
-            if (string.IsNullOrWhiteSpace(value))
+            if (args[i].Equals("--ipv6", StringComparison.OrdinalIgnoreCase))
             {
-                throw new ArgumentException($"{optionName} requires a value.");
+                addressFamily = AddressFamily.InterNetworkV6;
+                continue;
             }
 
-            return true;
+            if (args[i].Equals("--ipv4", StringComparison.OrdinalIgnoreCase))
+            {
+                addressFamily = AddressFamily.InterNetwork;
+                continue;
+            }
+
+            if (CliOptions.TryReadValue(args, ref i, "--stun-host", out var hostValue))
+            {
+                stunHost = hostValue;
+                continue;
+            }
+
+            if (CliOptions.TryReadValue(args, ref i, "--stun-port", out var portValue))
+            {
+                stunPort = CliOptions.ParsePositiveInt("--stun-port", portValue);
+                continue;
+            }
+
+            if (CliOptions.TryReadValue(args, ref i, "--timeout-ms", out var timeoutValue))
+            {
+                timeoutMilliseconds = CliOptions.ParsePositiveInt("--timeout-ms", timeoutValue);
+                continue;
+            }
+
+            throw new ArgumentException($"Unknown udp test option '{args[i]}'.");
         }
 
-        return false;
+        return new TestOptions(
+            "udp",
+            TestKind.Stun,
+            null,
+            detailed,
+            stunHost,
+            stunPort,
+            addressFamily,
+            timeoutMilliseconds);
     }
 
-    private static int ParsePositiveInt(string optionName, string value)
+    private static bool IsDetailed(string value)
     {
-        if (!int.TryParse(value, out var parsed) || parsed <= 0)
-        {
-            throw new ArgumentException($"{optionName} requires a positive integer.");
-        }
-
-        return parsed;
-    }
-
-    private static int ParseNonNegativeInt(string optionName, string value)
-    {
-        if (!int.TryParse(value, out var parsed) || parsed < 0)
-        {
-            throw new ArgumentException($"{optionName} requires a non-negative integer.");
-        }
-
-        return parsed;
-    }
-
-    private static string QuoteArgument(string argument)
-    {
-        if (argument.Length == 0)
-        {
-            return "\"\"";
-        }
-
-        return argument.Any(char.IsWhiteSpace) || argument.Contains('"', StringComparison.Ordinal)
-            ? "\"" + argument.Replace("\\", "\\\\", StringComparison.Ordinal).Replace("\"", "\\\"", StringComparison.Ordinal) + "\""
-            : argument;
+        return value.Equals("--detailed", StringComparison.OrdinalIgnoreCase)
+            || value.Equals("--verbose", StringComparison.OrdinalIgnoreCase);
     }
 }

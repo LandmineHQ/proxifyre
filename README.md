@@ -6,9 +6,9 @@ The current implementation is direct mode only:
 
 - Add applications by executable name, full executable path, or install directory.
 - Intercept matching traffic with WinpkFilter.
-- Forward selected traffic from the C# relay core to the original destination.
+- Forward selected traffic from the relay module to the original destination.
 - Inject responses back to the selected application without opening local TCP or UDP listener ports.
-- Configure the core process name used for self-exclusion. The default is `steamwebhelper.exe`.
+- Configure the AOT module target process name through `coreProcessName`. The default is `steamwebhelper.exe`.
 
 Implemented protocols:
 
@@ -23,10 +23,10 @@ Proxy mode and Windows service mode are intentionally not implemented yet.
 
 - Windows.
 - .NET 10 SDK or runtime.
+- Visual Studio Build Tools with C++ desktop build tools, because the relay module is published as a NativeAOT DLL.
 - WinpkFilter installed and running.
 - Administrator privileges, because the app opens the WinpkFilter driver and configures adapter tunnel mode.
 
-No C++ compiler or C++ build tools are required.
 No `ndisapi.dll` is required. The app installs/checks the WinpkFilter 3.6.2.1 MSI for the kernel driver and talks to the `NDISRD` device directly from C#.
 
 ## Layout
@@ -52,13 +52,16 @@ No `ndisapi.dll` is required. The app installs/checks the WinpkFilter 3.6.2.1 MS
         ├── Process/
         ├── Relay/
         └── UI/
-    └── TrafficTest/
+    ├── ProxiFyre.Module/
+        └── ModuleExports.cs
+    ├── TrafficTest/
         ├── Curl/
-        ├── Infrastructure/
-        ├── Models/
-        ├── Options/
+        ├── Diagnostics/
         ├── Stun/
         └── Program.cs
+    └── Shared/
+        ├── LicenseKey.cs
+        └── ModuleMessageProtocol.cs
 ```
 
 ## Build
@@ -81,7 +84,9 @@ Run without arguments to open the WPF UI:
 .\scripts\proxifyre.ps1 ui
 ```
 
-The UI stores its app list in `app-config.json` next to the built executable. Add an executable name such as `chrome.exe`, browse to a full executable path, or browse to a directory, then start the direct relay from the window.
+The UI stores its app list in `app-config.json` next to the built executable. Add an executable name such as `chrome.exe`, browse to a full executable path, or browse to a directory, then load the module from the window.
+
+The UI builds and loads `ProxiFyre.Module.dll` as a NativeAOT DLL. It selects the target process by `coreProcessName`; if several processes have the same name, the lowest PID is used. After the AOT DLL is loaded, it remains in the target process until that process exits. The UI sends run, stop, and reload commands through Windows messages.
 
 ## CLI
 
@@ -103,26 +108,44 @@ Add one application:
 .\scripts\proxifyre.ps1 add-app chrome.exe -Config .\app-config.json
 ```
 
-## Focused traffic test
-
-Use the isolated curl test when browser traffic is too noisy to diagnose:
+Print this machine's device ID and license key:
 
 ```powershell
-.\scripts\proxifyre.ps1 test
+.\scripts\proxifyre.ps1 license-device
 ```
 
-The test starts a temporary `proxifyre-test-core.exe` and writes a narrow config for the current test mode. TCP curl modes only match `curl.exe`, disable curl proxy environment variables, and request a known target. IPv4 curl modes use Bing. The IPv6 curl mode uses `ipv6.test-ipv6.com`, because `www.bing.com` may not return an AAAA record on every resolver. UDP STUN modes only match `TrafficTest.exe` and send a STUN binding request to `stun.l.google.com:19302`.
+Print a license key for a supplied device ID:
 
 ```powershell
-.\scripts\proxifyre.ps1 test curl-ipv4
-.\scripts\proxifyre.ps1 test curl-http-ipv4
-.\scripts\proxifyre.ps1 test curl-ipv6
-.\scripts\proxifyre.ps1 test stun-ipv4
-.\scripts\proxifyre.ps1 test stun-ipv6
-.\scripts\proxifyre.ps1 test curl-ipv4 -Detailed
+.\scripts\proxifyre.ps1 license-key <device-id>
 ```
 
-Normal core runs keep logs compact and only record when a configured application starts a TCP or UDP connection. Use `-Detailed` on the script, or `--detailed` on the executable, when packet-level relay diagnostics are needed.
+## Focused tests
+
+Run a TCP relay diagnostic with curl:
+
+```powershell
+.\scripts\proxifyre.ps1 test tcp
+.\scripts\proxifyre.ps1 test tcp -Detailed -- --url https://steamcommunity.com/
+```
+
+Run a UDP relay diagnostic with STUN:
+
+```powershell
+.\scripts\proxifyre.ps1 test udp
+.\scripts\proxifyre.ps1 test udp -Detailed -- --stun-host stun.cloudflare.com --stun-port 3478
+```
+
+The TCP and UDP tests start a minimal WPF test host, copy it as `steamwebhelper.exe`, and inject `ProxiFyre.Module.dll` into that exact PID. The test loader does not choose a real Steam WebHelper process even if Steam is running.
+
+Inspect UU or Steam process ports and connections:
+
+```powershell
+.\scripts\proxifyre.ps1 test uu
+.\scripts\proxifyre.ps1 test steam
+```
+
+Normal relay runs keep logs compact and only record when a configured application starts a TCP or UDP connection. Use `-Detailed` on the script, or `--detailed` on the executable, when packet-level relay diagnostics are needed.
 
 ## Configuration
 
@@ -154,7 +177,7 @@ The `proxifyre-ui` style is also accepted for easier migration:
 
 Only `appNames` are used from `proxies` entries. Proxy endpoint, authentication, and protocol fields are ignored by this direct-only build.
 
-The WPF executable is built as a Windows app, so launching the UI does not open a separate console window. When started from the UI, the core is copied and launched under `coreProcessName`, which defaults to `steamwebhelper.exe`.
+The WPF executable is built as a Windows app, so launching the UI does not open a separate console window. When loaded from the UI, the NativeAOT module is injected into the process named by `coreProcessName`, which defaults to `steamwebhelper.exe`.
 
 Matching rules:
 
@@ -162,11 +185,11 @@ Matching rules:
 - A full `.exe` path matches that executable path, case-insensitively.
 - A directory path with a trailing slash, or an existing directory path, matches processes under that directory by path prefix.
 - Other patterns containing `/` or `\` keep the legacy path-substring behavior.
-- `ProxiFyre.exe` excludes its own process traffic to avoid relay loops.
+- The loaded module excludes its host process traffic to avoid relay loops.
 
 ## Notes
 
 - IPv6 extension headers are parsed for hop-by-hop, routing, and destination options. Fragmented packets are passed through.
 - TCP ownership is resolved from the Windows TCP owner table. A brand-new connection may pass through normally if Windows has not published ownership for the first packet yet.
 - UDP ownership is resolved from the Windows UDP owner table by local endpoint, with wildcard-bind fallback.
-- The relay core does not open local TCP or UDP listener ports. It still creates outbound sockets to the original destination, so firewall prompts should be limited to normal outbound network access.
+- The relay module does not open local TCP or UDP listener ports. It still creates outbound sockets to the original destination, so firewall prompts should be limited to normal outbound network access.

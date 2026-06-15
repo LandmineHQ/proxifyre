@@ -24,7 +24,7 @@ internal sealed class CoreLogger : IDisposable
     public static CoreLogger CreateForCurrentProcess()
     {
         var logPath = Path.Combine(AppContext.BaseDirectory, "proxifyre-core.log");
-        var logger = new CoreLogger(logPath);
+        var logger = Create(logPath);
         logger.Info("============================================================");
         logger.Info("Core log session started.");
         logger.Info($"Process: {Process.GetCurrentProcess().ProcessName} pid={Environment.ProcessId}");
@@ -32,6 +32,11 @@ internal sealed class CoreLogger : IDisposable
         logger.Info($"Base directory: {AppContext.BaseDirectory}");
         logger.Info($"Log file: {logPath}");
         return logger;
+    }
+
+    public static CoreLogger Create(string logPath)
+    {
+        return new CoreLogger(logPath);
     }
 
     public void Info(string message) => Write("INFO", message, Console.Out);

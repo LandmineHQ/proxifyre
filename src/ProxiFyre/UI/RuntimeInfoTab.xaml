@@ -31,7 +31,7 @@
                        TextWrapping="Wrap"
                        Margin="0,3,0,10" />
 
-            <TextBlock Text="核心进程" FontWeight="SemiBold" />
+            <TextBlock Text="模组目标进程" FontWeight="SemiBold" />
             <TextBlock x:Name="CoreProcessText"
                        Text="未运行"
                        Foreground="{StaticResource MutedTextBrush}"
@@ -40,7 +40,7 @@
 
             <TextBlock Text="网络占用观察" FontWeight="SemiBold" />
             <TextBlock x:Name="NetworkOwnerHintText"
-                       Text="启动后查看核心进程，而不是 UI 进程。"
+                       Text="载入后查看目标进程，而不是 UI 进程。"
                        Foreground="{StaticResource MutedTextBrush}"
                        TextWrapping="Wrap"
                        Margin="0,3,0,10" />
@@ -52,7 +52,7 @@
                        Margin="0,3,0,10" />
         </StackPanel>
 
-        <Button Content="重新载入配置"
+        <Button Content="重载模组配置"
                 Click="ReloadButton_Click"
                 Grid.Row="1"
                 VerticalAlignment="Bottom"

@@ -486,7 +486,7 @@ internal sealed class ProcessLookup
         [MarshalAs(UnmanagedType.Bool)] bool inheritHandle,
         int processId);
 
-    [DllImport("kernel32.dll", SetLastError = true)]
+    [DllImport("kernel32.dll", EntryPoint = "QueryFullProcessImageNameW", ExactSpelling = true, SetLastError = true, CharSet = CharSet.Unicode)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool QueryFullProcessImageName(
         IntPtr processHandle,

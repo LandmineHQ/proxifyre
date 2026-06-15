@@ -14,6 +14,23 @@
     <Grid Margin="12">
         <ListBox x:Name="LogList"
                  FontFamily="Consolas"
-                 FontSize="12" />
+                 FontSize="12"
+                 SelectionMode="Extended"
+                 ScrollViewer.CanContentScroll="True"
+                 VirtualizingPanel.IsVirtualizing="True"
+                 VirtualizingPanel.VirtualizationMode="Recycling"
+                 PreviewKeyDown="LogList_PreviewKeyDown">
+            <ListBox.ContextMenu>
+                <ContextMenu>
+                    <MenuItem Header="复制选中行" Click="CopySelectedMenuItem_Click" />
+                    <MenuItem Header="复制全部日志" Click="CopyAllMenuItem_Click" />
+                </ContextMenu>
+            </ListBox.ContextMenu>
+            <ListBox.ItemsPanel>
+                <ItemsPanelTemplate>
+                    <VirtualizingStackPanel />
+                </ItemsPanelTemplate>
+            </ListBox.ItemsPanel>
+        </ListBox>
     </Grid>
 </UserControl>

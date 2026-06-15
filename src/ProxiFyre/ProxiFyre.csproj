@@ -28,6 +28,16 @@
     <None Remove="Assets\AppIcon.ico" />
     <Resource Include="Assets\AppIcon.ico" />
     <Compile Include="..\Shared\LicenseKey.cs" Link="Shared\LicenseKey.cs" />
+    <Compile Include="..\Shared\ModuleMessageProtocol.cs" Link="Shared\ModuleMessageProtocol.cs" />
     <Content Include="..\..\manifest.json" Link="manifest.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
+  <Target Name="CopyNativeAotModule" AfterTargets="Build">
+    <PropertyGroup>
+      <NativeAotModulePath>$(ArtifactsPath)\native\$(Configuration)\ProxiFyre.Module.dll</NativeAotModulePath>
+    </PropertyGroup>
+    <Copy SourceFiles="$(NativeAotModulePath)"
+          DestinationFolder="$(OutDir)"
+          SkipUnchangedFiles="true"
+          Condition="Exists('$(NativeAotModulePath)')" />
+  </Target>
 </Project>

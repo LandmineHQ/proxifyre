@@ -14,6 +14,7 @@ namespace ProxiFyre;
 public partial class MainWindow : Window
 {
     private const string DefaultSourceUrl = "https://github.com/LandmineHQ/proxifyre";
+    private const int MaxUiLogEntries = 1000;
 
     private static readonly Regex TrafficLinePattern = new(
         @"(?:^|\s)TRAFFIC up=(?<up>\d+) down=(?<down>\d+) upRate=(?<upRate>\d+) downRate=(?<downRate>\d+)",
@@ -21,11 +22,14 @@ public partial class MainWindow : Window
 
     private readonly ApplicationRulesManager _rulesManager = new();
     private readonly ObservableCollection<string> _logs = [];
+    private readonly object _uiLogSync = new();
     private readonly ConfigurationStore _configurationStore = new(Path.Combine(AppContext.BaseDirectory, "app-config.json"));
     private readonly SettingsViewModel _settingsViewModel = new();
     private readonly WinpkFilterManager _winpkFilterManager;
-    private readonly CoreRelayController _coreRelayController;
+    private readonly AotModuleController _moduleController;
     private readonly Forms.NotifyIcon _trayIcon;
+    private readonly string _uiLogPath = Path.Combine(AppContext.BaseDirectory, "proxifyre-ui.log");
+    private readonly StreamWriter _uiLogWriter;
     private bool _hasShownTrayHint;
     private bool _hasCheckedForUpdates;
     private bool _isAnnouncementDismissed;
@@ -34,6 +38,7 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+        _uiLogWriter = CreateUiLogWriter(_uiLogPath);
         _trayIcon = CreateTrayIcon();
         Tabs.Apps.ItemsSource = _rulesManager.View;
         Tabs.Logs.ItemsSource = _logs;
@@ -42,7 +47,7 @@ public partial class MainWindow : Window
         Tabs.SearchChanged += (_, _) => _rulesManager.SetSearchText(Tabs.SearchText);
         Tabs.EditAppRequested += Tabs_EditAppRequested;
         Tabs.RemoveAppRequested += Tabs_RemoveAppRequested;
-        Tabs.ReloadRequested += (_, _) => LoadConfig();
+        Tabs.ReloadRequested += (_, _) => ReloadConfigFromUi();
         Tabs.WinpkFilterActionRequested += Tabs_WinpkFilterActionRequested;
         Header.OpenSourceRequested += (_, _) => OpenSource();
         Header.StartStopRequested += Header_StartStopRequested;
@@ -54,21 +59,24 @@ public partial class MainWindow : Window
         RuleEntry.CoreProcessName = AppConfiguration.DefaultCoreProcessName;
         _winpkFilterManager = new WinpkFilterManager(AppendLog);
         _winpkFilterManager.StatusChanged += WinpkFilterManager_StatusChanged;
-        _coreRelayController = new CoreRelayController(_configurationStore, _winpkFilterManager, AppendLog, () =>
+        _moduleController = new AotModuleController(_configurationStore, _winpkFilterManager, AppendLog, moduleEvent =>
         {
-            Dispatcher.InvokeAsync(() => SetRunning(false));
+            Dispatcher.InvokeAsync(() => ApplyModuleEvent(moduleEvent));
         });
         LoadLocalManifestInfo();
         SetVersionStatusChecking();
         UpdateCoreProcessInfo();
         RefreshSettingsInfo();
         ClearCoreLog();
+        AppendLog($"UI log file: {_uiLogPath}");
         LoadConfig();
         Loaded += MainWindow_Loaded;
     }
 
     private async void MainWindow_Loaded(object sender, RoutedEventArgs e)
     {
+        await DiscoverExistingModuleAsync();
+
         if (_hasCheckedForUpdates)
         {
             return;
@@ -76,6 +84,45 @@ public partial class MainWindow : Window
 
         _hasCheckedForUpdates = true;
         await CheckForUpdatesAsync();
+    }
+
+    private async Task DiscoverExistingModuleAsync()
+    {
+        Header.StartStopEnabled = false;
+        try
+        {
+            var result = await _moduleController.TryAttachExistingAsync(RuleEntry.CoreProcessName);
+            switch (result)
+            {
+                case ModuleAttachResult.Attached:
+                    AppendLog("已发现目标进程中的 AOT 模组，正在恢复 UI 连接。");
+                    break;
+                case ModuleAttachResult.TargetProcessMissing:
+                    AppendLog($"未找到模组目标进程：{AppConfiguration.NormalizeCoreProcessName(RuleEntry.CoreProcessName)}。请先启动目标程序。");
+                    MessageBox.Show(
+                        this,
+                        $"未找到模组目标进程：{AppConfiguration.NormalizeCoreProcessName(RuleEntry.CoreProcessName)}\n\n请先启动目标程序，然后再载入模组。",
+                        "ProxiFyre",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Information);
+                    break;
+                case ModuleAttachResult.NotLoaded:
+                    AppendLog("目标进程已启动，但尚未发现 AOT 模组。");
+                    break;
+                case ModuleAttachResult.Unresponsive:
+                    AppendLog("发现 AOT 模组窗口，但模组未响应心跳；点击载入模组前请确认目标进程状态。");
+                    break;
+            }
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"Module reconnect failed: {ex.Message}");
+        }
+        finally
+        {
+            Header.StartStopEnabled = true;
+            UpdateCoreProcessInfo();
+        }
     }
 
     private async Task CheckForUpdatesAsync()
@@ -246,6 +293,16 @@ public partial class MainWindow : Window
         }
     }
 
+    private void ReloadConfigFromUi()
+    {
+        LoadConfig();
+        if (_moduleController.IsRunning)
+        {
+            _moduleController.Reload();
+            AppendLog("已向模组发送配置重载命令。");
+        }
+    }
+
     private bool SaveConfig()
     {
         RuleEntry.NormalizeCoreProcessName();
@@ -330,9 +387,9 @@ public partial class MainWindow : Window
 
     private async void Tabs_WinpkFilterActionRequested(object? sender, EventArgs e)
     {
-        if (_coreRelayController.IsRunning)
+        if (_moduleController.IsRunning)
         {
-            MessageBox.Show(this, "请先暂停核心，再修改 WinpkFilter 安装状态。", "ProxiFyre", MessageBoxButton.OK, MessageBoxImage.Information);
+            MessageBox.Show(this, "请先停止模组转发，再修改 WinpkFilter 安装状态。", "ProxiFyre", MessageBoxButton.OK, MessageBoxImage.Information);
             return;
         }
 
@@ -393,9 +450,9 @@ public partial class MainWindow : Window
 
     private async void Header_StartStopRequested(object? sender, EventArgs e)
     {
-        if (_coreRelayController.IsRunning)
+        if (_moduleController.IsRunning)
         {
-            await _coreRelayController.StopAsync();
+            _moduleController.StopRelay();
             SetRunning(false);
             return;
         }
@@ -403,22 +460,31 @@ public partial class MainWindow : Window
         try
         {
             Header.StartStopEnabled = false;
-            var result = await _coreRelayController.StartAsync(
+            var result = await _moduleController.LoadAndRunAsync(
                 RuleEntry.CoreProcessName,
                 _rulesManager.BuildApps(),
                 (deviceId, currentKey) => RegistrationDialog.Show(this, deviceId, currentKey));
-            if (result == CoreRelayStartResult.Canceled)
+            if (result == ModuleStartResult.Canceled)
             {
                 return;
             }
 
             _settingsViewModel.SetLicenseKey(_configurationStore.GetLicenseKey());
-            SetRunning(true);
             UpdateCoreProcessInfo();
         }
         catch (Exception ex)
         {
-            AppendLog($"Start failed: {ex.Message}");
+            AppendLog($"Module load failed: {ex.Message}");
+            if (ex.Message.Contains("未找到模组目标进程", StringComparison.Ordinal))
+            {
+                MessageBox.Show(
+                    this,
+                    $"{ex.Message}\n\n请先启动目标程序，然后再载入模组。",
+                    "ProxiFyre",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Information);
+            }
+
             SetRunning(false);
         }
         finally
@@ -491,17 +557,18 @@ public partial class MainWindow : Window
 
     private void AppendHotReloadHint(bool saved)
     {
-        if (saved && _coreRelayController.IsRunning)
+        if (saved && _moduleController.IsRunning)
         {
-            AppendLog("配置已保存，核心将热加载规则；已有连接不会被重启。");
+            _moduleController.Reload();
+            AppendLog("配置已保存，已向模组发送重载命令；已有连接不会被重启。");
         }
     }
 
     private void AppendCoreProcessNameHintIfRunning(bool saved)
     {
-        if (saved && _coreRelayController.IsRunning)
+        if (saved && _moduleController.IsRunning)
         {
-            AppendLog("核心进程名已保存；当前核心进程文件名会在下次启动时生效，应用规则已热加载。");
+            AppendLog("目标进程名已保存；已载入的 AOT 模组不会迁移进程，请在目标进程变更后重新载入。");
         }
     }
 
@@ -628,12 +695,32 @@ public partial class MainWindow : Window
 
     private void UpdateCoreProcessInfo()
     {
-        var info = _coreRelayController.GetDisplayInfo(RuleEntry.CoreProcessName);
+        var info = _moduleController.GetDisplayInfo(RuleEntry.CoreProcessName);
         Tabs.SetCoreProcessInfo(info.Text, info.NetworkOwnerHint);
+    }
+
+    private void ApplyModuleEvent(ModuleEvent moduleEvent)
+    {
+        if (!string.IsNullOrWhiteSpace(moduleEvent.Text))
+        {
+            AppendLog($"module {moduleEvent.EventName}: {moduleEvent.Text}");
+        }
+
+        if (moduleEvent.Running is not null)
+        {
+            SetRunning(moduleEvent.Running.Value);
+        }
+        else
+        {
+            UpdateCoreProcessInfo();
+        }
     }
 
     private void AppendLog(string message)
     {
+        var uiLine = $"{DateTime.Now:HH:mm:ss}  {message}";
+        WriteUiLogLine(message);
+
         if (TryParseTrafficLine(message, out var traffic))
         {
             Dispatcher.InvokeAsync(() => UpdateTrafficStatus(traffic));
@@ -642,14 +729,42 @@ public partial class MainWindow : Window
 
         Dispatcher.InvokeAsync(() =>
         {
-            _logs.Add($"{DateTime.Now:HH:mm:ss}  {message}");
-            while (_logs.Count > 300)
+            _logs.Add(uiLine);
+            while (_logs.Count > MaxUiLogEntries)
             {
                 _logs.RemoveAt(0);
             }
 
             Tabs.ScrollLogToEnd();
         });
+    }
+
+    private static StreamWriter CreateUiLogWriter(string logPath)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(logPath) ?? AppContext.BaseDirectory);
+        var writer = new StreamWriter(new FileStream(logPath, FileMode.Create, FileAccess.Write, FileShare.ReadWrite))
+        {
+            AutoFlush = true
+        };
+        writer.WriteLine($"{DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss.fff zzz} [INFO] UI log session started.");
+        writer.WriteLine($"{DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss.fff zzz} [INFO] Process: {Process.GetCurrentProcess().ProcessName} pid={Environment.ProcessId}");
+        writer.WriteLine($"{DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss.fff zzz} [INFO] Base directory: {AppContext.BaseDirectory}");
+        writer.WriteLine($"{DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss.fff zzz} [INFO] Log file: {logPath}");
+        return writer;
+    }
+
+    private void WriteUiLogLine(string message)
+    {
+        lock (_uiLogSync)
+        {
+            try
+            {
+                _uiLogWriter.WriteLine($"{DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss.fff zzz} [INFO] {message}");
+            }
+            catch
+            {
+            }
+        }
     }
 
     private static bool TryParseTrafficLine(string message, out TrafficSnapshot snapshot)
@@ -705,7 +820,19 @@ public partial class MainWindow : Window
     {
         _trayIcon.Visible = false;
         _trayIcon.Dispose();
-        _coreRelayController.Dispose();
+        _moduleController.Dispose();
+        lock (_uiLogSync)
+        {
+            try
+            {
+                _uiLogWriter.WriteLine($"{DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss.fff zzz} [INFO] UI log session ended.");
+                _uiLogWriter.Dispose();
+            }
+            catch
+            {
+            }
+        }
+
         base.OnClosed(e);
     }
 

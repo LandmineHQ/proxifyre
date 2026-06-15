@@ -7,13 +7,39 @@ internal static class Cli
     public static async Task<int> RunAsync(string[] args)
     {
         AttachConsole();
-        Console.WriteLine("ProxiFyre C# direct relay");
 
         if (args.Any(IsHelp))
         {
             PrintUsage();
             return 0;
         }
+
+        if (args.Any(a => string.Equals(a, "--license-device", StringComparison.OrdinalIgnoreCase)))
+        {
+            if (args.Length != 1)
+            {
+                Console.Error.WriteLine("Usage: ProxiFyre.exe --license-device");
+                return 2;
+            }
+
+            PrintLicense(LicenseKey.GetCurrentDeviceId());
+            return 0;
+        }
+
+        var licenseDeviceId = GetOptionValue(args, "--license-key");
+        if (licenseDeviceId is not null)
+        {
+            if (args.Length != 2 || LicenseKey.NormalizeDeviceId(licenseDeviceId).Length == 0)
+            {
+                Console.Error.WriteLine("Usage: ProxiFyre.exe --license-key <device-id>");
+                return 2;
+            }
+
+            PrintLicense(licenseDeviceId);
+            return 0;
+        }
+
+        Console.WriteLine("ProxiFyre C# direct relay");
 
         if (args.Any(a => string.Equals(a, "--reset-filter", StringComparison.OrdinalIgnoreCase)))
         {
@@ -138,8 +164,16 @@ internal static class Cli
         Console.WriteLine("  ProxiFyre.exe");
         Console.WriteLine("  ProxiFyre.exe --run [--config <path>] [--detailed]");
         Console.WriteLine("  ProxiFyre.exe --reset-filter");
+        Console.WriteLine("  ProxiFyre.exe --license-device");
+        Console.WriteLine("  ProxiFyre.exe --license-key <device-id>");
         Console.WriteLine("  ProxiFyre.exe --add-app <exe-or-path> [--config <path>]");
         Console.WriteLine("  ProxiFyre.exe --init-config [--config <path>]");
+    }
+
+    private static void PrintLicense(string deviceId)
+    {
+        Console.WriteLine($"deviceId={LicenseKey.NormalizeDeviceId(deviceId)}");
+        Console.WriteLine($"licenseKey={LicenseKey.CreateKey(deviceId)}");
     }
 
     private static void AttachConsole()

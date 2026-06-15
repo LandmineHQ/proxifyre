@@ -2,26 +2,6 @@ namespace TrafficTest;
 
 internal static class CoreLogReporter
 {
-    public static void PrintTrafficSummary(IEnumerable<string> outputLines)
-    {
-        var trafficLines = outputLines
-            .Where(line => line.Contains("TRAFFIC up=", StringComparison.Ordinal))
-            .TakeLast(3)
-            .ToArray();
-
-        if (trafficLines.Length == 0)
-        {
-            Console.WriteLine("traffic summary: no TRAFFIC status lines captured");
-            return;
-        }
-
-        Console.WriteLine("traffic summary:");
-        foreach (var line in trafficLines)
-        {
-            Console.WriteLine($"  {line}");
-        }
-    }
-
     public static async Task WaitForLogLineAsync(string logPath, string text, TimeSpan timeout, CancellationToken cancellationToken)
     {
         var deadline = DateTimeOffset.UtcNow + timeout;

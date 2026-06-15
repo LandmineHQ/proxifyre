@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AnalysisLevel>latest</AnalysisLevel>
+    <PlatformTarget>x64</PlatformTarget>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <PublishAot>true</PublishAot>
+    <NativeLib>Shared</NativeLib>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>ProxiFyre.Module</AssemblyName>
+    <RootNamespace>ProxiFyre</RootNamespace>
+    <PublishDir>$(MSBuildThisFileDirectory)..\..\artifacts\native\$(Configuration)\</PublishDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\Shared\LicenseKey.cs" Link="Shared\LicenseKey.cs" />
+    <Compile Include="..\Shared\ModuleMessageProtocol.cs" Link="Shared\ModuleMessageProtocol.cs" />
+    <Compile Include="..\ProxiFyre\Configuration\AppConfiguration.cs" Link="Configuration\AppConfiguration.cs" />
+    <Compile Include="..\ProxiFyre\Configuration\DynamicAppConfiguration.cs" Link="Configuration\DynamicAppConfiguration.cs" />
+    <Compile Include="..\ProxiFyre\Logging\CoreLogger.cs" Link="Logging\CoreLogger.cs" />
+    <Compile Include="..\ProxiFyre\Native\NdisApi.cs" Link="Native\NdisApi.cs" />
+    <Compile Include="..\ProxiFyre\Network\NetworkEndpointResolver.cs" Link="Network\NetworkEndpointResolver.cs" />
+    <Compile Include="..\ProxiFyre\Network\NetworkKeys.cs" Link="Network\NetworkKeys.cs" />
+    <Compile Include="..\ProxiFyre\Network\TlsSniParser.cs" Link="Network\TlsSniParser.cs" />
+    <Compile Include="..\ProxiFyre\PacketFiltering\PacketFilterLoop.cs" Link="PacketFiltering\PacketFilterLoop.cs" />
+    <Compile Include="..\ProxiFyre\PacketFiltering\PacketView.cs" Link="PacketFiltering\PacketView.cs" />
+    <Compile Include="..\ProxiFyre\PacketFiltering\PacketWakeSignal.cs" Link="PacketFiltering\PacketWakeSignal.cs" />
+    <Compile Include="..\ProxiFyre\Process\ProcessLookup.cs" Link="Process\ProcessLookup.cs" />
+    <Compile Include="..\ProxiFyre\Process\ProcessMatcher.cs" Link="Process\ProcessMatcher.cs" />
+    <Compile Include="..\ProxiFyre\Relay\RelayService.cs" Link="Relay\RelayService.cs" />
+    <Compile Include="..\ProxiFyre\Relay\TcpDirectRelay.cs" Link="Relay\TcpDirectRelay.cs" />
+    <Compile Include="..\ProxiFyre\Relay\TrafficCounter.cs" Link="Relay\TrafficCounter.cs" />
+    <Compile Include="..\ProxiFyre\Relay\UdpDirectRelay.cs" Link="Relay\UdpDirectRelay.cs" />
+  </ItemGroup>
+</Project>

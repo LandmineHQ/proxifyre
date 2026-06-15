@@ -45,29 +45,6 @@ internal static class ProcessRunner
         return process;
     }
 
-    public static Task CaptureProcessOutputAsync(Process process, BoundedLog output, bool echo, CancellationToken cancellationToken)
-    {
-        var stdout = Task.Run(() => CaptureReaderAsync("core>", process.StandardOutput, output, echo, cancellationToken), cancellationToken);
-        var stderr = Task.Run(() => CaptureReaderAsync("core!", process.StandardError, output, echo, cancellationToken), cancellationToken);
-        return Task.WhenAll(stdout, stderr);
-    }
-
-    public static async Task CaptureChildLinesAsync(StreamReader reader, List<string> lines, string echoPrefix)
-    {
-        while (await reader.ReadLineAsync() is { } line)
-        {
-            lock (lines)
-            {
-                lines.Add(line);
-            }
-
-            if (!string.IsNullOrWhiteSpace(line))
-            {
-                Console.WriteLine($"{echoPrefix} {line}");
-            }
-        }
-    }
-
     public static string QuoteArgument(string argument)
     {
         if (argument.Length == 0)
@@ -78,43 +55,5 @@ internal static class ProcessRunner
         return argument.Any(char.IsWhiteSpace) || argument.Contains('"', StringComparison.Ordinal)
             ? "\"" + argument.Replace("\\", "\\\\", StringComparison.Ordinal).Replace("\"", "\\\"", StringComparison.Ordinal) + "\""
             : argument;
-    }
-
-    private static async Task CaptureReaderAsync(
-        string prefix,
-        StreamReader reader,
-        BoundedLog output,
-        bool echo,
-        CancellationToken cancellationToken)
-    {
-        try
-        {
-            while (!cancellationToken.IsCancellationRequested)
-            {
-                var line = await reader.ReadLineAsync(cancellationToken);
-                if (line is null)
-                {
-                    return;
-                }
-
-                if (string.IsNullOrWhiteSpace(line))
-                {
-                    continue;
-                }
-
-                var formatted = $"{prefix} {line}";
-                output.Add(formatted);
-                if (echo)
-                {
-                    Console.WriteLine(formatted);
-                }
-            }
-        }
-        catch (OperationCanceledException)
-        {
-        }
-        catch
-        {
-        }
     }
 }

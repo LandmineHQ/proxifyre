@@ -7,7 +7,8 @@ internal static class TestHelp
         exitCode = 0;
         if (args.Length == 0)
         {
-            return false;
+            Print();
+            return true;
         }
 
         if (!IsHelp(args[0]))
@@ -15,8 +16,7 @@ internal static class TestHelp
             return false;
         }
 
-        var topic = args.Length > 1 ? args[1] : string.Empty;
-        Print(topic);
+        Print(args.Length > 1 ? args[1] : null);
         return true;
     }
 
@@ -24,14 +24,17 @@ internal static class TestHelp
     {
         switch (topic?.Trim().ToLowerInvariant())
         {
-            case "curl":
-                PrintCurl();
+            case "tcp":
+                PrintTcp();
                 break;
-            case "stun":
-                PrintStun();
+            case "udp":
+                PrintUdp();
                 break;
-            case "license":
-                PrintLicense();
+            case "uu":
+                PrintProcessDiagnostic("UU", "uu.exe");
+                break;
+            case "steam":
+                PrintProcessDiagnostic("Steam", "steamwebhelper.exe");
                 break;
             case "":
             case null:
@@ -48,83 +51,58 @@ internal static class TestHelp
     private static void PrintOverview()
     {
         Console.WriteLine("TrafficTest usage:");
-        Console.WriteLine("  proxifyre.ps1 test [mode] [-Detailed] [-- <test args>]");
-        Console.WriteLine("  proxifyre.ps1 test help [curl|stun|license]");
+        Console.WriteLine("  proxifyre.ps1 test <tcp|udp|uu|steam> [-Detailed] [-- <test args>]");
         Console.WriteLine();
         Console.WriteLine("Modes:");
-        Console.WriteLine("  curl-ipv4             HTTPS curl over IPv4");
-        Console.WriteLine("  curl-ipv6             HTTPS curl over IPv6");
-        Console.WriteLine("  curl-http-ipv4        HTTP curl over IPv4");
-        Console.WriteLine("  curl-large-ipv4       Large HTTPS download over IPv4");
-        Console.WriteLine("  curl-large-ipv6       Large HTTPS download over IPv6");
-        Console.WriteLine("  stun-ipv4             Single UDP STUN relay test over IPv4");
-        Console.WriteLine("  stun-ipv6             Single UDP STUN relay test over IPv6");
-        Console.WriteLine("  stun-bench-ipv4       Direct vs relay STUN latency benchmark over IPv4");
-        Console.WriteLine("  stun-bench-ipv6       Direct vs relay STUN latency benchmark over IPv6");
-        Console.WriteLine("  stun-scan-ipv4        Direct STUN server scan over IPv4");
-        Console.WriteLine("  stun-scan-ipv6        Direct STUN server scan over IPv6");
-        Console.WriteLine("  stun-relay-scan-ipv4  Relay STUN server scan over IPv4");
-        Console.WriteLine("  stun-relay-scan-ipv6  Relay STUN server scan over IPv6");
-        Console.WriteLine("  license-device        Print this machine device ID and license key");
-        Console.WriteLine("  license-key           Print license key for a supplied device ID");
-        Console.WriteLine();
-        Console.WriteLine("Common option:");
-        Console.WriteLine("  --detailed, --verbose Echo core packet logs and include detailed summaries.");
+        Console.WriteLine("  tcp    HTTPS curl relay diagnostic");
+        Console.WriteLine("  udp    UDP STUN relay diagnostic");
+        Console.WriteLine("  uu     UU process ports and connections");
+        Console.WriteLine("  steam  Steam WebHelper process ports and connections");
         Console.WriteLine();
         Console.WriteLine("More help:");
-        Console.WriteLine("  proxifyre.ps1 test help curl");
-        Console.WriteLine("  proxifyre.ps1 test help stun");
-        Console.WriteLine("  proxifyre.ps1 test help license");
+        Console.WriteLine("  proxifyre.ps1 test help tcp");
+        Console.WriteLine("  proxifyre.ps1 test help udp");
+        Console.WriteLine("  proxifyre.ps1 test help uu");
+        Console.WriteLine("  proxifyre.ps1 test help steam");
     }
 
-    private static void PrintCurl()
+    private static void PrintTcp()
     {
-        Console.WriteLine("Curl test modes:");
-        Console.WriteLine("  curl-ipv4 | curl-ipv6 | curl-http-ipv4 | curl-large-ipv4 | curl-large-ipv6");
+        Console.WriteLine("TCP test:");
+        Console.WriteLine("  proxifyre.ps1 test tcp [-Detailed] [-- --url <url> --ipv4|--ipv6]");
+        Console.WriteLine("  Starts a WPF test host renamed to steamwebhelper.exe and injects the AOT module into that PID.");
         Console.WriteLine();
-        Console.WriteLine("Curl-only args:");
-        Console.WriteLine("  --curl-url <url>       Override the mode's default target URL.");
-        Console.WriteLine("  --curl-option <arg>    Append one curl argument; can be repeated.");
-        Console.WriteLine();
-        Console.WriteLine("Examples:");
-        Console.WriteLine("  proxifyre.ps1 test curl-ipv4 -Detailed -- --curl-url https://steamcommunity.com/app/3658790/workshop/");
-        Console.WriteLine("  proxifyre.ps1 test curl-ipv4 -- --curl-option --insecure --curl-url https://example.com/");
+        Console.WriteLine("Args:");
+        Console.WriteLine("  --url <url>          Target URL. Defaults to https://www.bing.com/.");
+        Console.WriteLine("  --ipv4               Force IPv4. Default.");
+        Console.WriteLine("  --ipv6               Force IPv6.");
+        Console.WriteLine("  --curl-option <arg>  Append one curl argument; can be repeated.");
     }
 
-    private static void PrintStun()
+    private static void PrintUdp()
     {
-        Console.WriteLine("STUN test modes:");
-        Console.WriteLine("  stun-ipv4 | stun-ipv6");
-        Console.WriteLine("  stun-bench-ipv4 | stun-bench-ipv6");
-        Console.WriteLine("  stun-scan-ipv4 | stun-scan-ipv6");
-        Console.WriteLine("  stun-relay-scan-ipv4 | stun-relay-scan-ipv6");
+        Console.WriteLine("UDP test:");
+        Console.WriteLine("  proxifyre.ps1 test udp [-Detailed] [-- --stun-host <host> --stun-port <port> --ipv4|--ipv6]");
+        Console.WriteLine("  Starts a WPF test host renamed to steamwebhelper.exe and injects the AOT module into that PID.");
         Console.WriteLine();
-        Console.WriteLine("STUN target args:");
-        Console.WriteLine("  --stun-host <host>           Override host for stun-ipv4/stun-ipv6/stun-bench-*.");
-        Console.WriteLine("  --stun-port <port>           Override port; use together with --stun-host.");
-        Console.WriteLine("  --stun <host:port>           Add a scan candidate; can be repeated.");
-        Console.WriteLine();
-        Console.WriteLine("STUN timing args:");
-        Console.WriteLine("  --samples <count>            Sample count for stun-bench-*.");
-        Console.WriteLine("  --preflight-samples <count>  Probe count for preflight and scan modes.");
-        Console.WriteLine("  --interval-ms <ms>           Delay between STUN samples.");
-        Console.WriteLine("  --timeout-ms <ms>            Timeout for each STUN request.");
-        Console.WriteLine();
-        Console.WriteLine("Examples:");
-        Console.WriteLine("  proxifyre.ps1 test stun-ipv4 -- --stun-host stun.cloudflare.com --stun-port 3478");
-        Console.WriteLine("  proxifyre.ps1 test stun-bench-ipv4 -- --samples 10 --timeout-ms 2000");
-        Console.WriteLine("  proxifyre.ps1 test stun-scan-ipv4 -- --stun stun.cloudflare.com:3478 --stun stun.nextcloud.com:443");
+        Console.WriteLine("Args:");
+        Console.WriteLine("  --stun-host <host>   STUN host. Defaults to stun.l.google.com.");
+        Console.WriteLine("  --stun-port <port>   STUN port. Defaults to 19302.");
+        Console.WriteLine("  --timeout-ms <ms>    STUN response timeout. Defaults to 1500.");
+        Console.WriteLine("  --ipv4               Force IPv4. Default.");
+        Console.WriteLine("  --ipv6               Force IPv6.");
     }
 
-    private static void PrintLicense()
+    private static void PrintProcessDiagnostic(string label, string defaultProcessName)
     {
-        Console.WriteLine("License helper modes:");
-        Console.WriteLine("  license-device");
-        Console.WriteLine("  license-key <device-id>");
+        Console.WriteLine($"{label} process diagnostic:");
+        Console.WriteLine($"  proxifyre.ps1 test {label.ToLowerInvariant()} [-- --process-name <name> --duration-ms <ms> --json]");
         Console.WriteLine();
-        Console.WriteLine("Examples:");
-        Console.WriteLine("  proxifyre.ps1 test license-device");
-        Console.WriteLine("  proxifyre.ps1 test license-key 0123456789abcdef");
+        Console.WriteLine("Args:");
+        Console.WriteLine($"  --process-name <name>  Process name. Defaults to {defaultProcessName}.");
+        Console.WriteLine("  --duration-ms <ms>     Sampling duration. Defaults to 1000.");
+        Console.WriteLine("  --interval-ms <ms>     Sampling interval. Defaults to 250.");
+        Console.WriteLine("  --json                 Print JSON.");
     }
 
     private static bool IsHelp(string value)

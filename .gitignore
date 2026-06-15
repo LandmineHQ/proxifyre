@@ -16,3 +16,6 @@ artifacts/
 
 app-config.json
 steamwebhelper.exe
+
+# 临时文件夹
+.tmp

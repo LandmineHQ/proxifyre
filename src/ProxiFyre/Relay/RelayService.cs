@@ -32,6 +32,18 @@ internal sealed class RelayService : IDisposable, IAsyncDisposable
 
     public Task Completion => _filterTask ?? Task.CompletedTask;
 
+    public bool Reload(AppConfiguration configuration)
+    {
+        if (_configuration is null)
+        {
+            return false;
+        }
+
+        _configuration.Update(configuration);
+        _log($"Configuration reloaded: coreProcessName={configuration.CoreProcessName}, apps={configuration.Apps.Count}");
+        return true;
+    }
+
     public void Start(AppConfiguration configuration, string? configurationPath = null, CancellationToken externalCancellationToken = default)
     {
         if (IsRunning)
