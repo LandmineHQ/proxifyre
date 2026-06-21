@@ -36,6 +36,9 @@ internal static class TestHelp
             case "steam":
                 PrintProcessDiagnostic("Steam", "steamwebhelper.exe");
                 break;
+            case "leigod-redirect":
+                Console.WriteLine("Leigod redirect demo help.");
+                break;
             case "":
             case null:
                 PrintOverview();
@@ -51,13 +54,14 @@ internal static class TestHelp
     private static void PrintOverview()
     {
         Console.WriteLine("TrafficTest usage:");
-        Console.WriteLine("  proxifyre.ps1 test <tcp|udp|uu|steam> [-Detailed] [-- <test args>]");
+        Console.WriteLine("  proxifyre.ps1 test <tcp|udp|uu|steam|leigod-redirect> [-Detailed] [-- <test args>]");
         Console.WriteLine();
         Console.WriteLine("Modes:");
-        Console.WriteLine("  tcp    HTTPS curl relay diagnostic");
-        Console.WriteLine("  udp    UDP STUN relay diagnostic");
-        Console.WriteLine("  uu     UU process ports and connections");
-        Console.WriteLine("  steam  Steam WebHelper process ports and connections");
+        Console.WriteLine("  tcp              HTTPS curl relay diagnostic");
+        Console.WriteLine("  udp              UDP STUN relay diagnostic");
+        Console.WriteLine("  uu               UU process ports and connections");
+        Console.WriteLine("  steam            Steam WebHelper process ports and connections");
+        Console.WriteLine("  leigod-redirect  Leigod WFP redirect test and demo");
         Console.WriteLine();
         Console.WriteLine("More help:");
         Console.WriteLine("  proxifyre.ps1 test help tcp");

@@ -389,6 +389,11 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
 
     private void ProcessOutgoingUdp(NdisApi.IntermediateBuffer* buffer, PacketView packet)
     {
+        if (TryHandleDnsSpoof(buffer, packet))
+        {
+            return;
+        }
+
         if (_udpRelay.IsRelayOutboundEndpoint(packet.UdpEndpoint))
         {
             Pass(buffer);
@@ -999,6 +1004,167 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 "send-adapter-failed",
                 TimeSpan.FromSeconds(2));
         }
+    }
+
+    private bool TryHandleDnsSpoof(NdisApi.IntermediateBuffer* buffer, PacketView packet)
+    {
+        if (!_configuration.Current.EnableFakeIpWhitelist)
+        {
+            return false;
+        }
+
+        if (packet.DestinationPort != 53 || !packet.IsUdp)
+        {
+            return false;
+        }
+
+        var process = _processLookup.LookupUdpOwner(packet.UdpEndpoint);
+
+        var payload = packet.UdpPayload;
+        if (payload.Length < 12)
+        {
+            return false;
+        }
+
+        // Read DNS Header
+        ushort transactionId = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(payload[..2]);
+        ushort flags = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(payload.Slice(2, 2));
+        ushort qCount = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(payload.Slice(4, 2));
+
+        if (qCount == 0 || (flags & 0x8000) != 0) // Only query, not response
+        {
+            return false;
+        }
+
+        // Parse QNAME
+        int offset = 12;
+        var domain = new System.Text.StringBuilder();
+        while (offset < payload.Length)
+        {
+            byte len = payload[offset];
+            if (len == 0)
+            {
+                offset++;
+                break;
+            }
+            if (offset + 1 + len > payload.Length)
+            {
+                return false;
+            }
+
+            if (domain.Length > 0)
+            {
+                domain.Append('.');
+            }
+            domain.Append(System.Text.Encoding.ASCII.GetString(payload.Slice(offset + 1, len)));
+            offset += 1 + len;
+        }
+
+        if (offset + 4 > payload.Length)
+        {
+            return false;
+        }
+
+        ushort qType = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(payload.Slice(offset, 2));
+        offset += 4;
+
+        string queryDomain = domain.ToString();
+        // Check if query is fakeip format, e.g. fakeip-140-82-113-3.store.steampowered.com
+        if (qType == 1 && queryDomain.StartsWith("fakeip-", StringComparison.OrdinalIgnoreCase))
+        {
+            int firstDot = queryDomain.IndexOf('.');
+            if (firstDot == -1) return false;
+
+            string firstLabel = queryDomain[..firstDot]; // "fakeip-140-82-113-3"
+            string[] parts = firstLabel.Split('-');
+            if (parts.Length != 5) return false; // Must be "fakeip", "140", "82", "113", "3"
+
+            if (!IPAddress.TryParse($"{parts[1]}.{parts[2]}.{parts[3]}.{parts[4]}", out var fakeIp))
+            {
+                return false;
+            }
+
+            int questionLength = offset - 12;
+            int dnsResponseLength = 12 + questionLength + 16;
+            byte[] dnsResponse = new byte[dnsResponseLength];
+
+            // 1. Header
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(dnsResponse.AsSpan(0, 2), transactionId);
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(dnsResponse.AsSpan(2, 2), 0x8180); // Response, No error
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(dnsResponse.AsSpan(4, 2), 1);
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(dnsResponse.AsSpan(6, 2), 1);
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(dnsResponse.AsSpan(8, 2), 0);
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(dnsResponse.AsSpan(10, 2), 0);
+
+            // 2. Question
+            payload.Slice(12, questionLength).CopyTo(dnsResponse.AsSpan(12));
+
+            // 3. Answer
+            int answerOffset = 12 + questionLength;
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(dnsResponse.AsSpan(answerOffset, 2), 0xC00C);
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(dnsResponse.AsSpan(answerOffset + 2, 2), 1); // Type A
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(dnsResponse.AsSpan(answerOffset + 4, 2), 1); // Class IN
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(dnsResponse.AsSpan(answerOffset + 6, 4), 60); // TTL 60
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(dnsResponse.AsSpan(answerOffset + 10, 2), 4);
+            fakeIp.GetAddressBytes().CopyTo(dnsResponse.AsSpan(answerOffset + 12, 4));
+
+            InjectUdpResponse(buffer->AdapterOrListFlink, packet, dnsResponse);
+            var processInfoStr = process != null ? $"process={process.Name} pid={process.ProcessId}" : "process=unknown";
+            _log($"[DNS SPOOF] Spoofed {queryDomain} -> {fakeIp} ({processInfoStr})");
+            return true;
+        }
+
+        return false;
+    }
+
+    private void InjectUdpResponse(IntPtr adapterHandle, PacketView originalQuery, ReadOnlySpan<byte> dnsPayload)
+    {
+        var clientAddress = originalQuery.SourceAddress;
+        var dnsAddress = originalQuery.DestinationAddress;
+        var clientPort = originalQuery.SourcePort;
+
+        var ethernetSource = originalQuery.GetEthernetSource();
+        var ethernetDestination = originalQuery.GetEthernetDestination();
+
+        var ipHeaderLength = clientAddress.AddressFamily == AddressFamily.InterNetwork ? 20 : 40;
+        var packetLength = PacketView.EthernetHeaderLength + ipHeaderLength + 8 + dnsPayload.Length;
+
+        var buffer = default(NdisApi.IntermediateBuffer);
+        buffer.AdapterOrListFlink = adapterHandle;
+        buffer.DeviceFlags = NdisApi.PacketFlagOnReceive;
+        buffer.Length = (uint)packetLength;
+
+        var frame = new Span<byte>(buffer.Data, NdisApi.MaxEtherFrame);
+        frame[..packetLength].Clear();
+
+        ethernetSource.CopyTo(frame[..6]); // Destination MAC of response = Source MAC of query
+        ethernetDestination.CopyTo(frame.Slice(6, 6)); // Source MAC of response = Destination MAC of query
+
+        if (clientAddress.AddressFamily == AddressFamily.InterNetwork)
+        {
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(frame.Slice(12, 2), PacketView.EtherTypeIpv4);
+            BuildIpv4UdpPacket(
+                frame.Slice(PacketView.EthernetHeaderLength),
+                dnsAddress,
+                clientAddress,
+                53,
+                clientPort,
+                dnsPayload);
+        }
+        else
+        {
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(frame.Slice(12, 2), PacketView.EtherTypeIpv6);
+            BuildIpv6UdpPacket(
+                frame.Slice(PacketView.EthernetHeaderLength),
+                dnsAddress,
+                clientAddress,
+                53,
+                clientPort,
+                dnsPayload);
+        }
+
+        var request = CreateRequest(&buffer);
+        NdisApi.SendPacketToMstcp(_driverHandle, ref request);
     }
 
     private static NdisApi.EthRequest CreateRequest(NdisApi.IntermediateBuffer* buffer)

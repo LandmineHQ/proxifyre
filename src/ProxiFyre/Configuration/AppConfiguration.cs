@@ -14,6 +14,8 @@ internal sealed class AppConfiguration
 
     public string? LicenseKey { get; init; }
 
+    public bool EnableFakeIpWhitelist { get; init; } = false;
+
     public bool Matches(ProcessInfo process)
     {
         return TryGetMatchingPattern(process, out _, out _);
@@ -80,6 +82,15 @@ internal sealed class AppConfiguration
             licenseKey = licenseKeyElement.GetString();
         }
 
+        bool enableFakeIpWhitelist = false;
+        if (root.TryGetProperty("enableFakeIpWhitelist", out var enableFakeIpWhitelistElement))
+        {
+            if (enableFakeIpWhitelistElement.ValueKind == JsonValueKind.True)
+            {
+                enableFakeIpWhitelist = true;
+            }
+        }
+
         if (root.TryGetProperty("proxies", out var proxiesElement) && proxiesElement.ValueKind == JsonValueKind.Array)
         {
             foreach (var proxy in proxiesElement.EnumerateArray())
@@ -95,6 +106,7 @@ internal sealed class AppConfiguration
         {
             CoreProcessName = coreProcessName,
             LicenseKey = string.IsNullOrWhiteSpace(licenseKey) ? null : licenseKey.Trim(),
+            EnableFakeIpWhitelist = enableFakeIpWhitelist,
             Apps = apps
                 .Select(a => a.Trim())
                 .Where(a => a.Length > 0)
@@ -143,7 +155,8 @@ internal sealed class AppConfiguration
         {
             CoreProcessName = coreProcessName,
             LicenseKey = existingConfiguration?.LicenseKey,
-            Apps = apps
+            Apps = apps,
+            EnableFakeIpWhitelist = existingConfiguration?.EnableFakeIpWhitelist ?? false
         };
         File.WriteAllText(path, JsonSerializer.Serialize(simpleConfiguration, AppConfigurationJsonContext.Default.SimpleConfiguration));
         return apps;
@@ -164,7 +177,8 @@ internal sealed class AppConfiguration
                 .Select(a => a.Trim())
                 .Where(a => a.Length > 0)
                 .Distinct(StringComparer.OrdinalIgnoreCase)
-                .ToList()
+                .ToList(),
+            EnableFakeIpWhitelist = false
         };
 
         File.WriteAllText(path, JsonSerializer.Serialize(simpleConfiguration, AppConfigurationJsonContext.Default.SimpleConfiguration));
@@ -233,6 +247,9 @@ internal sealed class AppConfiguration
 
         [JsonPropertyName("apps")]
         public required List<string> Apps { get; init; }
+
+        [JsonPropertyName("enableFakeIpWhitelist")]
+        public bool EnableFakeIpWhitelist { get; init; }
     }
 }
 

@@ -25,6 +25,16 @@ internal static class TrafficTestRunner
                 return await ProcessNetworkDiagnostic.RunAsync("Steam", "steamwebhelper.exe", args.Skip(1).ToArray());
             }
 
+            if (args.Length > 0 && args[0].Equals("leigod-redirect", StringComparison.OrdinalIgnoreCase))
+            {
+                return await LeigodRedirectDemo.RunAsync(args.Skip(1).ToArray());
+            }
+
+            if (args.Length > 0 && args[0].Equals("run-leigod-demo", StringComparison.OrdinalIgnoreCase))
+            {
+                return await LeigodRedirectDemo.RunChildAsync(args.Skip(1).ToArray());
+            }
+
             var options = TestOptions.Parse(args);
             return await RunRelayTestAsync(options);
         }
