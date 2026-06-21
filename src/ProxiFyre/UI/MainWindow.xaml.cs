@@ -484,6 +484,24 @@ public partial class MainWindow : Window
                     MessageBoxButton.OK,
                     MessageBoxImage.Information);
             }
+            else if (ex.Message.Contains("WH_GETMESSAGE", StringComparison.Ordinal))
+            {
+                MessageBox.Show(
+                    this,
+                    $"注入模组失败（未找到有效的消息循环或句柄）。\n\n请尝试将目标进程（{AppConfiguration.NormalizeCoreProcessName(RuleEntry.CoreProcessName)}）调至前台显示并处于活动状态，然后再尝试载入模组。",
+                    "ProxiFyre 注入失败",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+            }
+            else
+            {
+                MessageBox.Show(
+                    this,
+                    $"载入模组时发生错误：\n{ex.Message}",
+                    "ProxiFyre 错误",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Error);
+            }
 
             SetRunning(false);
         }
