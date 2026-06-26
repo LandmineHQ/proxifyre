@@ -108,6 +108,8 @@ internal sealed unsafe class ModuleMessageClient : IDisposable
                 throw new InvalidOperationException($"CreateWindowExW failed. Win32={Marshal.GetLastWin32Error()}");
             }
 
+            _ = ChangeWindowMessageFilter(ModuleMessageProtocol.WmCopyData, MsgfltAdd);
+
             return handle;
         }
     }
@@ -302,6 +304,12 @@ internal sealed unsafe class ModuleMessageClient : IDisposable
 
     [DllImport("user32.dll", ExactSpelling = true)]
     private static extern nint DispatchMessageW(MSG* lpMsg);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ChangeWindowMessageFilter(uint message, uint dwFlag);
+
+    private const uint MsgfltAdd = 1;
 
     [DllImport("user32.dll", ExactSpelling = true, SetLastError = true)]
     private static extern nint SendMessageTimeoutW(

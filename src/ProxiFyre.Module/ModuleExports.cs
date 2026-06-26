@@ -88,6 +88,12 @@ public static unsafe class ModuleExports
     [DllImport("user32.dll", ExactSpelling = true)]
     private static extern nint DefWindowProcW(nint hWnd, uint msg, nint wParam, nint lParam);
 
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ChangeWindowMessageFilter(uint message, uint dwFlag);
+
+    private const uint MsgfltAdd = 1;
+
     [DllImport("user32.dll", ExactSpelling = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool DestroyWindow(nint hWnd);
@@ -125,6 +131,12 @@ public static unsafe class ModuleExports
         }
 
         return CallNextHookEx(nint.Zero, code, wParam, lParam);
+    }
+
+    [System.Runtime.CompilerServices.ModuleInitializer]
+    public static void InitializeModule()
+    {
+        ModuleRuntime.EnsureStarted();
     }
 
     private static class ModuleRuntime
@@ -232,6 +244,8 @@ public static unsafe class ModuleExports
                 {
                     throw new InvalidOperationException($"Failed to create module message window. Win32={Marshal.GetLastWin32Error()}");
                 }
+
+                _ = ChangeWindowMessageFilter(ModuleMessageProtocol.WmCopyData, MsgfltAdd);
 
                 return handle;
             }
@@ -498,6 +512,7 @@ public static unsafe class ModuleExports
             {
                 CoreProcessName = processName,
                 LicenseKey = configuration.LicenseKey,
+                ModuleDllName = configuration.ModuleDllName,
                 Apps = configuration.Apps
             };
         }

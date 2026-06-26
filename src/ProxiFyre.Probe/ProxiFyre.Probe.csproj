@@ -1,7 +1,5 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <DisableWinExeOutputInference>true</DisableWinExeOutputInference>
-    <OutputType>Exe</OutputType>
     <TargetFramework>net10.0-windows</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
@@ -10,9 +8,16 @@
     <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-x64</RuntimeIdentifier>
     <PlatformTarget Condition="'$(RuntimeIdentifier)' == 'win-x64'">x64</PlatformTarget>
     <PlatformTarget Condition="'$(RuntimeIdentifier)' == 'win-x86'">x86</PlatformTarget>
+    <SelfContained>true</SelfContained>
+    <PublishAot>true</PublishAot>
+    <NativeLib>Shared</NativeLib>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyName>ProxiFyre.Probe</AssemblyName>
+    <RootNamespace>ProxiFyre.Probe</RootNamespace>
+    <PublishDir>$(MSBuildThisFileDirectory)..\..\artifacts\native\$(Configuration)\</PublishDir>
   </PropertyGroup>
+
   <ItemGroup>
-    <Compile Include="..\Shared\LicenseKey.cs" Link="Shared\LicenseKey.cs" />
-    <ProjectReference Include="..\ProxiFyre\ProxiFyre.csproj" />
+    <Compile Include="..\Shared\ModuleMessageProtocol.cs" Link="Shared\ModuleMessageProtocol.cs" />
   </ItemGroup>
 </Project>

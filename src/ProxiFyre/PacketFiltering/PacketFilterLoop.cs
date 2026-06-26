@@ -389,6 +389,24 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
 
     private void ProcessOutgoingUdp(NdisApi.IntermediateBuffer* buffer, PacketView packet)
     {
+        var processInfo = _processLookup.LookupUdpOwner(packet.UdpEndpoint);
+        var processName = processInfo?.Name ?? "unknown";
+        var processId = processInfo?.ProcessId ?? 0;
+
+        // 1. Log Leigod's own UDP traffic
+        if (processName.Contains("leishen", StringComparison.OrdinalIgnoreCase) || processName.Contains("leigod", StringComparison.OrdinalIgnoreCase))
+        {
+            _log($"[LEIGOD UDP OUT] {packet.SourceAddress}:{packet.SourcePort} -> {packet.DestinationAddress}:{packet.DestinationPort} (Process={processName} PID={processId} PayloadLen={packet.UdpPayload.Length})");
+        }
+
+        // 2. Log any DNS queries (dest port 53 or parses as DNS query)
+        bool isPort53 = packet.SourcePort == 53 || packet.DestinationPort == 53;
+        bool isDnsQuery = TryGetDnsQueryDomain(packet.UdpPayload, out var domain);
+        if (isPort53 || isDnsQuery)
+        {
+            _log($"[UDP DNS OUT] {packet.SourceAddress}:{packet.SourcePort} -> {packet.DestinationAddress}:{packet.DestinationPort} (Process={processName} PID={processId} DnsQuery={isDnsQuery} Domain={domain})");
+        }
+
         if (TryHandleDnsSpoof(buffer, packet))
         {
             return;
@@ -448,6 +466,24 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
 
     private void ProcessIncomingUdp(NdisApi.IntermediateBuffer* buffer, PacketView packet)
     {
+        var localEndpoint = new UdpEndpointKey(packet.DestinationAddress, packet.DestinationPort);
+        var processInfo = _processLookup.LookupUdpOwner(localEndpoint);
+        var processName = processInfo?.Name ?? "unknown";
+        var processId = processInfo?.ProcessId ?? 0;
+
+        // 1. Log Leigod's own UDP traffic
+        if (processName.Contains("leishen", StringComparison.OrdinalIgnoreCase) || processName.Contains("leigod", StringComparison.OrdinalIgnoreCase))
+        {
+            _log($"[LEIGOD UDP IN] {packet.SourceAddress}:{packet.SourcePort} -> {packet.DestinationAddress}:{packet.DestinationPort} (Process={processName} PID={processId} PayloadLen={packet.UdpPayload.Length})");
+        }
+
+        // 2. Log any DNS traffic (source/dest port 53)
+        bool isPort53 = packet.SourcePort == 53 || packet.DestinationPort == 53;
+        if (isPort53)
+        {
+            _log($"[UDP DNS IN] {packet.SourceAddress}:{packet.SourcePort} -> {packet.DestinationAddress}:{packet.DestinationPort} (Process={processName} PID={processId})");
+        }
+
         Pass(buffer);
     }
 
@@ -1013,7 +1049,8 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             return false;
         }
 
-        if (packet.DestinationPort != 53 || !packet.IsUdp)
+        bool isDnsPort = packet.DestinationPort == 53 || packet.DestinationPort == 5353;
+        if (!isDnsPort || !packet.IsUdp)
         {
             return false;
         }
@@ -1070,7 +1107,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
 
         string queryDomain = domain.ToString();
         // Check if query is fakeip format, e.g. fakeip-140-82-113-3.store.steampowered.com
-        if (qType == 1 && queryDomain.StartsWith("fakeip-", StringComparison.OrdinalIgnoreCase))
+        if ((qType == 1 || qType == 28) && queryDomain.StartsWith("fakeip-", StringComparison.OrdinalIgnoreCase))
         {
             int firstDot = queryDomain.IndexOf('.');
             if (firstDot == -1) return false;
@@ -1085,7 +1122,8 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             }
 
             int questionLength = offset - 12;
-            int dnsResponseLength = 12 + questionLength + 16;
+            int ipLength = qType == 1 ? 4 : 16;
+            int dnsResponseLength = 12 + questionLength + 12 + ipLength;
             byte[] dnsResponse = new byte[dnsResponseLength];
 
             // 1. Header
@@ -1102,22 +1140,44 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             // 3. Answer
             int answerOffset = 12 + questionLength;
             System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(dnsResponse.AsSpan(answerOffset, 2), 0xC00C);
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(dnsResponse.AsSpan(answerOffset + 2, 2), 1); // Type A
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(dnsResponse.AsSpan(answerOffset + 4, 2), 1); // Class IN
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(dnsResponse.AsSpan(answerOffset + 6, 4), 60); // TTL 60
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(dnsResponse.AsSpan(answerOffset + 10, 2), 4);
-            fakeIp.GetAddressBytes().CopyTo(dnsResponse.AsSpan(answerOffset + 12, 4));
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(dnsResponse.AsSpan(answerOffset + 2, 2), qType); // Type A (1) or AAAA (28)
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(dnsResponse.AsSpan(answerOffset + 4, 2), 1);    // Class IN
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(dnsResponse.AsSpan(answerOffset + 6, 4), 60);   // TTL 60
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(dnsResponse.AsSpan(answerOffset + 10, 2), (ushort)ipLength);
 
-            InjectUdpResponse(buffer->AdapterOrListFlink, packet, dnsResponse);
+            if (qType == 1)
+            {
+                fakeIp.GetAddressBytes().CopyTo(dnsResponse.AsSpan(answerOffset + 12, 4));
+            }
+            else
+            {
+                // Write IPv4-mapped IPv6 address (16 bytes)
+                byte[] ipv6Bytes = new byte[16];
+                ipv6Bytes[10] = 0xFF;
+                ipv6Bytes[11] = 0xFF;
+                fakeIp.GetAddressBytes().CopyTo(ipv6Bytes.AsSpan(12, 4));
+                ipv6Bytes.CopyTo(dnsResponse.AsSpan(answerOffset + 12, 16));
+            }
+
+            // 1. Send the response with the original queried port to satisfy the client application
+            InjectUdpResponse(buffer->AdapterOrListFlink, packet, packet.DestinationPort, dnsResponse);
+
+            // 2. If the query came from a non-standard port (like 5353), also inject a response with source port 53 
+            // to trigger Leigod's WFP driver to whitelist the IP
+            if (packet.DestinationPort != 53)
+            {
+                InjectUdpResponse(buffer->AdapterOrListFlink, packet, 53, dnsResponse);
+            }
+
             var processInfoStr = process != null ? $"process={process.Name} pid={process.ProcessId}" : "process=unknown";
-            _log($"[DNS SPOOF] Spoofed {queryDomain} -> {fakeIp} ({processInfoStr})");
+            _log($"[DNS SPOOF] Spoofed {queryDomain} (Type={qType}) -> {fakeIp} ({processInfoStr}) (TargetPort={packet.DestinationPort})");
             return true;
         }
 
         return false;
     }
 
-    private void InjectUdpResponse(IntPtr adapterHandle, PacketView originalQuery, ReadOnlySpan<byte> dnsPayload)
+    private void InjectUdpResponse(IntPtr adapterHandle, PacketView originalQuery, ushort sourcePort, ReadOnlySpan<byte> dnsPayload)
     {
         var clientAddress = originalQuery.SourceAddress;
         var dnsAddress = originalQuery.DestinationAddress;
@@ -1147,7 +1207,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 frame.Slice(PacketView.EthernetHeaderLength),
                 dnsAddress,
                 clientAddress,
-                53,
+                sourcePort,
                 clientPort,
                 dnsPayload);
         }
@@ -1158,7 +1218,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 frame.Slice(PacketView.EthernetHeaderLength),
                 dnsAddress,
                 clientAddress,
-                53,
+                sourcePort,
                 clientPort,
                 dnsPayload);
         }
@@ -1205,5 +1265,78 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         }
 
         GC.SuppressFinalize(this);
+    }
+
+    private static bool TryGetDnsQueryDomain(ReadOnlySpan<byte> payload, out string domain)
+    {
+        domain = string.Empty;
+        if (payload.Length < 12)
+        {
+            return false;
+        }
+
+        ushort flags = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(payload.Slice(2, 2));
+        ushort qCount = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(payload.Slice(4, 2));
+        ushort ansCount = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(payload.Slice(6, 2));
+        ushort nsCount = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(payload.Slice(8, 2));
+        ushort addCount = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(payload.Slice(10, 2));
+
+        // Basic DNS query checks
+        if (qCount == 0 || (flags & 0x8000) != 0 || ansCount != 0 || nsCount != 0 || addCount > 1)
+        {
+            return false;
+        }
+
+        try
+        {
+            int offset = 12;
+            var sb = new System.Text.StringBuilder();
+            while (offset < payload.Length)
+            {
+                byte len = payload[offset];
+                if (len == 0)
+                {
+                    offset++;
+                    break;
+                }
+
+                if ((len & 0xC0) != 0 || len > 63)
+                {
+                    return false;
+                }
+
+                if (offset + 1 + len > payload.Length)
+                {
+                    return false;
+                }
+
+                for (int i = 0; i < len; i++)
+                {
+                    char c = (char)payload[offset + 1 + i];
+                    if (!char.IsLetterOrDigit(c) && c != '-' && c != '_' && c != '.')
+                    {
+                        return false;
+                    }
+                }
+
+                if (sb.Length > 0)
+                {
+                    sb.Append('.');
+                }
+                sb.Append(System.Text.Encoding.ASCII.GetString(payload.Slice(offset + 1, len)));
+                offset += 1 + len;
+            }
+
+            if (sb.Length > 0)
+            {
+                domain = sb.ToString();
+                return true;
+            }
+        }
+        catch
+        {
+        }
+
+        return false;
     }
 }

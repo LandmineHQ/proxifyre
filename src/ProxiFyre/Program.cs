@@ -19,9 +19,18 @@ internal static class Program
             return Cli.RunAsync(args).GetAwaiter().GetResult();
         }
 
-        var app = new App();
-        app.InitializeComponent();
-        app.Run(new MainWindow());
-        return 0;
+        if (!UiSingleInstanceCoordinator.TryAcquirePrimary(out var singleInstance))
+        {
+            return 0;
+        }
+
+        using (singleInstance)
+        {
+            var app = new App();
+            app.InitializeComponent();
+            var mainWindow = new MainWindow();
+            singleInstance.StartListening(app.Dispatcher, mainWindow.ShowAndActivate);
+            return app.Run(mainWindow);
+        }
     }
 }

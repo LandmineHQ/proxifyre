@@ -127,7 +127,7 @@ internal sealed class AotModuleController : IDisposable
         var moduleWindow = TryFindModuleWindow(target.ProcessId);
         if (moduleWindow == nint.Zero)
         {
-            _runtimeDllPath = PrepareRuntimeModuleDll();
+            _runtimeDllPath = PrepareRuntimeModuleDll(configuration.ModuleDllName);
             ClearHookHandles();
             moduleWindow = await InstallGetMessageHooksAndWaitAsync(target.ProcessId, _runtimeDllPath).ConfigureAwait(false);
         }
@@ -456,18 +456,19 @@ internal sealed class AotModuleController : IDisposable
         _moduleEvent(new ModuleEvent("lost", message, false, target.ProcessId));
     }
 
-    private static string PrepareRuntimeModuleDll()
+    private static string PrepareRuntimeModuleDll(string dllName)
     {
-        var nativeDll = FindNativeModuleDll();
+        var nativeDll = FindNativeModuleDll(dllName);
         var configuration = GetConfigurationName(nativeDll);
         var runtimeDirectory = Path.Combine(AppContext.BaseDirectory, "runtime", configuration);
         Directory.CreateDirectory(runtimeDirectory);
-        var runtimeDll = Path.Combine(runtimeDirectory, $"ProxiFyre.Module_{DateTime.Now:yyyyMMdd_HHmmss_fff}.dll");
+        var baseName = Path.GetFileNameWithoutExtension(dllName);
+        var runtimeDll = Path.Combine(runtimeDirectory, $"{baseName}_{DateTime.Now:yyyyMMdd_HHmmss_fff}.dll");
         File.Copy(nativeDll, runtimeDll, overwrite: true);
         return runtimeDll;
     }
 
-    private static string FindNativeModuleDll()
+    private static string FindNativeModuleDll(string dllName)
     {
         var baseDirectory = AppContext.BaseDirectory;
         var preferredConfiguration = GetPreferredConfigurationName(baseDirectory);
@@ -476,11 +477,11 @@ internal sealed class AotModuleController : IDisposable
             : "Release";
         var candidates = new[]
         {
-            Path.Combine(baseDirectory, "ProxiFyre.Module.dll"),
-            Path.GetFullPath(Path.Combine(baseDirectory, "..", "..", "..", "..", "native", preferredConfiguration, "ProxiFyre.Module.dll")),
-            Path.GetFullPath(Path.Combine(baseDirectory, "..", "..", "..", "native", preferredConfiguration, "ProxiFyre.Module.dll")),
-            Path.GetFullPath(Path.Combine(baseDirectory, "..", "..", "..", "..", "native", alternateConfiguration, "ProxiFyre.Module.dll")),
-            Path.GetFullPath(Path.Combine(baseDirectory, "..", "..", "..", "native", alternateConfiguration, "ProxiFyre.Module.dll")),
+            Path.Combine(baseDirectory, dllName),
+            Path.GetFullPath(Path.Combine(baseDirectory, "..", "..", "..", "..", "native", preferredConfiguration, dllName)),
+            Path.GetFullPath(Path.Combine(baseDirectory, "..", "..", "..", "native", preferredConfiguration, dllName)),
+            Path.GetFullPath(Path.Combine(baseDirectory, "..", "..", "..", "..", "native", alternateConfiguration, dllName)),
+            Path.GetFullPath(Path.Combine(baseDirectory, "..", "..", "..", "native", alternateConfiguration, dllName)),
         };
 
         var existing = candidates
@@ -492,7 +493,7 @@ internal sealed class AotModuleController : IDisposable
             return existing;
         }
 
-        throw new FileNotFoundException("未找到 ProxiFyre.Module.dll。请先执行 build/publish 生成 AOT 模组。", candidates[0]);
+        throw new FileNotFoundException($"未找到 {dllName}。请先执行 build/publish 生成 AOT 模组。", candidates[0]);
     }
 
     private static string GetPreferredConfigurationName(string baseDirectory)
@@ -512,11 +513,41 @@ internal sealed class AotModuleController : IDisposable
     private async Task<nint> InstallGetMessageHooksAndWaitAsync(int targetProcessId, string dllPath)
     {
         var hookTargets = FindHookTargetsByProcessId(targetProcessId).ToArray();
-        if (hookTargets.Length == 0)
+        var windowThreadCount = hookTargets.Count(target => target.HasWindow);
+
+        _log($"Injection: target process pid={targetProcessId}, window threads={windowThreadCount}, all threads={hookTargets.Length}");
+
+        bool remoteThreadAttempted = false;
+        string remoteThreadError = string.Empty;
+
+        // If target has no window threads, it's a daemon/background process. Inject via CreateRemoteThread directly.
+        if (windowThreadCount == 0 || hookTargets.Length == 0)
         {
-            throw new InvalidOperationException("找不到目标进程的线程，无法通过 WH_GETMESSAGE 注入模组。");
+            _log("Target process has no window threads. Attempting injection via CreateRemoteThread...");
+            remoteThreadAttempted = true;
+            if (InjectDllViaCreateRemoteThread(targetProcessId, dllPath, out remoteThreadError))
+            {
+                _log("CreateRemoteThread injection succeeded. Waiting for module message window...");
+                var moduleWindow = await WaitForModuleWindowAsync(targetProcessId, TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+                if (moduleWindow != nint.Zero)
+                {
+                    _log("Module message window found via CreateRemoteThread injection.");
+                    return moduleWindow;
+                }
+                _log("Warning: CreateRemoteThread succeeded but module message window was not found.");
+            }
+            else
+            {
+                _log($"CreateRemoteThread injection failed: {remoteThreadError}");
+            }
         }
 
+        if (hookTargets.Length == 0)
+        {
+            throw new InvalidOperationException($"无法注入模组：目标进程没有线程且 CreateRemoteThread 失败 ({remoteThreadError})。");
+        }
+
+        _log("Attempting injection via WH_GETMESSAGE hooks...");
         nint hDll = LoadLibraryW(dllPath);
         if (hDll == nint.Zero)
         {
@@ -529,7 +560,6 @@ internal sealed class AotModuleController : IDisposable
             ThrowLastWin32Error($"GetProcAddress failed: {ModuleMessageProtocol.HookExportName}");
         }
 
-        var windowThreadCount = hookTargets.Count(target => target.HasWindow);
         _log($"WH_GETMESSAGE hook candidates for pid={targetProcessId}: threads={hookTargets.Length}, windowThreads={windowThreadCount}, fallbackThreads={hookTargets.Length - windowThreadCount}.");
 
         var failures = new List<string>();
@@ -557,11 +587,129 @@ internal sealed class AotModuleController : IDisposable
         if (_hookHandles.Count == 0)
         {
             var detail = failures.Count == 0 ? "no hook target accepted" : string.Join("; ", failures.Take(5));
-            throw new InvalidOperationException($"无法在目标进程的任何线程安装 WH_GETMESSAGE hook：{detail}");
+            var extraErr = remoteThreadAttempted ? $", CreateRemoteThread error: {remoteThreadError}" : "";
+            throw new InvalidOperationException($"无法在目标进程的任何线程安装 WH_GETMESSAGE hook：{detail}{extraErr}");
         }
 
         _log($"Module hook installed for pid={targetProcessId}: hooks={_hookHandles.Count}; waiting for a target thread to process messages.");
-        return await WaitForModuleWindowAsync(targetProcessId, TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+        nint finalWindow = await WaitForModuleWindowAsync(targetProcessId, TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+        if (finalWindow == nint.Zero && !remoteThreadAttempted)
+        {
+            _log("WH_GETMESSAGE timed out. Attempting fallback via CreateRemoteThread...");
+            if (InjectDllViaCreateRemoteThread(targetProcessId, dllPath, out remoteThreadError))
+            {
+                _log("Fallback CreateRemoteThread injection succeeded. Waiting for module message window...");
+                finalWindow = await WaitForModuleWindowAsync(targetProcessId, TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+            }
+            else
+            {
+                _log($"Fallback CreateRemoteThread injection failed: {remoteThreadError}");
+            }
+        }
+
+        return finalWindow;
+    }
+
+    private static bool InjectDllViaCreateRemoteThread(int targetProcessId, string dllPath, out string errorMessage)
+    {
+        errorMessage = string.Empty;
+        nint hProcess = nint.Zero;
+        nint pRemoteMem = nint.Zero;
+        nint hThread = nint.Zero;
+
+        try
+        {
+            hProcess = OpenProcess(ProcessAllAccess, false, targetProcessId);
+            if (hProcess == nint.Zero)
+            {
+                var err = Marshal.GetLastWin32Error();
+                errorMessage = $"OpenProcess failed with error code: {err}.";
+                return false;
+            }
+
+            int sizeInBytes = (dllPath.Length + 1) * 2;
+            pRemoteMem = VirtualAllocEx(hProcess, nint.Zero, (uint)sizeInBytes, MemCommit | MemReserve, PageReadWrite);
+            if (pRemoteMem == nint.Zero)
+            {
+                var err = Marshal.GetLastWin32Error();
+                errorMessage = $"VirtualAllocEx failed with error code: {err}.";
+                return false;
+            }
+
+            byte[] bytes = Encoding.Unicode.GetBytes(dllPath + "\0");
+            if (!WriteProcessMemory(hProcess, pRemoteMem, bytes, (uint)bytes.Length, out _))
+            {
+                var err = Marshal.GetLastWin32Error();
+                errorMessage = $"WriteProcessMemory failed with error code: {err}.";
+                return false;
+            }
+
+            var hKernel32 = GetModuleHandleWString("kernel32.dll");
+            if (hKernel32 == nint.Zero)
+            {
+                errorMessage = "GetModuleHandleW for kernel32.dll failed.";
+                return false;
+            }
+
+            var pLoadLibrary = GetProcAddress(hKernel32, "LoadLibraryW");
+            if (pLoadLibrary == nint.Zero)
+            {
+                errorMessage = "GetProcAddress for LoadLibraryW failed.";
+                return false;
+            }
+
+            hThread = CreateRemoteThread(hProcess, nint.Zero, 0, pLoadLibrary, pRemoteMem, 0, out _);
+            if (hThread == nint.Zero)
+            {
+                var err = Marshal.GetLastWin32Error();
+                errorMessage = $"CreateRemoteThread failed with error code: {err}.";
+                return false;
+            }
+
+            uint waitResult = WaitForSingleObject(hThread, 5000);
+            if (waitResult == WaitTimeout)
+            {
+                errorMessage = "WaitForSingleObject timed out waiting for LoadLibraryW thread.";
+                return false;
+            }
+
+            if (GetExitCodeThread(hThread, out uint exitCode))
+            {
+                if (exitCode == 0)
+                {
+                    errorMessage = "LoadLibraryW returned NULL in the remote process (DLL loading failed).";
+                    return false;
+                }
+            }
+            else
+            {
+                var err = Marshal.GetLastWin32Error();
+                errorMessage = $"GetExitCodeThread failed with error code: {err}.";
+                return false;
+            }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            errorMessage = $"Exception during CreateRemoteThread injection: {ex.Message}";
+            return false;
+        }
+        finally
+        {
+            if (pRemoteMem != nint.Zero && hProcess != nint.Zero)
+            {
+                _ = VirtualFreeEx(hProcess, pRemoteMem, 0, MemRelease);
+            }
+            if (hThread != nint.Zero)
+            {
+                _ = CloseHandle(hThread);
+            }
+            if (hProcess != nint.Zero)
+            {
+                _ = CloseHandle(hProcess);
+            }
+        }
     }
 
     private static void WakeTargetProcess(int targetProcessId)
@@ -812,6 +960,44 @@ internal sealed class AotModuleController : IDisposable
     [DllImport("user32.dll", ExactSpelling = true, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool PostMessageW(nint hWnd, uint Msg, nint wParam, nint lParam);
+
+    private const uint ProcessAllAccess = 0x001F0FFF;
+    private const uint MemCommit = 0x00001000;
+    private const uint MemReserve = 0x00002000;
+    private const uint MemRelease = 0x00008000;
+    private const uint PageReadWrite = 0x04;
+    private const uint WaitTimeout = 0x00000102;
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern nint OpenProcess(uint processAccess, [MarshalAs(UnmanagedType.Bool)] bool bInheritHandle, int processId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern nint VirtualAllocEx(nint hProcess, nint lpAddress, uint dwSize, uint flAllocationType, uint flProtect);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool WriteProcessMemory(nint hProcess, nint lpBaseAddress, byte[] lpBuffer, uint nSize, out nint lpNumberOfBytesWritten);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern nint CreateRemoteThread(nint hProcess, nint lpThreadAttributes, uint dwStackSize, nint lpStartAddress, nint lpParameter, uint dwCreationFlags, out uint lpThreadId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint WaitForSingleObject(nint hHandle, uint dwMilliseconds);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetExitCodeThread(nint hThread, out uint lpExitCode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool VirtualFreeEx(nint hProcess, nint lpAddress, uint dwSize, uint dwFreeType);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseHandle(nint hObject);
+
+    [DllImport("kernel32.dll", EntryPoint = "GetModuleHandleW", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern nint GetModuleHandleWString(string lpModuleName);
 
     private readonly record struct WindowInfo(nint HWnd, uint ThreadId, bool IsVisible, bool IsLowPriority);
 

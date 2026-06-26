@@ -5,8 +5,9 @@
     <UseWPF>true</UseWPF>
     <UseWindowsForms>true</UseWindowsForms>
     <StartupObject>ProxiFyre.Program</StartupObject>
-    <PlatformTarget>x64</PlatformTarget>
-    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-x64</RuntimeIdentifier>
+    <PlatformTarget Condition="'$(RuntimeIdentifier)' == 'win-x64'">x64</PlatformTarget>
+    <PlatformTarget Condition="'$(RuntimeIdentifier)' == 'win-x86'">x86</PlatformTarget>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>latest</LangVersion>
@@ -34,10 +35,15 @@
   <Target Name="CopyNativeAotModule" AfterTargets="Build">
     <PropertyGroup>
       <NativeAotModulePath>$(ArtifactsPath)\native\$(Configuration)\ProxiFyre.Module.dll</NativeAotModulePath>
+      <NativeAotProbePath>$(ArtifactsPath)\native\$(Configuration)\ProxiFyre.Probe.dll</NativeAotProbePath>
     </PropertyGroup>
     <Copy SourceFiles="$(NativeAotModulePath)"
           DestinationFolder="$(OutDir)"
           SkipUnchangedFiles="true"
           Condition="Exists('$(NativeAotModulePath)')" />
+    <Copy SourceFiles="$(NativeAotProbePath)"
+          DestinationFolder="$(OutDir)"
+          SkipUnchangedFiles="true"
+          Condition="Exists('$(NativeAotProbePath)')" />
   </Target>
 </Project>

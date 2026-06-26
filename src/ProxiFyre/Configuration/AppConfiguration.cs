@@ -16,6 +16,8 @@ internal sealed class AppConfiguration
 
     public bool EnableFakeIpWhitelist { get; init; } = false;
 
+    public string ModuleDllName { get; init; } = "ProxiFyre.Module.dll";
+
     public bool Matches(ProcessInfo process)
     {
         return TryGetMatchingPattern(process, out _, out _);
@@ -91,6 +93,12 @@ internal sealed class AppConfiguration
             }
         }
 
+        string? moduleDllName = null;
+        if (root.TryGetProperty("moduleDllName", out var moduleDllNameElement) && moduleDllNameElement.ValueKind == JsonValueKind.String)
+        {
+            moduleDllName = moduleDllNameElement.GetString();
+        }
+
         if (root.TryGetProperty("proxies", out var proxiesElement) && proxiesElement.ValueKind == JsonValueKind.Array)
         {
             foreach (var proxy in proxiesElement.EnumerateArray())
@@ -107,6 +115,7 @@ internal sealed class AppConfiguration
             CoreProcessName = coreProcessName,
             LicenseKey = string.IsNullOrWhiteSpace(licenseKey) ? null : licenseKey.Trim(),
             EnableFakeIpWhitelist = enableFakeIpWhitelist,
+            ModuleDllName = string.IsNullOrWhiteSpace(moduleDllName) ? "ProxiFyre.Module.dll" : moduleDllName.Trim(),
             Apps = apps
                 .Select(a => a.Trim())
                 .Where(a => a.Length > 0)
@@ -124,6 +133,7 @@ internal sealed class AppConfiguration
             CoreProcessName = DefaultCoreProcessName,
             LicenseKey = string.Empty,
             Apps = ["chrome.exe", @"C:\Program Files\SomeApp\SomeApp.exe", @"C:\Games\SomeGame\"],
+            ModuleDllName = "ProxiFyre.Module.dll",
             Proxies =
             [
                 new SampleProxy
@@ -156,7 +166,8 @@ internal sealed class AppConfiguration
             CoreProcessName = coreProcessName,
             LicenseKey = existingConfiguration?.LicenseKey,
             Apps = apps,
-            EnableFakeIpWhitelist = existingConfiguration?.EnableFakeIpWhitelist ?? false
+            EnableFakeIpWhitelist = existingConfiguration?.EnableFakeIpWhitelist ?? false,
+            ModuleDllName = existingConfiguration?.ModuleDllName ?? "ProxiFyre.Module.dll"
         };
         File.WriteAllText(path, JsonSerializer.Serialize(simpleConfiguration, AppConfigurationJsonContext.Default.SimpleConfiguration));
         return apps;
@@ -169,6 +180,7 @@ internal sealed class AppConfiguration
         string? licenseKey = null)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path)) ?? AppContext.BaseDirectory);
+        var existing = File.Exists(path) ? Load(path) : null;
         var simpleConfiguration = new SimpleConfiguration
         {
             CoreProcessName = NormalizeCoreProcessName(coreProcessName),
@@ -178,7 +190,8 @@ internal sealed class AppConfiguration
                 .Where(a => a.Length > 0)
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToList(),
-            EnableFakeIpWhitelist = false
+            EnableFakeIpWhitelist = existing?.EnableFakeIpWhitelist ?? false,
+            ModuleDllName = existing?.ModuleDllName ?? "ProxiFyre.Module.dll"
         };
 
         File.WriteAllText(path, JsonSerializer.Serialize(simpleConfiguration, AppConfigurationJsonContext.Default.SimpleConfiguration));
@@ -221,6 +234,9 @@ internal sealed class AppConfiguration
         [JsonPropertyName("apps")]
         public required List<string> Apps { get; init; }
 
+        [JsonPropertyName("moduleDllName")]
+        public string? ModuleDllName { get; init; }
+
         [JsonPropertyName("proxies")]
         public required List<SampleProxy> Proxies { get; init; }
     }
@@ -250,6 +266,9 @@ internal sealed class AppConfiguration
 
         [JsonPropertyName("enableFakeIpWhitelist")]
         public bool EnableFakeIpWhitelist { get; init; }
+
+        [JsonPropertyName("moduleDllName")]
+        public string? ModuleDllName { get; init; }
     }
 }
 

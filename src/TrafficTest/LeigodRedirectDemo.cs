@@ -111,6 +111,45 @@ internal static class LeigodRedirectDemo
             // Wait a moment for ProxiFyre to initialize the NDIS filter table
             await Task.Delay(1500);
 
+            // Flush DNS cache to ensure Windows DNS Client queries the network instead of using cached results
+            try
+            {
+                using var flushProc = Process.Start(new ProcessStartInfo
+                {
+                    FileName = "ipconfig",
+                    Arguments = "/flushdns",
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                });
+                if (flushProc != null)
+                {
+                    await flushProc.WaitForExitAsync();
+                    Console.WriteLine("Flushed Windows DNS cache.");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Warning: Failed to flush DNS cache: {ex.Message}");
+            }
+
+            Console.WriteLine("Parent: Sending test DNS query to port 53 to check redirection and whitelist...");
+            try
+            {
+                var parentSpoofedIp = await SendDnsQueryCustomPortAsync("fakeip-20-205-243-166.store.steampowered.com", "8.8.8.8", 53, TimeSpan.FromSeconds(3));
+                if (parentSpoofedIp != null)
+                {
+                    Console.WriteLine($"Parent: DNS query completed successfully. IP = {parentSpoofedIp}");
+                }
+                else
+                {
+                    Console.WriteLine("Parent Warning: DNS query to port 53 returned null (possible Leigod redirection/hijack)");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Parent Warning: DNS query to port 53 failed: {ex.Message}");
+            }
+
             Console.WriteLine("Starting child steamwebhelper.exe...");
             var startInfo = new ProcessStartInfo
             {
@@ -263,11 +302,18 @@ internal static class LeigodRedirectDemo
             if (!host.Contains("steam", StringComparison.OrdinalIgnoreCase))
             {
                 string fakeHost = $"fakeip-{targetIp.ToString().Replace('.', '-')}.store.steampowered.com";
-                Console.WriteLine($"Child: Triggering Fake IP whitelist injection via DNS query for: {fakeHost}");
+                Console.WriteLine($"Child: Triggering Fake IP whitelist injection via custom port DNS query for: {fakeHost}");
                 try
                 {
-                    var fakeIps = await Dns.GetHostAddressesAsync(fakeHost);
-                    Console.WriteLine($"Child: Fake IP DNS resolution completed. Resolved IP: {fakeIps[0]}");
+                    var spoofedIp = await SendDnsQueryCustomPortAsync(fakeHost, "8.8.8.8", 5353, TimeSpan.FromSeconds(3));
+                    if (spoofedIp != null)
+                    {
+                        Console.WriteLine($"Child: Fake IP DNS resolution completed. Resolved IP: {spoofedIp}");
+                    }
+                    else
+                    {
+                        Console.WriteLine("Child Warning: Fake IP DNS query returned null IP");
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -316,5 +362,101 @@ internal static class LeigodRedirectDemo
             Console.WriteLine($"Child Exception: {ex.Message}");
             return 1;
         }
+    }
+
+    private static async Task<IPAddress?> SendDnsQueryCustomPortAsync(string domain, string dnsServer, int port, TimeSpan timeout)
+    {
+        try
+        {
+            ushort transactionId = (ushort)Random.Shared.Next(1, 65535);
+            var payload = new List<byte>();
+            
+            // Header
+            payload.AddRange(BitConverter.GetBytes(IPAddress.HostToNetworkOrder((short)transactionId)));
+            payload.AddRange(BitConverter.GetBytes(IPAddress.HostToNetworkOrder((short)0x0100))); // Standard query, recursion desired
+            payload.AddRange(BitConverter.GetBytes(IPAddress.HostToNetworkOrder((short)1)));      // 1 Question
+            payload.AddRange(BitConverter.GetBytes(IPAddress.HostToNetworkOrder((short)0)));
+            payload.AddRange(BitConverter.GetBytes(IPAddress.HostToNetworkOrder((short)0)));
+            payload.AddRange(BitConverter.GetBytes(IPAddress.HostToNetworkOrder((short)0)));
+            
+            // Question: QNAME
+            var labels = domain.Split('.');
+            foreach (var label in labels)
+            {
+                var bytes = System.Text.Encoding.ASCII.GetBytes(label);
+                payload.Add((byte)bytes.Length);
+                payload.AddRange(bytes);
+            }
+            payload.Add(0); // QNAME terminator
+            
+            // QTYPE: A (1)
+            payload.AddRange(BitConverter.GetBytes(IPAddress.HostToNetworkOrder((short)1)));
+            // QCLASS: IN (1)
+            payload.AddRange(BitConverter.GetBytes(IPAddress.HostToNetworkOrder((short)1)));
+
+            using var udpClient = new UdpClient();
+            var serverEndPoint = new IPEndPoint(IPAddress.Parse(dnsServer), port);
+            byte[] queryBytes = payload.ToArray();
+            
+            await udpClient.SendAsync(queryBytes, queryBytes.Length, serverEndPoint);
+            
+            var receiveTask = udpClient.ReceiveAsync();
+            var delayTask = Task.Delay(timeout);
+            var completedTask = await Task.WhenAny(receiveTask, delayTask);
+            
+            if (completedTask == delayTask)
+            {
+                throw new TimeoutException("DNS query timed out");
+            }
+            
+            var result = await receiveTask;
+            byte[] responseBytes = result.Buffer;
+            if (responseBytes.Length < 12) return null;
+            
+            ushort resTxId = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(responseBytes.AsSpan(0, 2));
+            if (resTxId != transactionId) return null;
+            
+            // Parse QNAME to skip it
+            int offset = 12;
+            while (offset < responseBytes.Length)
+            {
+                byte len = responseBytes[offset];
+                if (len == 0) { offset++; break; }
+                if ((len & 0xC0) == 0xC0) { offset += 2; break; }
+                offset += 1 + len;
+            }
+            offset += 4; // Skip QTYPE and QCLASS
+            
+            // Answer section parsing
+            if (offset + 12 <= responseBytes.Length)
+            {
+                if ((responseBytes[offset] & 0xC0) == 0xC0) offset += 2;
+                else
+                {
+                    while (offset < responseBytes.Length)
+                    {
+                        byte len = responseBytes[offset];
+                        if (len == 0) { offset++; break; }
+                        offset += 1 + len;
+                    }
+                }
+                
+                ushort type = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(responseBytes.AsSpan(offset, 2));
+                ushort rdLen = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(responseBytes.AsSpan(offset + 8, 2));
+                offset += 10;
+                
+                if (type == 1 && rdLen == 4 && offset + 4 <= responseBytes.Length)
+                {
+                    byte[] ipBytes = new byte[4];
+                    Array.Copy(responseBytes, offset, ipBytes, 0, 4);
+                    return new IPAddress(ipBytes);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Custom DNS Query Error: {ex.Message}");
+        }
+        return null;
     }
 }

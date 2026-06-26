@@ -35,6 +35,11 @@ internal static class TrafficTestRunner
                 return await LeigodRedirectDemo.RunChildAsync(args.Skip(1).ToArray());
             }
 
+            if (args.Length > 0 && args[0].Equals("inject", StringComparison.OrdinalIgnoreCase))
+            {
+                return await RunInjectAsync(args.Skip(1).ToArray());
+            }
+
             var options = TestOptions.Parse(args);
             return await RunRelayTestAsync(options);
         }
@@ -257,5 +262,92 @@ internal static class TrafficTestRunner
             TestKind.Stun => [ProcessIdentity.GetCurrentExecutableName()],
             _ => throw new ArgumentOutOfRangeException(nameof(options))
         };
+    }
+
+    private static async Task<int> RunInjectAsync(string[] args)
+    {
+        string configPath = "app-config.json";
+        for (int i = 0; i < args.Length - 1; i++)
+        {
+            if (args[i].Equals("--config", StringComparison.OrdinalIgnoreCase))
+            {
+                configPath = args[i + 1];
+                break;
+            }
+        }
+
+        configPath = Path.GetFullPath(configPath);
+        if (!File.Exists(configPath))
+        {
+            Console.WriteLine($"Config file '{configPath}' not found. Generating default config with leishenSdk.exe and ProxiFyre.Probe.dll...");
+            var defaultConfig = new
+            {
+                coreProcessName = "leishenSdk.exe",
+                moduleDllName = "ProxiFyre.Probe.dll",
+                apps = new[] { "steam.exe" }
+            };
+            File.WriteAllText(configPath, JsonSerializer.Serialize(defaultConfig, new JsonSerializerOptions { WriteIndented = true }));
+        }
+
+        Console.WriteLine($"Loading configuration from '{configPath}'...");
+        var appConfig = AppConfiguration.Load(configPath);
+        Console.WriteLine($"Target Process Name: {appConfig.CoreProcessName}");
+        Console.WriteLine($"Module DLL Name: {appConfig.ModuleDllName}");
+
+        string targetProcNameWithoutExe = Path.GetFileNameWithoutExtension(appConfig.CoreProcessName);
+        var processes = Process.GetProcessesByName(targetProcNameWithoutExe);
+        if (processes.Length == 0)
+        {
+            Console.Error.WriteLine($"Error: Target process '{appConfig.CoreProcessName}' is not running.");
+            Console.Error.WriteLine("Please start the target process first!");
+            return 1;
+        }
+
+        var process = processes[0];
+        Console.WriteLine($"Found target process: {process.ProcessName} pid={process.Id}");
+
+        var root = RepositoryPaths.FindRepositoryRoot(AppContext.BaseDirectory);
+        var artifactMoniker = GetCurrentArtifactMoniker();
+        var logPath = Path.Combine(root, "artifacts", "bin", "ProxiFyre", artifactMoniker, "proxifyre-core.log");
+
+        using var cts = new CancellationTokenSource();
+        Console.CancelKeyPress += (_, e) =>
+        {
+            e.Cancel = true;
+            Console.WriteLine("Cancel key pressed. Stopping inject controller...");
+            cts.Cancel();
+        };
+
+        Console.WriteLine("Injecting AOT module/probe...");
+        using var module = new AotModuleTestController(configPath, logPath, Console.WriteLine);
+        try
+        {
+            var task = module.LoadAndRunAsync(
+                process.Id,
+                appConfig.CoreProcessName,
+                process.MainModule?.FileName,
+                appConfig.Apps,
+                LicenseKey.CreateKey(LicenseKey.GetCurrentDeviceId()),
+                cts.Token);
+
+            Console.WriteLine("Inject controller active. Press Ctrl+C to exit and stop probing.");
+            await task.ConfigureAwait(false);
+
+            while (!cts.IsCancellationRequested)
+            {
+                await Task.Delay(500, cts.Token);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Error during injection/monitoring: {ex.Message}");
+            return 1;
+        }
+
+        Console.WriteLine("Controller stopped. Target hooks will automatically clean up.");
+        return 0;
     }
 }

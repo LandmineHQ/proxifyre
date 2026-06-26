@@ -23,6 +23,7 @@ $Root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
 $Solution = Join-Path $Root "ProxiFyre.sln"
 $Project = Join-Path $Root "src\ProxiFyre\ProxiFyre.csproj"
 $ModuleProject = Join-Path $Root "src\ProxiFyre.Module\ProxiFyre.Module.csproj"
+$ProbeProject = Join-Path $Root "src\ProxiFyre.Probe\ProxiFyre.Probe.csproj"
 $TrafficTestHostProject = Join-Path $Root "src\TrafficTestHost\TrafficTestHost.csproj"
 $Artifacts = Join-Path $Root "artifacts"
 
@@ -81,6 +82,8 @@ switch ($Command) {
     "build" {
         dotnet publish $ModuleProject --configuration $Configuration --runtime win-x64
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        dotnet publish $ProbeProject --configuration $Configuration --runtime win-x64
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         dotnet publish $TrafficTestHostProject --configuration $Configuration --runtime win-x64
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         dotnet build $Solution --configuration $Configuration
@@ -88,6 +91,8 @@ switch ($Command) {
     }
     "ui" {
         dotnet publish $ModuleProject --configuration $Configuration --runtime win-x64
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        dotnet publish $ProbeProject --configuration $Configuration --runtime win-x64
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         dotnet run --project $Project
         exit $LASTEXITCODE
@@ -175,6 +180,8 @@ switch ($Command) {
             (Join-Path $Root "src\ProxiFyre\obj"),
             (Join-Path $Root "src\ProxiFyre.Module\bin"),
             (Join-Path $Root "src\ProxiFyre.Module\obj"),
+            (Join-Path $Root "src\ProxiFyre.Probe\bin"),
+            (Join-Path $Root "src\ProxiFyre.Probe\obj"),
             (Join-Path $Root "src\TrafficTestHost\bin"),
             (Join-Path $Root "src\TrafficTestHost\obj"),
             (Join-Path $Root "src\TrafficTest\bin"),

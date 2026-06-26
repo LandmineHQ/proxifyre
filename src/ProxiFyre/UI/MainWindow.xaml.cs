@@ -5,7 +5,9 @@ using System.IO;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Runtime.InteropServices;
 using System.Windows;
+using System.Windows.Interop;
 using Microsoft.Win32;
 using Forms = System.Windows.Forms;
 
@@ -15,6 +17,7 @@ public partial class MainWindow : Window
 {
     private const string DefaultSourceUrl = "https://github.com/LandmineHQ/proxifyre";
     private const int MaxUiLogEntries = 1000;
+    private const int SwRestore = 9;
 
     private static readonly Regex TrafficLinePattern = new(
         @"(?:^|\s)TRAFFIC up=(?<up>\d+) down=(?<down>\d+) upRate=(?<upRate>\d+) downRate=(?<downRate>\d+)",
@@ -34,6 +37,14 @@ public partial class MainWindow : Window
     private bool _hasCheckedForUpdates;
     private bool _isAnnouncementDismissed;
     private string _sourceUrl = DefaultSourceUrl;
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetForegroundWindow(nint hWnd);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ShowWindow(nint hWnd, int nCmdShow);
 
     public MainWindow()
     {
@@ -902,6 +913,43 @@ public partial class MainWindow : Window
         Show();
         WindowState = WindowState.Normal;
         Activate();
+    }
+
+    public void ShowAndActivate()
+    {
+        if (WindowState == WindowState.Minimized || !ShowInTaskbar)
+        {
+            RestoreFromTray();
+        }
+
+        ShowInTaskbar = true;
+        Show();
+        WindowState = WindowState.Normal;
+
+        var handle = new WindowInteropHelper(this).Handle;
+        if (handle != nint.Zero)
+        {
+            ShowWindow(handle, SwRestore);
+        }
+
+        if (Topmost)
+        {
+            Activate();
+            if (handle != nint.Zero)
+            {
+                SetForegroundWindow(handle);
+            }
+
+            return;
+        }
+
+        Topmost = true;
+        Activate();
+        Topmost = false;
+        if (handle != nint.Zero)
+        {
+            SetForegroundWindow(handle);
+        }
     }
 
 }
