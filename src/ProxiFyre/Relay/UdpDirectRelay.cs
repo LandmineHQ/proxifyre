@@ -26,6 +26,7 @@ internal sealed class UdpDirectRelay : IDisposable
     private Action<RelayOutboundFlow>? _outboundBypassRegister;
     private Action<RelayOutboundFlow>? _outboundBypassUnregister;
     private CancellationToken _cancellationToken;
+    private bool _disposed;
 
     public UdpDirectRelay(
         Action<string>? log = null,
@@ -108,6 +109,7 @@ internal sealed class UdpDirectRelay : IDisposable
             : IPAddress.IPv6Any;
         return _relayOutboundFlows.ContainsKey(new UdpRelayKey(
             key.AdapterHandle,
+            key.Dot1q,
             wildcardAddress,
             key.ClientPort,
             key.RemoteAddress,
@@ -121,7 +123,6 @@ internal sealed class UdpDirectRelay : IDisposable
 
     private void Remove(UdpRelayKey key, UdpRelaySocket? expectedSocket)
     {
-        _targets.TryRemove(key, out _);
         UdpRelaySocket? socket;
         lock (_socketCreationSync)
         {
@@ -133,6 +134,7 @@ internal sealed class UdpDirectRelay : IDisposable
             }
 
             _sockets.TryRemove(key, out _);
+            _targets.TryRemove(key, out _);
         }
 
         socket?.Dispose();
@@ -145,6 +147,7 @@ internal sealed class UdpDirectRelay : IDisposable
         IPAddress remoteAddress,
         ushort remotePort)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         Register(key, target);
         if (!_sockets.ContainsKey(key) && _sockets.Count >= MaxFlows)
         {
@@ -166,6 +169,7 @@ internal sealed class UdpDirectRelay : IDisposable
     {
         lock (_socketCreationSync)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             if (_sockets.TryGetValue(key, out var existing) && existing.Matches(target))
             {
                 return existing;
@@ -228,6 +232,7 @@ internal sealed class UdpDirectRelay : IDisposable
             outboundFlows.Add(exact);
             _relayOutboundFlows[new UdpRelayKey(
                 target.AdapterHandle,
+                target.Dot1q,
                 localAddress,
                 localPort,
                 remoteEndPoint.Address,
@@ -245,6 +250,7 @@ internal sealed class UdpDirectRelay : IDisposable
                 outboundFlows.Add(wildcard);
                 _relayOutboundFlows[new UdpRelayKey(
                     target.AdapterHandle,
+                    target.Dot1q,
                     wildcardAddress,
                     localPort,
                     remoteEndPoint.Address,
@@ -317,6 +323,7 @@ internal sealed class UdpDirectRelay : IDisposable
 
     public void Dispose()
     {
+        _disposed = true;
         UdpRelaySocket[] sockets;
         lock (_socketCreationSync)
         {
@@ -411,7 +418,8 @@ internal sealed class UdpDirectRelay : IDisposable
             return target.ProcessId == _target.ProcessId
                 && target.ProcessName.Equals(_target.ProcessName, StringComparison.OrdinalIgnoreCase)
                 && target.ProcessPath.Equals(_target.ProcessPath, StringComparison.OrdinalIgnoreCase)
-                && target.AdapterHandle == _target.AdapterHandle;
+                && target.AdapterHandle == _target.AdapterHandle
+                && target.Dot1q == _target.Dot1q;
         }
 
         public void Start(CancellationToken cancellationToken)
@@ -608,6 +616,7 @@ internal sealed class UdpDirectRelay : IDisposable
                 _relayOutboundFlows.TryRemove(
                     new UdpRelayKey(
                         flow.AdapterHandle,
+                        _target.Dot1q,
                         flow.LocalAddress,
                         flow.LocalPort,
                         flow.RemoteAddress,

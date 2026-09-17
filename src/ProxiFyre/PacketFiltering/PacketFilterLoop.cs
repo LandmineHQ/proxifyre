@@ -295,17 +295,20 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             return false;
         }
 
-        foreach (var flow in _outboundBypassFlows.Keys)
+        lock (_outboundBypassSync)
         {
-            if (flow.AdapterHandle != adapterHandle
-                || flow.Protocol != protocol
-                || !AddressesEqual(flow.LocalAddress, sourceAddress)
-                || !flow.RemoteAddress.Equals(destinationAddress))
+            foreach (var flow in _outboundBypassFlows.Keys)
             {
-                continue;
-            }
+                if (flow.AdapterHandle != adapterHandle
+                    || flow.Protocol != protocol
+                    || !AddressesEqual(flow.LocalAddress, sourceAddress)
+                    || !flow.RemoteAddress.Equals(destinationAddress))
+                {
+                    continue;
+                }
 
-            return true;
+                return true;
+            }
         }
 
         return false;
@@ -492,8 +495,15 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
 
         if (_tcpRelay.TryGetConnection(relayKey, out var existingConnection))
         {
-            existingConnection.SendClientSegment(CreateTcpSegment(packet));
-            return true;
+            if (existingConnection.IsClosed)
+            {
+                _tcpRelay.Remove(existingConnection);
+            }
+            else
+            {
+                existingConnection.SendClientSegment(CreateTcpSegment(packet));
+                return true;
+            }
         }
 
         if (!packet.IsInitialSyn)
@@ -600,6 +610,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
 
         var relayKey = new UdpRelayKey(
             adapterHandle,
+            dot1q,
             packet.SourceAddress,
             packet.SourcePort,
             packet.DestinationAddress,

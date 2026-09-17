@@ -62,12 +62,14 @@ internal readonly record struct UdpRelayKey
 {
     public UdpRelayKey(
         IntPtr adapterHandle,
+        uint dot1q,
         IPAddress clientAddress,
         ushort clientPort,
         IPAddress remoteAddress,
         ushort remotePort)
     {
         AdapterHandle = adapterHandle;
+        Dot1q = dot1q;
         ClientAddress = NetworkAddress.Normalize(clientAddress);
         ClientPort = clientPort;
         RemoteAddress = NetworkAddress.Normalize(remoteAddress);
@@ -75,6 +77,8 @@ internal readonly record struct UdpRelayKey
     }
 
     public IntPtr AdapterHandle { get; }
+
+    public uint Dot1q { get; }
 
     public IPAddress ClientAddress { get; }
 

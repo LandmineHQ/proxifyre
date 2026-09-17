@@ -33,6 +33,7 @@ internal static class UdpRelaySelfTest
             var clientEndPoint = new IPEndPoint(IPAddress.Loopback, 40234);
             var key = new UdpRelayKey(
                 IntPtr.Zero,
+                0,
                 clientEndPoint.Address,
                 (ushort)clientEndPoint.Port,
                 remoteEndPointA.Address,

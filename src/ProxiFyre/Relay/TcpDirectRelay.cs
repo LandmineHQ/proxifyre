@@ -490,6 +490,12 @@ internal sealed class TcpDirectRelay : IDisposable
                         return;
                     }
 
+                    if ((segment.Flags & PacketView.TcpFlagAck) != 0
+                        && !IsClientSequenceInWindow(segment.SequenceNumber))
+                    {
+                        return;
+                    }
+
                     if (!ProcessAckLocked(segment))
                     {
                         FailLocked("DIRECT TCP relay received an invalid acknowledgement.");
@@ -1060,7 +1066,8 @@ internal sealed class TcpDirectRelay : IDisposable
                     continue;
                 }
 
-                if (outbound.End > windowEnd)
+                if ((outbound.Segment.Flags & PacketView.TcpFlagSyn) == 0
+                    && outbound.End > windowEnd)
                 {
                     return;
                 }
@@ -1164,6 +1171,13 @@ internal sealed class TcpDirectRelay : IDisposable
             return (ushort)Math.Clamp(MaxBufferedClientBytes - buffered, 0, ushort.MaxValue);
         }
 
+        private bool IsClientSequenceInWindow(uint sequenceNumber)
+        {
+            var sequence = UnwrapNear(sequenceNumber, _clientReceiveNext);
+            return sequence >= _clientAcknowledged
+                && sequence <= _clientReceiveNext + _clientWindow;
+        }
+
         private bool TryCompleteCloseLocked()
         {
             if (!_clientFinReceived || !_remoteFinAcknowledged)
@@ -1231,6 +1245,11 @@ internal sealed class TcpDirectRelay : IDisposable
 
             lock (_outboundFlowSync)
             {
+                if (_resourcesDisposed)
+                {
+                    return;
+                }
+
                 if (_outboundFlows.Contains(flow))
                 {
                     return;
@@ -1320,6 +1339,12 @@ internal sealed class TcpDirectRelay : IDisposable
                 {
                     failureMessage = "DIRECT TCP relay closed a stale half-closed connection.";
                 }
+                else if (_remoteFinQueued
+                    && !_remoteFinAcknowledged
+                    && now - _lastActivity > InitialRemoteFinLifetime)
+                {
+                    failureMessage = "DIRECT TCP relay timed out waiting for the remote FIN acknowledgement.";
+                }
             }
 
             if (failureMessage is not null)
@@ -1356,14 +1381,37 @@ internal sealed class TcpDirectRelay : IDisposable
             {
                 try
                 {
-                    _ = _packetInjector(_target, segment);
+                    if (!_packetInjector(_target, segment))
+                    {
+                        _errorLog($"DIRECT TCP reset injection was rejected app={_target.AppLabel} client={_clientKey.ClientAddress}:{_clientKey.ClientPort}");
+                    }
                 }
                 catch
                 {
                 }
             }
 
+            AbortRemoteSocket();
             DisposeResources();
+        }
+
+        private void AbortRemoteSocket()
+        {
+            lock (_sync)
+            {
+                if (_socket is null)
+                {
+                    return;
+                }
+
+                try
+                {
+                    _socket.LingerState = new LingerOption(true, 0);
+                }
+                catch
+                {
+                }
+            }
         }
 
         private void FailLocked(string message)
