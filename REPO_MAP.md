@@ -238,7 +238,7 @@ one packet per call.
 | Path | Responsibility |
 | --- | --- |
 | `PacketFilterLoop.cs` | Central packet-processing loop. Configures adapters, watches WinpkFilter events, parses or reassembles packets, classifies outgoing TCP/UDP, performs process matching, redirects flows, injects synthetic TCP/UDP/ICMP responses, fragments oversized UDP output, manages bypass filters, handles the fake-IP DNS path, computes checksums, and logs throttled diagnostics. |
-| `IpFragmentReassembler.cs` | Reassembles IPv4/IPv6 outgoing fragments, validates overlap, preserves original fragments for transparent pass-through, and rebuilds a parseable logical packet for relay decisions. |
+| `IpFragmentReassembler.cs` | Reassembles IPv4/IPv6 outgoing fragments with VLAN metadata, per-assembly limits, duplicate detection, overlap validation, and original-fragment preservation for transparent pass-through. |
 | `PacketView.cs` | Zero-copy-ish `ref struct` over an Ethernet or VLAN-tagged frame. Parses IPv4/IPv6, skips supported IPv6 extension headers, exposes addresses, ports, TCP options/urgent pointer, UDP declared length, and payload spans. |
 | `PacketWakeSignal.cs` | Auto-reset event used by relay sockets to wake the packet loop after traffic counters or injected packets change. |
 | `PacketFilterReset.cs` | Reset utility for `--reset-filter`. Clears static filters, removes adapter events, resets adapter modes, and flushes queued packets. |
@@ -256,7 +256,7 @@ one packet per call.
 | --- | --- |
 | `RelayService.cs` | Owns relay lifetime and task supervision. Starts/stops the packet loop and TCP/UDP relays, watches configuration changes, reports one-second traffic snapshots, and propagates unexpected filter failure. |
 | `TcpDirectRelay.cs` | Tracks TCP connections by adapter and full four-tuple; connects outbound sockets; handles random ISN/MSS negotiation using the adapter MTU, long-unwrapped sequencing, retransmission, ACK processing, client windows, bounded out-of-order data, SYN payload bypass, urgent data best effort, half-close/FIN/RST, pending writes, deterministic failure cleanup, SNI probing, bypass registration, and maintenance cleanup. |
-| `UdpDirectRelay.cs` | Tracks one unconnected outbound UDP socket per adapter/four-tuple; handles bind fallback, owner/process validation, alternate response endpoints, broadcast/multicast pass-through, wildcard bypass ownership, DTLS SNI probing, ICMP error callbacks, response injection callbacks, traffic counters, and activity-based cleanup. |
+| `UdpDirectRelay.cs` | Tracks one unconnected outbound UDP socket per adapter/four-tuple with serialized creation/removal; handles bind fallback, owner/process validation, same-address alternate response ports, broadcast/multicast pass-through, DTLS SNI probing, ICMP error callbacks, response injection callbacks, traffic counters, and activity-based cleanup. |
 | `TrafficCounter.cs` | Thread-safe cumulative upload/download counters and current-rate snapshot calculation. |
 
 ### `Telemetry/`

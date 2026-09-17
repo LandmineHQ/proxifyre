@@ -155,7 +155,9 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             _adapterMtus[adapter] = adapterList.GetMtu(i) is > 0 and <= ushort.MaxValue
                 ? (int)adapterList.GetMtu(i)
                 : 1500;
-            var interfaceIndex = ResolveInterfaceIndex(adapterList.GetName(i));
+            var interfaceIndex = ResolveInterfaceIndex(
+                adapterList.GetName(i),
+                adapterList.GetMacAddress(i));
             if (interfaceIndex > 0)
             {
                 _adapterInterfaceIndices[adapter] = interfaceIndex;
@@ -182,7 +184,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         _log($"Filtering {_adapters.Count} adapter(s) on send path.");
     }
 
-    private static int ResolveInterfaceIndex(string adapterName)
+    private static int ResolveInterfaceIndex(string adapterName, byte[] macAddress)
     {
         if (string.IsNullOrWhiteSpace(adapterName))
         {
@@ -192,7 +194,8 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         foreach (var networkInterface in NetworkInterface.GetAllNetworkInterfaces())
         {
             if (!networkInterface.Name.Equals(adapterName, StringComparison.OrdinalIgnoreCase)
-                && !networkInterface.Description.Equals(adapterName, StringComparison.OrdinalIgnoreCase))
+                && !networkInterface.Description.Equals(adapterName, StringComparison.OrdinalIgnoreCase)
+                && !networkInterface.GetPhysicalAddress().GetAddressBytes().SequenceEqual(macAddress))
             {
                 continue;
             }
@@ -265,11 +268,6 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                     flow.RemoteAddress,
                     flow.LocalPort,
                     flow.RemotePort));
-                filters.Add(NdisApi.CreateOutboundNetworkPassFilter(
-                    adapter,
-                    flow.Protocol,
-                    flow.LocalAddress,
-                    flow.RemoteAddress));
             }
         }
 
@@ -280,6 +278,46 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 "set-static-filter-failed",
                 TimeSpan.FromSeconds(2));
         }
+    }
+
+    private bool IsRelayOutboundFragment(
+        ReadOnlySpan<byte> frame,
+        int packetLength,
+        IntPtr adapterHandle)
+    {
+        if (!IpFragmentReassembler.TryGetIdentity(
+                frame,
+                packetLength,
+                out var sourceAddress,
+                out var destinationAddress,
+                out var protocol))
+        {
+            return false;
+        }
+
+        foreach (var flow in _outboundBypassFlows.Keys)
+        {
+            if (flow.AdapterHandle != adapterHandle
+                || flow.Protocol != protocol
+                || !AddressesEqual(flow.LocalAddress, sourceAddress)
+                || !flow.RemoteAddress.Equals(destinationAddress))
+            {
+                continue;
+            }
+
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool AddressesEqual(IPAddress expected, IPAddress actual)
+    {
+        expected = NetworkAddress.Normalize(expected);
+        actual = NetworkAddress.Normalize(actual);
+        return expected.Equals(IPAddress.Any)
+            || expected.Equals(IPAddress.IPv6Any)
+            || expected.Equals(actual);
     }
 
     private bool TryReadAndProcessPacket()
@@ -327,6 +365,12 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         {
             if (buffer->DeviceFlags == NdisApi.PacketFlagOnSend)
             {
+                if (IsRelayOutboundFragment(frame, length, buffer->AdapterOrListFlink))
+                {
+                    Pass(buffer);
+                    return;
+                }
+
                 var status = _fragmentReassembler.Add(
                     frame,
                     length,
@@ -392,6 +436,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         var buffer = default(NdisApi.IntermediateBuffer);
         buffer.AdapterOrListFlink = fragment.AdapterHandle;
         buffer.DeviceFlags = fragment.DeviceFlags;
+        buffer.Dot1q = fragment.Dot1q;
         buffer.Length = (uint)fragment.Length;
         fragment.Frame.AsSpan(0, fragment.Length).CopyTo(new Span<byte>(buffer.Data, NdisApi.MaxEtherFrame));
         SendToAdapter(&buffer);
@@ -908,7 +953,9 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             ? configuredMtu
             : 1500;
         var maxFramePayload = NdisApi.MaxEtherFrame - linkHeaderLength;
-        var maxDatagramDataLength = Math.Max(8, Math.Min(mtu - ipHeaderLength, maxFramePayload) - 8);
+        var maxDatagramDataLength = Math.Max(
+            8,
+            Math.Min(mtu, maxFramePayload) - ipHeaderLength - 8);
 
         if (payloadSpan.Length > maxDatagramDataLength)
         {
@@ -1146,6 +1193,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         {
             SocketError.ConnectionRefused => 3,
             SocketError.HostUnreachable => 1,
+            SocketError.MessageSize => 4,
             _ => 0
         };
     }
@@ -1156,6 +1204,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         {
             SocketError.ConnectionRefused => 4,
             SocketError.HostUnreachable => 3,
+            SocketError.MessageSize => 2,
             _ => 0
         };
     }
@@ -1182,7 +1231,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         if (clientAddress.AddressFamily == AddressFamily.InterNetwork)
         {
             var maxFragmentData = Math.Max(8, maxDatagramDataLength & ~7);
-            var identification = unchecked((ushort)Environment.TickCount64);
+            var identification = (ushort)RandomNumberGenerator.GetInt32(1, ushort.MaxValue);
             var moreFragments = true;
             var offset = 0;
             while (moreFragments)

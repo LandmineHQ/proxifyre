@@ -12,8 +12,9 @@ internal sealed class UdpDirectRelay : IDisposable
     private const int MaxFlows = 4096;
 
     private readonly ConcurrentDictionary<UdpRelayKey, DirectRelayTarget> _targets = new();
-    private readonly ConcurrentDictionary<UdpRelayKey, Lazy<UdpRelaySocket>> _sockets = new();
+    private readonly ConcurrentDictionary<UdpRelayKey, UdpRelaySocket> _sockets = new();
     private readonly ConcurrentDictionary<UdpRelayKey, byte> _relayOutboundFlows = new();
+    private readonly object _socketCreationSync = new();
     private readonly Action<string> _log;
     private readonly bool _detailedLogging;
     private readonly TrafficCounter _trafficCounter;
@@ -115,28 +116,26 @@ internal sealed class UdpDirectRelay : IDisposable
 
     public void Remove(UdpRelayKey key)
     {
+        Remove(key, expectedSocket: null);
+    }
+
+    private void Remove(UdpRelayKey key, UdpRelaySocket? expectedSocket)
+    {
         _targets.TryRemove(key, out _);
-        if (!_sockets.TryRemove(key, out var socket))
+        UdpRelaySocket? socket;
+        lock (_socketCreationSync)
         {
-            return;
+            _sockets.TryGetValue(key, out socket);
+            if (socket is null
+                || (expectedSocket is not null && !ReferenceEquals(socket, expectedSocket)))
+            {
+                return;
+            }
+
+            _sockets.TryRemove(key, out _);
         }
 
-        if (socket.IsValueCreated)
-        {
-            socket.Value.Dispose();
-            return;
-        }
-
-        _ = Task.Run(() =>
-        {
-            try
-            {
-                socket.Value.Dispose();
-            }
-            catch
-            {
-            }
-        });
+        socket?.Dispose();
     }
 
     public async Task SendToRemoteAsync(
@@ -153,38 +152,39 @@ internal sealed class UdpDirectRelay : IDisposable
         }
 
         var relaySocket = GetOrCreateSocket(key, target);
+        var remoteEndPoint = NetworkEndpointResolver.CreateRemoteEndPoint(
+            target,
+            remoteAddress,
+            remotePort);
         await relaySocket.SendToRemoteAsync(
             payload,
-            new IPEndPoint(remoteAddress, remotePort),
+            remoteEndPoint,
             _cancellationToken).ConfigureAwait(false);
     }
 
     private UdpRelaySocket GetOrCreateSocket(UdpRelayKey key, DirectRelayTarget target)
     {
-        while (true)
+        lock (_socketCreationSync)
         {
-            var lazy = _sockets.GetOrAdd(
-                key,
-                _ => new Lazy<UdpRelaySocket>(
-                    () => CreateSocket(key, target),
-                    LazyThreadSafetyMode.ExecutionAndPublication));
-            UdpRelaySocket socket;
-            try
+            if (_sockets.TryGetValue(key, out var existing) && existing.Matches(target))
             {
-                socket = lazy.Value;
+                return existing;
             }
-            catch
+
+            if (existing is not null)
             {
                 _sockets.TryRemove(key, out _);
-                throw;
+                existing.Dispose();
             }
 
-            if (socket.Matches(target))
+            if (_sockets.Count >= MaxFlows)
             {
-                return socket;
+                throw new InvalidOperationException("UDP relay flow limit reached.");
             }
 
-            Remove(key);
+            var socket = CreateSocket(key, target);
+            _sockets[key] = socket;
+            return socket;
         }
     }
 
@@ -257,14 +257,15 @@ internal sealed class UdpDirectRelay : IDisposable
             }
         }
 
-        var relaySocket = new UdpRelaySocket(
+        UdpRelaySocket? relaySocket = null;
+        relaySocket = new UdpRelaySocket(
             socket,
             key,
             target,
             remoteEndPoint,
             outboundFlows,
             () => Refresh(key),
-            Remove,
+            key => Remove(key, relaySocket),
             _relayOutboundFlows,
             _outboundBypassUnregister,
             _trafficCounter,
@@ -316,21 +317,24 @@ internal sealed class UdpDirectRelay : IDisposable
 
     public void Dispose()
     {
-        foreach (var socket in _sockets.Values)
+        UdpRelaySocket[] sockets;
+        lock (_socketCreationSync)
+        {
+            sockets = _sockets.Values.ToArray();
+            _sockets.Clear();
+        }
+
+        foreach (var socket in sockets)
         {
             try
             {
-                if (socket.IsValueCreated)
-                {
-                    socket.Value.Dispose();
-                }
+                socket.Dispose();
             }
             catch
             {
             }
         }
 
-        _sockets.Clear();
         _targets.Clear();
         _relayOutboundFlows.Clear();
     }
@@ -533,17 +537,26 @@ internal sealed class UdpDirectRelay : IDisposable
                     return;
                 }
 
-                if (_responseValidator is not null && !_responseValidator(_target))
+                try
                 {
-                    _errorLog($"UDP relay response owner is no longer valid for app={_target.AppLabel} appLocal={_target.ClientEndpoint} from={remoteEndPoint}.");
-                    _remove(_key);
-                    return;
-                }
+                    if (_responseValidator is not null && !_responseValidator(_target))
+                    {
+                        _errorLog($"UDP relay response owner is no longer valid for app={_target.AppLabel} appLocal={_target.ClientEndpoint} from={remoteEndPoint}.");
+                        _remove(_key);
+                        return;
+                    }
 
-                var payload = buffer.AsMemory(0, result.ReceivedBytes).ToArray();
-                if (!_responseInjector(_target, remoteEndPoint, payload))
+                    var payload = buffer.AsMemory(0, result.ReceivedBytes).ToArray();
+                    if (!_responseInjector(_target, remoteEndPoint, payload))
+                    {
+                        _errorLog($"UDP relay response injection failed for app={_target.AppLabel} appLocal={_target.ClientEndpoint} from={remoteEndPoint}.");
+                        _remove(_key);
+                        return;
+                    }
+                }
+                catch (Exception ex)
                 {
-                    _errorLog($"UDP relay response injection failed for app={_target.AppLabel} appLocal={_target.ClientEndpoint} from={remoteEndPoint}.");
+                    _errorLog($"UDP relay response handling failed for app={_target.AppLabel} appLocal={_target.ClientEndpoint} from={remoteEndPoint}: {ex.Message}");
                     _remove(_key);
                     return;
                 }

@@ -54,6 +54,27 @@ internal sealed class IpFragmentReassembler
         _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
+    public static bool TryGetIdentity(
+        ReadOnlySpan<byte> frame,
+        int packetLength,
+        out IPAddress sourceAddress,
+        out IPAddress destinationAddress,
+        out byte protocol)
+    {
+        sourceAddress = IPAddress.None;
+        destinationAddress = IPAddress.None;
+        protocol = 0;
+        if (!TryParseFragment(frame, packetLength, out var fragment))
+        {
+            return false;
+        }
+
+        sourceAddress = fragment.SourceAddress;
+        destinationAddress = fragment.DestinationAddress;
+        protocol = fragment.Protocol;
+        return true;
+    }
+
     public FragmentAddStatus Add(
         ReadOnlySpan<byte> frame,
         int packetLength,
@@ -84,7 +105,8 @@ internal sealed class IpFragmentReassembler
             fragment.SourceAddress,
             fragment.DestinationAddress,
             fragment.Identification,
-            fragment.Protocol);
+            fragment.Protocol,
+            dot1q);
 
         if (!_assemblies.TryGetValue(key, out var assembly))
         {
@@ -296,8 +318,11 @@ internal sealed class IpFragmentReassembler
 
     private sealed class FragmentAssembly(DateTimeOffset now)
     {
+        private const int MaxFragmentsPerAssembly = 1024;
+        private const int MaxFragmentBytesPerAssembly = ushort.MaxValue;
         private readonly List<StoredFragment> _fragments = [];
         private int _totalLength = -1;
+        private int _fragmentBytes;
         private IpFragment? _headerFragment;
 
         public DateTimeOffset LastActivity { get; set; } = now;
@@ -318,8 +343,16 @@ internal sealed class IpFragmentReassembler
                 if (fragment.Offset < stored.Fragment.Offset + stored.Fragment.PayloadLength
                     && stored.Fragment.Offset < end)
                 {
-                    return false;
+                    return fragment.Offset == stored.Fragment.Offset
+                        && fragment.PayloadLength == stored.Fragment.PayloadLength
+                        && fragment.Payload.AsSpan().SequenceEqual(stored.Fragment.Payload);
                 }
+            }
+
+            if (_fragments.Count >= MaxFragmentsPerAssembly
+                || _fragmentBytes + fragment.PayloadLength > MaxFragmentBytesPerAssembly)
+            {
+                return false;
             }
 
             var original = new CapturedPacketFragment(
@@ -329,6 +362,7 @@ internal sealed class IpFragmentReassembler
                 deviceFlags,
                 dot1q);
             _fragments.Add(new StoredFragment(fragment, original));
+            _fragmentBytes += fragment.PayloadLength;
             _fragments.Sort(static (left, right) => left.Fragment.Offset.CompareTo(right.Fragment.Offset));
 
             if (fragment.Offset == 0)
@@ -457,7 +491,8 @@ internal sealed class IpFragmentReassembler
         IPAddress SourceAddress,
         IPAddress DestinationAddress,
         uint Identification,
-        byte Protocol);
+        byte Protocol,
+        uint Dot1q);
 
     private readonly record struct IpFragment(
         AddressFamily AddressFamily,
