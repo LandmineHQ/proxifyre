@@ -86,7 +86,8 @@ internal sealed class TcpDirectRelay : IDisposable
         DirectRelayTarget target,
         uint clientSequenceNumber,
         ushort clientWindow,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        ushort clientMss = 536)
     {
         if (_connections.TryGetValue(flowKey, out var existingConnection))
         {
@@ -100,6 +101,7 @@ internal sealed class TcpDirectRelay : IDisposable
             target,
             clientSequenceNumber,
             clientWindow,
+            clientMss,
             CreateInitialSequence(),
             _trafficCounter,
             _packetWakeSignal,
@@ -291,6 +293,8 @@ internal sealed class TcpDirectRelay : IDisposable
         private Task? _writerTask;
         private Task? _receiverTask;
         private long _clientReceiveNext;
+        private readonly uint _clientInitialSequence;
+        private readonly ushort _clientMss;
         private long _clientAcknowledged;
         private long _clientFinSequence = -1;
         private long? _pendingFinSequence;
@@ -300,6 +304,7 @@ internal sealed class TcpDirectRelay : IDisposable
         private long _remoteSendUna;
         private long _clientAckSequence;
         private long _remoteFinSequence = -1;
+        private DateTimeOffset _remoteFinQueuedAt;
         private long _outOfOrderBytes;
         private ushort _clientWindow;
         private int _duplicateAckCount;
@@ -321,6 +326,7 @@ internal sealed class TcpDirectRelay : IDisposable
             DirectRelayTarget target,
             uint clientSequenceNumber,
             ushort clientWindow,
+            ushort clientMss,
             uint remoteInitialSequence,
             TrafficCounter trafficCounter,
             PacketWakeSignal? packetWakeSignal,
@@ -350,6 +356,8 @@ internal sealed class TcpDirectRelay : IDisposable
             _lastActivity = _createdAt;
 
             _clientReceiveNext = (long)clientSequenceNumber + 1;
+            _clientInitialSequence = clientSequenceNumber;
+            _clientMss = (ushort)Math.Clamp((int)clientMss, 536, 1460);
             _clientAcknowledged = _clientReceiveNext;
             _clientWindow = clientWindow;
             _remoteInitialSequence = remoteInitialSequence;
@@ -362,6 +370,8 @@ internal sealed class TcpDirectRelay : IDisposable
         public TcpRelayKey FlowKey => _flowKey;
 
         public TcpClientKey ClientKey => _clientKey;
+
+        public uint ClientInitialSequence => _clientInitialSequence;
 
         public bool IsClosed
         {
@@ -392,6 +402,22 @@ internal sealed class TcpDirectRelay : IDisposable
             {
                 socket = CreateRelaySocket(_target.RemoteAddress.AddressFamily);
                 var remoteEndPoint = NetworkEndpointResolver.CreateRemoteEndPoint(_target);
+                if (_target.InterfaceIndex > 0)
+                {
+                    try
+                    {
+                        socket.SetSocketOption(
+                            _target.RemoteAddress.AddressFamily == AddressFamily.InterNetwork
+                                ? SocketOptionLevel.IP
+                                : SocketOptionLevel.IPv6,
+                            (SocketOptionName)31,
+                            _target.InterfaceIndex);
+                    }
+                    catch
+                    {
+                    }
+                }
+
                 var bindEndPoint = NetworkEndpointResolver.CreateBindEndPoint(_target)
                     ?? NetworkEndpointResolver.CreateAnyEndPoint(remoteEndPoint.AddressFamily);
                 socket.Bind(bindEndPoint);
@@ -1023,6 +1049,7 @@ internal sealed class TcpDirectRelay : IDisposable
 
                 _remoteFinQueued = true;
                 _remoteFinSequence = _remoteSendNext;
+                _remoteFinQueuedAt = _timeProvider.GetUtcNow();
                 var segment = new TcpSegment(
                     (uint)_remoteFinSequence,
                     (uint)_clientAcknowledged,
@@ -1082,7 +1109,8 @@ internal sealed class TcpDirectRelay : IDisposable
             {
                 if (!outbound.Sent || force)
                 {
-                    if (outbound.End > _clientAckSequence + _clientWindow)
+                    if ((outbound.Segment.Flags & PacketView.TcpFlagSyn) == 0
+                        && outbound.End > _clientAckSequence + _clientWindow)
                     {
                         return;
                     }
@@ -1175,7 +1203,7 @@ internal sealed class TcpDirectRelay : IDisposable
         {
             var sequence = UnwrapNear(sequenceNumber, _clientReceiveNext);
             return sequence >= _clientAcknowledged
-                && sequence <= _clientReceiveNext + _clientWindow;
+                && sequence <= _clientReceiveNext + MaxBufferedClientBytes;
         }
 
         private bool TryCompleteCloseLocked()
@@ -1241,7 +1269,8 @@ internal sealed class TcpDirectRelay : IDisposable
                 localAddress,
                 remoteEndPoint.Address,
                 (ushort)localEndPoint.Port,
-                (ushort)remoteEndPoint.Port);
+                (ushort)remoteEndPoint.Port,
+                _target.Dot1q);
 
             lock (_outboundFlowSync)
             {
@@ -1335,13 +1364,13 @@ internal sealed class TcpDirectRelay : IDisposable
                 }
 
                 if (_remoteFinAcknowledged
-                    && now - _lastActivity > InitialRemoteFinLifetime)
+                    && now - _remoteFinQueuedAt > InitialRemoteFinLifetime)
                 {
                     failureMessage = "DIRECT TCP relay closed a stale half-closed connection.";
                 }
                 else if (_remoteFinQueued
                     && !_remoteFinAcknowledged
-                    && now - _lastActivity > InitialRemoteFinLifetime)
+                    && now - _remoteFinQueuedAt > InitialRemoteFinLifetime)
                 {
                     failureMessage = "DIRECT TCP relay timed out waiting for the remote FIN acknowledgement.";
                 }
@@ -1368,7 +1397,7 @@ internal sealed class TcpDirectRelay : IDisposable
                 _closed = true;
                 injectReset = true;
                 segment = new TcpSegment(
-                    (uint)_remoteSendNext,
+                    (uint)_remoteSentNext,
                     (uint)_clientReceiveNext,
                     PacketView.TcpFlagRst | PacketView.TcpFlagAck,
                     0,
@@ -1577,7 +1606,10 @@ internal sealed class TcpDirectRelay : IDisposable
         private int GetMaxTcpPayload()
         {
             var ipHeaderLength = _target.RemoteAddress.AddressFamily == AddressFamily.InterNetwork ? 20 : 40;
-            return Math.Clamp(_target.AdapterMtu - ipHeaderLength - 20, 536, MaxTcpPayload);
+            return Math.Clamp(
+                Math.Min(_target.AdapterMtu - ipHeaderLength - 20, _clientMss),
+                536,
+                MaxTcpPayload);
         }
 
         private sealed class PendingClientData(

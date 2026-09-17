@@ -136,7 +136,14 @@ internal readonly record struct TcpRelayKey
 
 internal readonly record struct RelayOutboundFlow
 {
-    public RelayOutboundFlow(IntPtr adapterHandle, byte protocol, IPAddress localAddress, IPAddress remoteAddress, ushort localPort, ushort remotePort)
+    public RelayOutboundFlow(
+        IntPtr adapterHandle,
+        byte protocol,
+        IPAddress localAddress,
+        IPAddress remoteAddress,
+        ushort localPort,
+        ushort remotePort,
+        uint dot1q = 0)
     {
         AdapterHandle = adapterHandle;
         Protocol = protocol;
@@ -144,6 +151,7 @@ internal readonly record struct RelayOutboundFlow
         RemoteAddress = NetworkAddress.Normalize(remoteAddress);
         LocalPort = localPort;
         RemotePort = remotePort;
+        Dot1q = dot1q;
     }
 
     public IntPtr AdapterHandle { get; }
@@ -157,6 +165,8 @@ internal readonly record struct RelayOutboundFlow
     public ushort LocalPort { get; }
 
     public ushort RemotePort { get; }
+
+    public uint Dot1q { get; }
 
     public override string ToString()
     {

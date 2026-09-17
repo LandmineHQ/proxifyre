@@ -127,13 +127,17 @@ internal sealed class UdpDirectRelay : IDisposable
         lock (_socketCreationSync)
         {
             _sockets.TryGetValue(key, out socket);
-            if (socket is null
-                || (expectedSocket is not null && !ReferenceEquals(socket, expectedSocket)))
+            if (expectedSocket is not null
+                && !ReferenceEquals(socket, expectedSocket))
             {
                 return;
             }
 
-            _sockets.TryRemove(key, out _);
+            if (socket is not null)
+            {
+                _sockets.TryRemove(key, out _);
+            }
+
             _targets.TryRemove(key, out _);
         }
 
@@ -228,7 +232,8 @@ internal sealed class UdpDirectRelay : IDisposable
                 localAddress,
                 remoteEndPoint.Address,
                 localPort,
-                (ushort)remoteEndPoint.Port);
+                (ushort)remoteEndPoint.Port,
+                target.Dot1q);
             outboundFlows.Add(exact);
             _relayOutboundFlows[new UdpRelayKey(
                 target.AdapterHandle,
@@ -246,7 +251,8 @@ internal sealed class UdpDirectRelay : IDisposable
                     wildcardAddress,
                     remoteEndPoint.Address,
                     localPort,
-                    (ushort)remoteEndPoint.Port);
+                    (ushort)remoteEndPoint.Port,
+                    target.Dot1q);
                 outboundFlows.Add(wildcard);
                 _relayOutboundFlows[new UdpRelayKey(
                     target.AdapterHandle,
@@ -323,10 +329,15 @@ internal sealed class UdpDirectRelay : IDisposable
 
     public void Dispose()
     {
-        _disposed = true;
         UdpRelaySocket[] sockets;
         lock (_socketCreationSync)
         {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
             sockets = _sockets.Values.ToArray();
             _sockets.Clear();
         }

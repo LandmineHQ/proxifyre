@@ -283,7 +283,8 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
     private bool IsRelayOutboundFragment(
         ReadOnlySpan<byte> frame,
         int packetLength,
-        IntPtr adapterHandle)
+        IntPtr adapterHandle,
+        uint dot1q)
     {
         if (!IpFragmentReassembler.TryGetIdentity(
                 frame,
@@ -300,6 +301,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             foreach (var flow in _outboundBypassFlows.Keys)
             {
                 if (flow.AdapterHandle != adapterHandle
+                    || flow.Dot1q != dot1q
                     || flow.Protocol != protocol
                     || !AddressesEqual(flow.LocalAddress, sourceAddress)
                     || !flow.RemoteAddress.Equals(destinationAddress))
@@ -368,7 +370,11 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         {
             if (buffer->DeviceFlags == NdisApi.PacketFlagOnSend)
             {
-                if (IsRelayOutboundFragment(frame, length, buffer->AdapterOrListFlink))
+                if (IsRelayOutboundFragment(
+                        frame,
+                        length,
+                        buffer->AdapterOrListFlink,
+                        buffer->Dot1q))
                 {
                     Pass(buffer);
                     return;
@@ -499,6 +505,12 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             {
                 _tcpRelay.Remove(existingConnection);
             }
+            else if (packet.IsInitialSyn
+                && packet.TcpPayloadLength == 0
+                && existingConnection.ClientInitialSequence != packet.TcpSequenceNumber)
+            {
+                _tcpRelay.Remove(existingConnection);
+            }
             else
             {
                 existingConnection.SendClientSegment(CreateTcpSegment(packet));
@@ -541,7 +553,17 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             TimeSpan.FromSeconds(2));
         var target = CreateTarget(adapterHandle, dot1q, packet, process, matchedPattern);
         var clientKey = new TcpClientKey(packet.SourceAddress, packet.SourcePort);
-        _tcpRelay.RegisterSyn(relayKey, clientKey, target, packet.TcpSequenceNumber, packet.TcpWindow, _cancellationToken);
+        var clientMss = TryGetTcpMss(packet.TcpOptions, out var parsedMss)
+            ? parsedMss
+            : (ushort)536;
+        _tcpRelay.RegisterSyn(
+            relayKey,
+            clientKey,
+            target,
+            packet.TcpSequenceNumber,
+            packet.TcpWindow,
+            _cancellationToken,
+            clientMss);
         _packetsRedirected++;
         LogPacketStats();
         return true;
@@ -576,6 +598,46 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             packet.TcpUrgentPointer,
             packet.TcpPayload.ToArray(),
             packet.TcpOptions.ToArray());
+    }
+
+    private static bool TryGetTcpMss(ReadOnlySpan<byte> options, out ushort mss)
+    {
+        mss = 0;
+        var offset = 0;
+        while (offset < options.Length)
+        {
+            var kind = options[offset++];
+            if (kind == 0)
+            {
+                return false;
+            }
+
+            if (kind == 1)
+            {
+                continue;
+            }
+
+            if (offset >= options.Length)
+            {
+                return false;
+            }
+
+            var length = options[offset++];
+            if (length < 2 || offset + length - 2 > options.Length)
+            {
+                return false;
+            }
+
+            if (kind == 2 && length == 4)
+            {
+                mss = BinaryPrimitives.ReadUInt16BigEndian(options.Slice(offset, 2));
+                return mss >= 536;
+            }
+
+            offset += length - 2;
+        }
+
+        return false;
     }
 
     private bool ProcessOutgoingUdp(PacketView packet, IntPtr adapterHandle, uint dot1q)
