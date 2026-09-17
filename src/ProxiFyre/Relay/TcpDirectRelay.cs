@@ -410,7 +410,7 @@ internal sealed class TcpDirectRelay : IDisposable
                     try
                     {
                         var optionValue = _target.RemoteAddress.AddressFamily == AddressFamily.InterNetwork
-                            ? IPAddress.HostToNetworkOrder(unchecked((short)_target.InterfaceIndex))
+                            ? IPAddress.HostToNetworkOrder(_target.InterfaceIndex)
                             : _target.InterfaceIndex;
                         socket.SetSocketOption(
                             _target.RemoteAddress.AddressFamily == AddressFamily.InterNetwork
@@ -503,8 +503,8 @@ internal sealed class TcpDirectRelay : IDisposable
                 if ((segment.Flags & PacketView.TcpFlagRst) != 0)
                 {
                     var resetSequence = UnwrapNear(segment.SequenceNumber, _clientReceiveNext);
-                    if (resetSequence >= _clientAcknowledged - MaxBufferedClientBytes
-                        && resetSequence <= _clientReceiveNext + MaxBufferedClientBytes)
+                    if (resetSequence >= _clientReceiveNext - MaxBufferedClientBytes
+                        && resetSequence <= _clientReceiveNext + GetClientFacingWindowLocked())
                     {
                         closeWithoutReset = true;
                     }

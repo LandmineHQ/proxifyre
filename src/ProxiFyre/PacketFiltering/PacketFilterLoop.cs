@@ -256,6 +256,11 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         var filters = new List<NdisApi.StaticFilter>(_outboundBypassFlows.Count * Math.Max(_adapters.Count, 1));
         foreach (var flow in _outboundBypassFlows.Keys)
         {
+            if (flow.Dot1q != 0)
+            {
+                continue;
+            }
+
             var adapters = flow.AdapterHandle != IntPtr.Zero
                 ? [flow.AdapterHandle]
                 : _adapters;
@@ -327,6 +332,8 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
 
     private bool TryReadAndProcessPacket()
     {
+        _fragmentReassembler.FlushExpired(SendCapturedFragmentToAdapter);
+
         foreach (var adapter in _adapters)
         {
             var buffer = default(NdisApi.IntermediateBuffer);
@@ -386,7 +393,16 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                     buffer->AdapterOrListFlink,
                     buffer->DeviceFlags,
                     buffer->Dot1q,
-                    out var reassembled);
+                    out var reassembled,
+                    out var fragmentsToPass);
+                if (fragmentsToPass is not null)
+                {
+                    foreach (var fragment in fragmentsToPass)
+                    {
+                        SendCapturedFragmentToAdapter(fragment);
+                    }
+                }
+
                 if (status == FragmentAddStatus.Incomplete)
                 {
                     return;
@@ -793,7 +809,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                     }
 
                     _log($"DIRECT UDP send failed app={target.AppLabel} appLocal={target.ClientEndpoint} client={relayKey.ClientAddress}:{relayKey.ClientPort} target={target.RemoteEndpoint}: {ex.Message}");
-                    _udpRelay.Remove(relayKey);
+                    _udpRelay.RemoveIfMatches(relayKey, target);
                 },
                 CancellationToken.None,
                 TaskContinuationOptions.OnlyOnFaulted,

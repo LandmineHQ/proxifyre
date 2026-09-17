@@ -121,6 +121,20 @@ internal sealed class UdpDirectRelay : IDisposable
         Remove(key, expectedSocket: null);
     }
 
+    public void RemoveIfMatches(UdpRelayKey key, DirectRelayTarget target)
+    {
+        lock (_socketCreationSync)
+        {
+            if (!_targets.TryGetValue(key, out var current)
+                || !TargetMatches(current, target))
+            {
+                return;
+            }
+        }
+
+        Remove(key);
+    }
+
     private void Remove(UdpRelayKey key, UdpRelaySocket? expectedSocket)
     {
         UdpRelaySocket? socket;
@@ -426,11 +440,7 @@ internal sealed class UdpDirectRelay : IDisposable
 
         public bool Matches(DirectRelayTarget target)
         {
-            return target.ProcessId == _target.ProcessId
-                && target.ProcessName.Equals(_target.ProcessName, StringComparison.OrdinalIgnoreCase)
-                && target.ProcessPath.Equals(_target.ProcessPath, StringComparison.OrdinalIgnoreCase)
-                && target.AdapterHandle == _target.AdapterHandle
-                && target.Dot1q == _target.Dot1q;
+            return TargetMatches(target, _target);
         }
 
         public void Start(CancellationToken cancellationToken)
@@ -638,5 +648,18 @@ internal sealed class UdpDirectRelay : IDisposable
 
             _socket.Dispose();
         }
+    }
+
+    private static bool TargetMatches(DirectRelayTarget left, DirectRelayTarget right)
+    {
+        return left.ProcessId == right.ProcessId
+            && left.ProcessName.Equals(right.ProcessName, StringComparison.OrdinalIgnoreCase)
+            && left.ProcessPath.Equals(right.ProcessPath, StringComparison.OrdinalIgnoreCase)
+            && left.AdapterHandle == right.AdapterHandle
+            && left.Dot1q == right.Dot1q
+            && Equals(left.ClientAddress, right.ClientAddress)
+            && left.ClientPort == right.ClientPort
+            && Equals(left.RemoteAddress, right.RemoteAddress)
+            && left.RemotePort == right.RemotePort;
     }
 }

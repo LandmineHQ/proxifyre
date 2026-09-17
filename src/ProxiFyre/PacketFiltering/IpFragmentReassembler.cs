@@ -81,9 +81,11 @@ internal sealed class IpFragmentReassembler
         IntPtr adapterHandle,
         uint deviceFlags,
         uint dot1q,
-        out ReassembledIpPacket? packet)
+        out ReassembledIpPacket? packet,
+        out IReadOnlyList<CapturedPacketFragment>? fragmentsToPass)
     {
         packet = null;
+        fragmentsToPass = null;
         CleanupExpired();
 
         if (!TryParseFragment(frame, packetLength, out var fragment))
@@ -112,6 +114,12 @@ internal sealed class IpFragmentReassembler
         {
             if (_assemblies.Count >= MaxAssemblies)
             {
+                fragmentsToPass = [CreateCapturedFragment(
+                    frame,
+                    packetLength,
+                    adapterHandle,
+                    deviceFlags,
+                    dot1q)];
                 return FragmentAddStatus.Invalid;
             }
 
@@ -123,6 +131,14 @@ internal sealed class IpFragmentReassembler
         if (!assembly.TryAdd(fragment, frame, packetLength, adapterHandle, deviceFlags, dot1q))
         {
             _assemblies.Remove(key);
+            fragmentsToPass = assembly.GetOriginals()
+                .Append(CreateCapturedFragment(
+                    frame,
+                    packetLength,
+                    adapterHandle,
+                    deviceFlags,
+                    dot1q))
+                .ToArray();
             return FragmentAddStatus.Invalid;
         }
 
@@ -133,19 +149,53 @@ internal sealed class IpFragmentReassembler
 
         _assemblies.Remove(key);
         packet = assembly.Build();
-        return packet is null ? FragmentAddStatus.Invalid : FragmentAddStatus.Complete;
+        if (packet is null)
+        {
+            fragmentsToPass = assembly.GetOriginals();
+            return FragmentAddStatus.Invalid;
+        }
+
+        return FragmentAddStatus.Complete;
     }
 
-    public void CleanupExpired()
+    public void FlushExpired(Action<CapturedPacketFragment> flush)
+    {
+        CleanupExpired(flush);
+    }
+
+    private void CleanupExpired(Action<CapturedPacketFragment>? flush = null)
     {
         var now = _timeProvider.GetUtcNow();
         foreach (var pair in _assemblies.ToArray())
         {
             if (now - pair.Value.LastActivity > AssemblyTtl)
             {
+                if (flush is not null)
+                {
+                    foreach (var fragment in pair.Value.GetOriginals())
+                    {
+                        flush(fragment);
+                    }
+                }
+
                 _assemblies.Remove(pair.Key);
             }
         }
+    }
+
+    private static CapturedPacketFragment CreateCapturedFragment(
+        ReadOnlySpan<byte> frame,
+        int packetLength,
+        IntPtr adapterHandle,
+        uint deviceFlags,
+        uint dot1q)
+    {
+        return new CapturedPacketFragment(
+            frame[..packetLength].ToArray(),
+            packetLength,
+            adapterHandle,
+            deviceFlags,
+            dot1q);
     }
 
     private static bool TryParseFragment(
@@ -328,6 +378,11 @@ internal sealed class IpFragmentReassembler
         public DateTimeOffset LastActivity { get; set; } = now;
 
         public bool IsComplete => _totalLength >= 0 && IsContiguous();
+
+        public IReadOnlyList<CapturedPacketFragment> GetOriginals()
+        {
+            return _fragments.Select(static item => item.Original).ToArray();
+        }
 
         public bool TryAdd(
             IpFragment fragment,

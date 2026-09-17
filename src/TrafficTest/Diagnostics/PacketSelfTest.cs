@@ -106,7 +106,8 @@ internal static class PacketSelfTest
                 IntPtr.Zero,
                 1,
                 0,
-                out var candidate);
+                out var candidate,
+                out _);
             if (status == FragmentAddStatus.Complete)
             {
                 result = candidate;
@@ -139,7 +140,8 @@ internal static class PacketSelfTest
                 IntPtr.Zero,
                 1,
                 0,
-                out var candidate);
+                out var candidate,
+                out _);
             if (status == FragmentAddStatus.Complete)
             {
                 result = candidate;
