@@ -252,6 +252,49 @@ internal static unsafe class NdisApi
         return filter;
     }
 
+    public static StaticFilter CreateOutboundNetworkPassFilter(
+        IntPtr adapter,
+        byte protocol,
+        IPAddress localAddress,
+        IPAddress remoteAddress)
+    {
+        localAddress = NetworkAddress.Normalize(localAddress);
+        remoteAddress = NetworkAddress.Normalize(remoteAddress);
+        var matchLocalAddress = !localAddress.Equals(IPAddress.Any)
+            && !localAddress.Equals(IPAddress.IPv6Any);
+        var filter = new StaticFilter
+        {
+            AdapterHandle = adapter.ToInt64(),
+            DirectionFlags = PacketFlagOnSend,
+            FilterAction = FilterPacketPass,
+            ValidFields = NetworkLayerValid,
+            NetworkSelector = remoteAddress.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork ? Ipv4 : Ipv6
+        };
+
+        if (remoteAddress.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+        {
+            WriteIpv4Filter(
+                &filter,
+                remoteAddress,
+                protocol,
+                matchLocalAddress && localAddress.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork
+                    ? localAddress
+                    : null);
+        }
+        else
+        {
+            WriteIpv6Filter(
+                &filter,
+                remoteAddress,
+                protocol,
+                matchLocalAddress && localAddress.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6
+                    ? localAddress
+                    : null);
+        }
+
+        return filter;
+    }
+
     private static void WriteIpv4Filter(
         StaticFilter* filter,
         IPAddress destinationAddress,
@@ -470,6 +513,14 @@ internal static unsafe class NdisApi
             fixed (ushort* mtus = Mtus)
             {
                 return mtus[index];
+            }
+        }
+
+        public string GetName(int index)
+        {
+            fixed (byte* names = Names)
+            {
+                return Marshal.PtrToStringAnsi((IntPtr)(names + (index * AdapterNameSize))) ?? string.Empty;
             }
         }
     }

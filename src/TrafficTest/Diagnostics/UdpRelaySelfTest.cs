@@ -21,6 +21,7 @@ internal static class UdpRelaySelfTest
         {
             responseSource.TrySetResult(remoteEndPoint);
             responsePayload.TrySetResult(payload.ToArray());
+            return true;
         });
         relay.SetOutboundBypass(_ => { }, _ => { });
         relay.Start(timeout.Token);

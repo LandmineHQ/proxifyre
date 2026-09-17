@@ -22,6 +22,8 @@ internal static class TcpRelaySelfTest
             {
                 injections.Add(segment);
             }
+
+            return true;
         });
         relay.SetOutboundBypass(_ => { }, _ => { });
         using var relayCancellation = CancellationTokenSource.CreateLinkedTokenSource(timeout.Token);

@@ -39,8 +39,6 @@ internal readonly record struct TcpSessionKey
 
     public ushort RemotePort { get; }
 
-    public IntPtr AdapterHandle { get; }
-
     public override string ToString()
     {
         return $"{LocalAddress}:{LocalPort} -> {RemoteAddress}:{RemotePort}";
@@ -178,7 +176,10 @@ internal sealed record DirectRelayTarget(
     IntPtr AdapterHandle = default,
     byte[]? LinkHeader = null,
     byte[]? InboundEthernetSource = null,
-    byte[]? InboundEthernetDestination = null)
+    byte[]? InboundEthernetDestination = null,
+    int AdapterMtu = 1500,
+    uint Dot1q = 0,
+    int InterfaceIndex = 0)
 {
     public string AppLabel => ProcessId > 0
         ? $"{ProcessName} pid={ProcessId} pattern={MatchedPattern}"

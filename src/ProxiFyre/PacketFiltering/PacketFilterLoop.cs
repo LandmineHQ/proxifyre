@@ -1,7 +1,9 @@
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Buffers.Binary;
 using System.Security.Cryptography;
+using System.Collections.Concurrent;
 
 namespace ProxiFyre;
 
@@ -15,10 +17,11 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
     private readonly IpFragmentReassembler _fragmentReassembler;
     private readonly HashSet<IntPtr> _adapters = [];
     private readonly Dictionary<IntPtr, int> _adapterMtus = [];
+    private readonly Dictionary<IntPtr, int> _adapterInterfaceIndices = [];
     private readonly Action<string> _log;
     private readonly bool _detailedLogging;
     private readonly TimeProvider _timeProvider;
-    private readonly Dictionary<string, DateTimeOffset> _detailLogTimes = [];
+    private readonly ConcurrentDictionary<string, DateTimeOffset> _detailLogTimes = new();
     private readonly object _outboundBypassSync = new();
     private readonly Dictionary<RelayOutboundFlow, int> _outboundBypassFlows = [];
     private DateTimeOffset _lastPacketStatsLog;
@@ -42,6 +45,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         _fragmentReassembler = new IpFragmentReassembler(_timeProvider);
         _tcpRelay.SetPacketInjector(InjectTcpSegmentToClient);
         _udpRelay.SetResponseInjector(InjectUdpResponseToClient);
+        _udpRelay.SetResponseValidator(IsUdpTargetCurrent);
         _udpRelay.SetErrorInjector(InjectUdpErrorToClient);
         _tcpRelay.SetOutboundBypass(RegisterOutboundBypass, UnregisterOutboundBypass);
         _udpRelay.SetOutboundBypass(RegisterOutboundBypass, UnregisterOutboundBypass);
@@ -151,6 +155,11 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             _adapterMtus[adapter] = adapterList.GetMtu(i) is > 0 and <= ushort.MaxValue
                 ? (int)adapterList.GetMtu(i)
                 : 1500;
+            var interfaceIndex = ResolveInterfaceIndex(adapterList.GetName(i));
+            if (interfaceIndex > 0)
+            {
+                _adapterInterfaceIndices[adapter] = interfaceIndex;
+            }
             var mode = new NdisApi.AdapterMode
             {
                 AdapterHandle = adapter,
@@ -171,6 +180,31 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         }
 
         _log($"Filtering {_adapters.Count} adapter(s) on send path.");
+    }
+
+    private static int ResolveInterfaceIndex(string adapterName)
+    {
+        if (string.IsNullOrWhiteSpace(adapterName))
+        {
+            return 0;
+        }
+
+        foreach (var networkInterface in NetworkInterface.GetAllNetworkInterfaces())
+        {
+            if (!networkInterface.Name.Equals(adapterName, StringComparison.OrdinalIgnoreCase)
+                && !networkInterface.Description.Equals(adapterName, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var properties = networkInterface.GetIPProperties().GetIPv6Properties();
+            if (properties is not null && properties.Index > 0)
+            {
+                return properties.Index;
+            }
+        }
+
+        return 0;
     }
 
     private void RegisterOutboundBypass(RelayOutboundFlow flow)
@@ -219,7 +253,10 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         var filters = new List<NdisApi.StaticFilter>(_outboundBypassFlows.Count * Math.Max(_adapters.Count, 1));
         foreach (var flow in _outboundBypassFlows.Keys)
         {
-            foreach (var adapter in _adapters)
+            var adapters = flow.AdapterHandle != IntPtr.Zero
+                ? [flow.AdapterHandle]
+                : _adapters;
+            foreach (var adapter in adapters)
             {
                 filters.Add(NdisApi.CreateOutboundPassFilter(
                     adapter,
@@ -228,6 +265,11 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                     flow.RemoteAddress,
                     flow.LocalPort,
                     flow.RemotePort));
+                filters.Add(NdisApi.CreateOutboundNetworkPassFilter(
+                    adapter,
+                    flow.Protocol,
+                    flow.LocalAddress,
+                    flow.RemoteAddress));
             }
         }
 
@@ -268,7 +310,17 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
     {
         _packetsRead++;
 
-        var length = checked((int)Math.Min(buffer->Length, NdisApi.MaxEtherFrame));
+        if (buffer->Length > NdisApi.MaxEtherFrame)
+        {
+            LogThrottled(
+                $"Packet exceeds the configured Ethernet buffer length={buffer->Length}.",
+                "packet-too-large",
+                TimeSpan.FromSeconds(5));
+            Pass(buffer);
+            return;
+        }
+
+        var length = (int)buffer->Length;
         var frame = new Span<byte>(buffer->Data, NdisApi.MaxEtherFrame);
 
         if (!PacketView.TryParse(frame, length, out var packet))
@@ -280,8 +332,14 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                     length,
                     buffer->AdapterOrListFlink,
                     buffer->DeviceFlags,
+                    buffer->Dot1q,
                     out var reassembled);
                 if (status == FragmentAddStatus.Incomplete)
+                {
+                    return;
+                }
+
+                if (status == FragmentAddStatus.Invalid)
                 {
                     return;
                 }
@@ -299,7 +357,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
 
         if (buffer->DeviceFlags == NdisApi.PacketFlagOnSend)
         {
-            if (!ProcessOutgoing(packet, buffer->AdapterOrListFlink))
+            if (!ProcessOutgoing(packet, buffer->AdapterOrListFlink, buffer->Dot1q))
             {
                 Pass(buffer);
             }
@@ -320,7 +378,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
     {
         var frame = reassembled.Frame.AsSpan();
         if (!PacketView.TryParse(frame, reassembled.Length, out var packet)
-            || !ProcessOutgoing(packet, reassembled.AdapterHandle))
+            || !ProcessOutgoing(packet, reassembled.AdapterHandle, reassembled.Dot1q))
         {
             foreach (var fragment in reassembled.Fragments)
             {
@@ -339,16 +397,16 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         SendToAdapter(&buffer);
     }
 
-    private bool ProcessOutgoing(PacketView packet, IntPtr adapterHandle)
+    private bool ProcessOutgoing(PacketView packet, IntPtr adapterHandle, uint dot1q)
     {
         if (packet.IsTcp)
         {
-            return ProcessOutgoingTcp(packet, adapterHandle);
+            return ProcessOutgoingTcp(packet, adapterHandle, dot1q);
         }
 
         if (packet.IsUdp)
         {
-            return ProcessOutgoingUdp(packet, adapterHandle);
+            return ProcessOutgoingUdp(packet, adapterHandle, dot1q);
         }
 
         return false;
@@ -370,7 +428,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         }
     }
 
-    private bool ProcessOutgoingTcp(PacketView packet, IntPtr adapterHandle)
+    private bool ProcessOutgoingTcp(PacketView packet, IntPtr adapterHandle, uint dot1q)
     {
         var relayKey = new TcpRelayKey(
             adapterHandle,
@@ -426,7 +484,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             $"TCP APP MATCH {packet.Session} pid={process.ProcessId} name={process.Name} path={process.Path} pattern={matchedPattern}",
             $"tcp-app-match:{process.ProcessId}:{packet.DestinationAddress}:{packet.DestinationPort}",
             TimeSpan.FromSeconds(2));
-        var target = CreateTarget(adapterHandle, packet, process, matchedPattern);
+        var target = CreateTarget(adapterHandle, dot1q, packet, process, matchedPattern);
         var clientKey = new TcpClientKey(packet.SourceAddress, packet.SourcePort);
         _tcpRelay.RegisterSyn(relayKey, clientKey, target, packet.TcpSequenceNumber, packet.TcpWindow, _cancellationToken);
         _packetsRedirected++;
@@ -465,7 +523,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             packet.TcpOptions.ToArray());
     }
 
-    private bool ProcessOutgoingUdp(PacketView packet, IntPtr adapterHandle)
+    private bool ProcessOutgoingUdp(PacketView packet, IntPtr adapterHandle, uint dot1q)
     {
         var processInfo = _processLookup.LookupUdpOwner(packet.UdpEndpoint);
         var processName = processInfo?.Name ?? "unknown";
@@ -490,7 +548,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             return false;
         }
 
-        if (TryHandleDnsSpoof(adapterHandle, packet))
+        if (TryHandleDnsSpoof(adapterHandle, dot1q, packet))
         {
             return true;
         }
@@ -560,7 +618,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             $"UDP APP MATCH {packet.SourceAddress}:{packet.SourcePort} -> {packet.DestinationAddress}:{packet.DestinationPort} pid={process.ProcessId} name={process.Name} path={process.Path} pattern={matchedPattern}",
             $"udp-app-match:{process.ProcessId}:{packet.DestinationAddress}:{packet.DestinationPort}",
             TimeSpan.FromSeconds(2));
-        var target = CreateTarget(adapterHandle, packet, process, matchedPattern);
+        var target = CreateTarget(adapterHandle, dot1q, packet, process, matchedPattern);
         SendUdpClientToRemote(packet, relayKey, target);
         return true;
     }
@@ -617,7 +675,23 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 TaskScheduler.Default);
     }
 
-    private void InjectTcpSegmentToClient(DirectRelayTarget target, TcpSegment segment)
+    private bool IsUdpTargetCurrent(DirectRelayTarget target)
+    {
+        if (target.ClientAddress is null || target.ClientPort == 0)
+        {
+            return false;
+        }
+
+        var owner = _processLookup.LookupUdpOwner(
+            new UdpEndpointKey(target.ClientAddress, target.ClientPort),
+            forceRefresh: true);
+        return owner is not null
+            && owner.ProcessId == target.ProcessId
+            && owner.Name.Equals(target.ProcessName, StringComparison.OrdinalIgnoreCase)
+            && owner.Path.Equals(target.ProcessPath, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private bool InjectTcpSegmentToClient(DirectRelayTarget target, TcpSegment segment)
     {
         if (target.ClientAddress is null || target.ClientPort == 0)
         {
@@ -625,7 +699,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 $"TCP inject skipped because client endpoint is unknown app={target.AppLabel}",
                 $"tcp-inject-no-client:{target.ProcessId}:{target.RemoteEndpoint}",
                 TimeSpan.FromSeconds(2));
-            return;
+            return false;
         }
 
         if (target.AdapterHandle == IntPtr.Zero)
@@ -634,7 +708,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 $"TCP inject skipped because adapter is unknown app={target.AppLabel} appLocal={target.ClientEndpoint}",
                 $"tcp-inject-no-adapter:{target.ProcessId}:{target.ClientEndpoint}",
                 TimeSpan.FromSeconds(2));
-            return;
+            return false;
         }
 
         var clientAddress = NetworkAddress.Normalize(target.ClientAddress);
@@ -645,7 +719,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 $"TCP inject skipped because address families differ app={target.AppLabel} client={clientAddress} remote={remoteAddress}",
                 $"tcp-inject-family-mismatch:{target.ProcessId}:{target.ClientEndpoint}:{target.RemoteEndpoint}",
                 TimeSpan.FromSeconds(2));
-            return;
+            return false;
         }
 
         if (target.LinkHeader is not { Length: >= PacketView.EthernetHeaderLength }
@@ -656,7 +730,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 $"TCP inject skipped because ethernet addresses are unknown app={target.AppLabel} appLocal={target.ClientEndpoint}",
                 $"tcp-inject-no-ethernet:{target.ProcessId}:{target.ClientEndpoint}",
                 TimeSpan.FromSeconds(2));
-            return;
+            return false;
         }
 
         var payloadSpan = segment.Payload.Span;
@@ -667,7 +741,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 $"TCP inject skipped because options are invalid app={target.AppLabel} appLocal={target.ClientEndpoint} options={optionSpan.Length}",
                 $"tcp-inject-invalid-options:{target.ProcessId}:{target.ClientEndpoint}",
                 TimeSpan.FromSeconds(2));
-            return;
+            return false;
         }
 
         var linkHeaderLength = target.LinkHeader is { Length: >= PacketView.EthernetHeaderLength } linkHeader
@@ -682,12 +756,13 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 $"TCP inject skipped because packet is too large length={packetLength} app={target.AppLabel} appLocal={target.ClientEndpoint}",
                 $"tcp-inject-too-large:{target.ProcessId}:{target.ClientEndpoint}:{target.RemoteEndpoint}",
                 TimeSpan.FromSeconds(2));
-            return;
+            return false;
         }
 
         var buffer = default(NdisApi.IntermediateBuffer);
         buffer.AdapterOrListFlink = target.AdapterHandle;
         buffer.DeviceFlags = NdisApi.PacketFlagOnReceive;
+        buffer.Dot1q = target.Dot1q;
         buffer.Length = (uint)packetLength;
         var frame = new Span<byte>(buffer.Data, NdisApi.MaxEtherFrame);
         frame[..packetLength].Clear();
@@ -739,13 +814,14 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 $"TCP inject SendPacketToMstcp failed app={target.AppLabel} appLocal={target.ClientEndpoint} length={packetLength} win32={NdisApi.LastWin32Error}",
                 $"tcp-inject-send-failed:{target.ProcessId}:{target.ClientEndpoint}:{target.RemoteEndpoint}",
                 TimeSpan.FromSeconds(2));
-            return;
+            return false;
         }
 
         LogDetail(
             $"RESTORE TCP RECV flags={FormatTcpFlags(segment.Flags)} app={target.AppLabel} appLocal={target.ClientEndpoint} from={target.RemoteEndpoint} injectedBytes={payloadSpan.Length}",
             $"tcp-inject:{target.ProcessId}:{target.ClientEndpoint}:{target.RemoteEndpoint}:{segment.Flags}:{payloadSpan.Length > 0}",
             payloadSpan.Length > 0 ? TimeSpan.Zero : TimeSpan.FromSeconds(2));
+        return true;
     }
 
     private static void WriteInboundLinkHeader(
@@ -769,7 +845,10 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         target.InboundEthernetSource!.CopyTo(frame.Slice(6, 6));
     }
 
-    private void InjectUdpResponseToClient(DirectRelayTarget target, IPEndPoint remoteEndPoint, ReadOnlyMemory<byte> payload)
+    private bool InjectUdpResponseToClient(
+        DirectRelayTarget target,
+        IPEndPoint remoteEndPoint,
+        ReadOnlyMemory<byte> payload)
     {
         if (target.ClientAddress is null || target.ClientPort == 0)
         {
@@ -777,7 +856,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 $"UDP inject skipped because client endpoint is unknown app={target.AppLabel} from={remoteEndPoint}",
                 $"udp-inject-no-client:{target.ProcessId}:{remoteEndPoint}",
                 TimeSpan.FromSeconds(2));
-            return;
+            return false;
         }
 
         if (target.AdapterHandle == IntPtr.Zero)
@@ -786,7 +865,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 $"UDP inject skipped because adapter is unknown app={target.AppLabel} appLocal={target.ClientEndpoint} from={remoteEndPoint}",
                 $"udp-inject-no-adapter:{target.ProcessId}:{target.ClientEndpoint}:{remoteEndPoint}",
                 TimeSpan.FromSeconds(2));
-            return;
+            return false;
         }
 
         var clientAddress = NetworkAddress.Normalize(target.ClientAddress);
@@ -797,7 +876,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 $"UDP inject skipped because address families differ app={target.AppLabel} client={clientAddress} remote={remoteAddress}",
                 $"udp-inject-family-mismatch:{target.ProcessId}:{target.ClientEndpoint}:{remoteEndPoint}",
                 TimeSpan.FromSeconds(2));
-            return;
+            return false;
         }
 
         if (target.LinkHeader is not { Length: >= PacketView.EthernetHeaderLength }
@@ -808,7 +887,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 $"UDP inject skipped because ethernet addresses are unknown app={target.AppLabel} appLocal={target.ClientEndpoint} from={remoteEndPoint}",
                 $"udp-inject-no-ethernet:{target.ProcessId}:{target.ClientEndpoint}:{remoteEndPoint}",
                 TimeSpan.FromSeconds(2));
-            return;
+            return false;
         }
 
         var payloadSpan = payload.Span;
@@ -818,7 +897,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 $"UDP inject skipped because datagram is too large length={payloadSpan.Length} app={target.AppLabel} appLocal={target.ClientEndpoint}",
                 $"udp-inject-datagram-too-large:{target.ProcessId}:{target.ClientEndpoint}",
                 TimeSpan.FromSeconds(2));
-            return;
+            return false;
         }
 
         var linkHeaderLength = target.LinkHeader is { Length: >= PacketView.EthernetHeaderLength } linkHeader
@@ -833,7 +912,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
 
         if (payloadSpan.Length > maxDatagramDataLength)
         {
-            InjectFragmentedUdpResponse(
+            return InjectFragmentedUdpResponse(
                 target,
                 remoteEndPoint,
                 clientAddress,
@@ -842,13 +921,13 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 ipHeaderLength,
                 maxDatagramDataLength,
                 payloadSpan);
-            return;
         }
 
         var packetLength = linkHeaderLength + ipHeaderLength + 8 + payloadSpan.Length;
         var buffer = default(NdisApi.IntermediateBuffer);
         buffer.AdapterOrListFlink = target.AdapterHandle;
         buffer.DeviceFlags = NdisApi.PacketFlagOnReceive;
+        buffer.Dot1q = target.Dot1q;
         buffer.Length = (uint)packetLength;
         var frame = new Span<byte>(buffer.Data, NdisApi.MaxEtherFrame);
         frame[..packetLength].Clear();
@@ -876,13 +955,14 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 $"UDP inject SendPacketToMstcp failed app={target.AppLabel} appLocal={target.ClientEndpoint} from={remoteEndPoint} length={packetLength} win32={NdisApi.LastWin32Error}",
                 $"udp-inject-send-failed:{target.ProcessId}:{target.ClientEndpoint}:{remoteEndPoint}",
                 TimeSpan.FromSeconds(2));
-            return;
+            return false;
         }
 
         LogDetail(
             $"RESTORE UDP RECV app={target.AppLabel} appLocal={target.ClientEndpoint} from={remoteEndPoint} injectedBytes={payloadSpan.Length}",
             $"udp-inject:{target.ProcessId}:{target.ClientEndpoint}:{remoteEndPoint}",
             TimeSpan.FromSeconds(2));
+        return true;
     }
 
     private void InjectUdpErrorToClient(
@@ -954,6 +1034,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         var buffer = default(NdisApi.IntermediateBuffer);
         buffer.AdapterOrListFlink = target.AdapterHandle;
         buffer.DeviceFlags = NdisApi.PacketFlagOnReceive;
+        buffer.Dot1q = target.Dot1q;
         buffer.Length = (uint)packetLength;
         var frame = new Span<byte>(buffer.Data, NdisApi.MaxEtherFrame);
         frame[..packetLength].Clear();
@@ -983,7 +1064,13 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         }
 
         var request = CreateRequest(&buffer);
-        NdisApi.SendPacketToMstcp(_driverHandle, ref request);
+        if (!NdisApi.SendPacketToMstcp(_driverHandle, ref request))
+        {
+            LogDetail(
+                $"ICMP inject SendPacketToMstcp failed app={target.AppLabel} appLocal={target.ClientEndpoint} from={sourceAddress} win32={NdisApi.LastWin32Error}",
+                $"icmp-inject-send-failed:{target.ProcessId}:{target.ClientEndpoint}",
+                TimeSpan.FromSeconds(2));
+        }
     }
 
     private static byte[] BuildIpv4IcmpError(
@@ -1073,7 +1160,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         };
     }
 
-    private void InjectFragmentedUdpResponse(
+    private bool InjectFragmentedUdpResponse(
         DirectRelayTarget target,
         IPEndPoint remoteEndPoint,
         IPAddress clientAddress,
@@ -1084,6 +1171,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         ReadOnlySpan<byte> payload)
     {
         var udpDatagram = new byte[8 + payload.Length];
+        var success = true;
         BinaryPrimitives.WriteUInt16BigEndian(udpDatagram.AsSpan(0, 2), (ushort)remoteEndPoint.Port);
         BinaryPrimitives.WriteUInt16BigEndian(udpDatagram.AsSpan(2, 2), target.ClientPort);
         BinaryPrimitives.WriteUInt16BigEndian(udpDatagram.AsSpan(4, 2), checked((ushort)udpDatagram.Length));
@@ -1105,6 +1193,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 var buffer = default(NdisApi.IntermediateBuffer);
                 buffer.AdapterOrListFlink = target.AdapterHandle;
                 buffer.DeviceFlags = NdisApi.PacketFlagOnReceive;
+                buffer.Dot1q = target.Dot1q;
                 buffer.Length = (uint)packetLength;
                 var frame = new Span<byte>(buffer.Data, NdisApi.MaxEtherFrame);
                 frame[..packetLength].Clear();
@@ -1128,11 +1217,11 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 var ipChecksum = ComputeOnesComplement(ip);
                 BinaryPrimitives.WriteUInt16BigEndian(ip.Slice(10, 2), ipChecksum);
                 udpDatagram.AsSpan(offset, fragmentLength).CopyTo(ip.Slice(20));
-                SendInjectedUdpFragment(target, remoteEndPoint, &buffer);
+                success &= SendInjectedUdpFragment(target, remoteEndPoint, &buffer);
                 offset += fragmentLength;
             }
 
-            return;
+            return success;
         }
 
         var maxIpv6FragmentData = Math.Max(8, (maxDatagramDataLength - 8) & ~7);
@@ -1149,6 +1238,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             var buffer = default(NdisApi.IntermediateBuffer);
             buffer.AdapterOrListFlink = target.AdapterHandle;
             buffer.DeviceFlags = NdisApi.PacketFlagOnReceive;
+            buffer.Dot1q = target.Dot1q;
             buffer.Length = (uint)packetLength;
             var frame = new Span<byte>(buffer.Data, NdisApi.MaxEtherFrame);
             frame[..packetLength].Clear();
@@ -1172,12 +1262,14 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 (ushort)(((ipv6Offset / 8) << 3) | (ipv6MoreFragments ? 1 : 0)));
             BinaryPrimitives.WriteUInt32BigEndian(fragment.Slice(4, 4), ipv6Identification);
             udpDatagram.AsSpan(ipv6Offset, fragmentLength).CopyTo(frame.Slice(linkHeaderLength + 48));
-            SendInjectedUdpFragment(target, remoteEndPoint, &buffer);
+            success &= SendInjectedUdpFragment(target, remoteEndPoint, &buffer);
             ipv6Offset += fragmentLength;
         }
+
+        return success;
     }
 
-    private void SendInjectedUdpFragment(
+    private bool SendInjectedUdpFragment(
         DirectRelayTarget target,
         IPEndPoint remoteEndPoint,
         NdisApi.IntermediateBuffer* buffer)
@@ -1189,7 +1281,10 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 $"UDP fragment SendPacketToMstcp failed app={target.AppLabel} appLocal={target.ClientEndpoint} from={remoteEndPoint} length={buffer->Length} win32={NdisApi.LastWin32Error}",
                 $"udp-fragment-send-failed:{target.ProcessId}:{target.ClientEndpoint}:{remoteEndPoint}",
                 TimeSpan.FromSeconds(2));
+            return false;
         }
+
+        return true;
     }
 
     private static void BuildIpv4UdpPacket(Span<byte> packet, IPAddress sourceAddress, IPAddress destinationAddress, ushort sourcePort, ushort destinationPort, ReadOnlySpan<byte> payload)
@@ -1376,8 +1471,19 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         return (ushort)~sum;
     }
 
-    private DirectRelayTarget CreateTarget(IntPtr adapterHandle, PacketView packet, ProcessInfo process, string? matchedPattern)
+    private DirectRelayTarget CreateTarget(
+        IntPtr adapterHandle,
+        uint dot1q,
+        PacketView packet,
+        ProcessInfo process,
+        string? matchedPattern)
     {
+        var adapterMtu = _adapterMtus.TryGetValue(adapterHandle, out var configuredMtu)
+            ? configuredMtu
+            : 1500;
+        var interfaceIndex = _adapterInterfaceIndices.TryGetValue(adapterHandle, out var configuredIndex)
+            ? configuredIndex
+            : 0;
         return new DirectRelayTarget(
             packet.DestinationAddress,
             packet.DestinationPort,
@@ -1391,7 +1497,10 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             adapterHandle,
             packet.GetLinkHeader(),
             packet.GetEthernetDestination(),
-            packet.GetEthernetSource());
+            packet.GetEthernetSource(),
+            adapterMtu,
+            dot1q,
+            interfaceIndex);
     }
 
     private void LogAppConnection(string protocol, PacketView packet, ProcessInfo process, string? matchedPattern)
@@ -1548,7 +1657,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         }
     }
 
-    private bool TryHandleDnsSpoof(IntPtr adapterHandle, PacketView packet)
+    private bool TryHandleDnsSpoof(IntPtr adapterHandle, uint dot1q, PacketView packet)
     {
         if (!_configuration.Current.EnableFakeIpWhitelist)
         {
@@ -1666,13 +1775,13 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             }
 
             // 1. Send the response with the original queried port to satisfy the client application
-            InjectUdpResponse(adapterHandle, packet, packet.DestinationPort, dnsResponse);
+            InjectUdpResponse(adapterHandle, dot1q, packet, packet.DestinationPort, dnsResponse);
 
             // 2. If the query came from a non-standard port (like 5353), also inject a response with source port 53 
             // to trigger Leigod's WFP driver to whitelist the IP
             if (packet.DestinationPort != 53)
             {
-                InjectUdpResponse(adapterHandle, packet, 53, dnsResponse);
+                InjectUdpResponse(adapterHandle, dot1q, packet, 53, dnsResponse);
             }
 
             var processInfoStr = process != null ? $"process={process.Name} pid={process.ProcessId}" : "process=unknown";
@@ -1683,7 +1792,12 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         return false;
     }
 
-    private void InjectUdpResponse(IntPtr adapterHandle, PacketView originalQuery, ushort sourcePort, ReadOnlySpan<byte> dnsPayload)
+    private void InjectUdpResponse(
+        IntPtr adapterHandle,
+        uint dot1q,
+        PacketView originalQuery,
+        ushort sourcePort,
+        ReadOnlySpan<byte> dnsPayload)
     {
         var target = new DirectRelayTarget(
             originalQuery.DestinationAddress,
@@ -1694,7 +1808,8 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             ClientPort: originalQuery.SourcePort,
             LinkHeader: originalQuery.GetLinkHeader(),
             InboundEthernetSource: originalQuery.GetEthernetDestination(),
-            InboundEthernetDestination: originalQuery.GetEthernetSource());
+            InboundEthernetDestination: originalQuery.GetEthernetSource(),
+            Dot1q: dot1q);
         InjectUdpResponseToClient(
             target,
             new IPEndPoint(originalQuery.DestinationAddress, sourcePort),

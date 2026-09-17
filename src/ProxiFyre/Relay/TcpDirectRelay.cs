@@ -30,10 +30,9 @@ internal sealed class TcpDirectRelay : IDisposable
     private static readonly TimeSpan MaxRetransmissionTimeout = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan ConnectTimeout = TimeSpan.FromSeconds(15);
     private static readonly TimeSpan MaintenanceInterval = TimeSpan.FromMilliseconds(200);
-    private static readonly TimeSpan BypassFlowTtl = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan BypassFlowTtl = TimeSpan.FromSeconds(30);
 
-    private readonly ConcurrentDictionary<TcpClientKey, TcpRelayConnection> _connections = new();
-    private readonly ConcurrentDictionary<TcpRelayKey, TcpClientKey> _clientsByFlow = new();
+    private readonly ConcurrentDictionary<TcpRelayKey, TcpRelayConnection> _connections = new();
     private readonly ConcurrentDictionary<TcpRelayKey, byte> _relayOutboundFlows = new();
     private readonly ConcurrentDictionary<TcpRelayKey, DateTimeOffset> _bypassedFlows = new();
     private readonly Action<string> _log;
@@ -43,7 +42,7 @@ internal sealed class TcpDirectRelay : IDisposable
     private readonly TimeProvider _timeProvider;
     private CancellationToken _cancellationToken;
     private Task? _maintenanceTask;
-    private Action<DirectRelayTarget, TcpSegment>? _packetInjector;
+    private Func<DirectRelayTarget, TcpSegment, bool>? _packetInjector;
     private Action<RelayOutboundFlow>? _outboundBypassRegister;
     private Action<RelayOutboundFlow>? _outboundBypassUnregister;
 
@@ -61,7 +60,7 @@ internal sealed class TcpDirectRelay : IDisposable
         _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
-    public void SetPacketInjector(Action<DirectRelayTarget, TcpSegment> packetInjector)
+    public void SetPacketInjector(Func<DirectRelayTarget, TcpSegment, bool> packetInjector)
     {
         _packetInjector = packetInjector;
     }
@@ -89,7 +88,7 @@ internal sealed class TcpDirectRelay : IDisposable
         ushort clientWindow,
         CancellationToken cancellationToken)
     {
-        if (_connections.TryGetValue(clientKey, out var existingConnection))
+        if (_connections.TryGetValue(flowKey, out var existingConnection))
         {
             existingConnection.MarkSynRetransmitted();
             return existingConnection;
@@ -113,31 +112,23 @@ internal sealed class TcpDirectRelay : IDisposable
             _timeProvider,
             cancellationToken);
 
-        if (!_connections.TryAdd(clientKey, connection))
+        if (!_connections.TryAdd(flowKey, connection))
         {
             connection.DisposeWithoutRemoving();
-            if (_connections.TryGetValue(clientKey, out var existing))
+            if (_connections.TryGetValue(flowKey, out var existing))
             {
                 existing.MarkSynRetransmitted();
                 return existing;
             }
         }
 
-        _clientsByFlow[flowKey] = clientKey;
         _ = connection.StartAsync();
         return connection;
     }
 
     public bool TryGetConnection(TcpRelayKey flowKey, out TcpRelayConnection connection)
     {
-        connection = default!;
-        return _clientsByFlow.TryGetValue(flowKey, out var clientKey)
-            && _connections.TryGetValue(clientKey, out connection!);
-    }
-
-    public bool TryGetConnection(TcpClientKey clientKey, out TcpRelayConnection connection)
-    {
-        return _connections.TryGetValue(clientKey, out connection!);
+        return _connections.TryGetValue(flowKey, out connection!);
     }
 
     public bool IsRelayOutboundFlow(TcpRelayKey flowKey)
@@ -179,11 +170,10 @@ internal sealed class TcpDirectRelay : IDisposable
         return false;
     }
 
-    public void Remove(TcpClientKey clientKey)
+    public void Remove(TcpRelayKey flowKey)
     {
-        if (_connections.TryRemove(clientKey, out var connection))
+        if (_connections.TryRemove(flowKey, out var connection))
         {
-            _clientsByFlow.TryRemove(connection.FlowKey, out _);
             connection.Dispose();
         }
     }
@@ -236,9 +226,9 @@ internal sealed class TcpDirectRelay : IDisposable
             foreach (var connection in _connections.Values)
             {
                 connection.Maintain(now);
-                if (connection.IsClosed)
+                if (connection.CanBeRemoved)
                 {
-                    Remove(connection.ClientKey);
+                    Remove(connection.FlowKey);
                 }
             }
 
@@ -260,7 +250,6 @@ internal sealed class TcpDirectRelay : IDisposable
         }
 
         _connections.Clear();
-        _clientsByFlow.Clear();
         _relayOutboundFlows.Clear();
         _bypassedFlows.Clear();
     }
@@ -277,10 +266,10 @@ internal sealed class TcpDirectRelay : IDisposable
         private readonly DirectRelayTarget _target;
         private readonly TrafficCounter _trafficCounter;
         private readonly PacketWakeSignal? _packetWakeSignal;
-        private readonly Action<DirectRelayTarget, TcpSegment>? _packetInjector;
+        private readonly Func<DirectRelayTarget, TcpSegment, bool>? _packetInjector;
         private readonly Action<RelayOutboundFlow> _registerOutboundFlow;
         private readonly Action<RelayOutboundFlow> _unregisterOutboundFlow;
-        private readonly Action<TcpClientKey> _remove;
+        private readonly Action<TcpRelayKey> _remove;
         private readonly Action<string>? _detailLog;
         private readonly Action<string> _errorLog;
         private readonly TimeProvider _timeProvider;
@@ -316,6 +305,8 @@ internal sealed class TcpDirectRelay : IDisposable
         private bool _remoteFinAcknowledged;
         private bool _clientFinReceived;
         private bool _closed;
+        private bool _resourcesDisposed;
+        private bool _failureScheduled;
         private DateTimeOffset _createdAt;
         private DateTimeOffset _lastActivity;
         private TimeSpan _retransmissionTimeout = InitialRetransmissionTimeout;
@@ -329,10 +320,10 @@ internal sealed class TcpDirectRelay : IDisposable
             uint remoteInitialSequence,
             TrafficCounter trafficCounter,
             PacketWakeSignal? packetWakeSignal,
-            Action<DirectRelayTarget, TcpSegment>? packetInjector,
+            Func<DirectRelayTarget, TcpSegment, bool>? packetInjector,
             Action<RelayOutboundFlow> registerOutboundFlow,
             Action<RelayOutboundFlow> unregisterOutboundFlow,
-            Action<TcpClientKey> _remove,
+            Action<TcpRelayKey> _remove,
             Action<string>? detailLog,
             Action<string> errorLog,
             TimeProvider timeProvider,
@@ -378,6 +369,17 @@ internal sealed class TcpDirectRelay : IDisposable
             }
         }
 
+        public bool CanBeRemoved
+        {
+            get
+            {
+                lock (_sync)
+                {
+                    return _closed && !_failureScheduled;
+                }
+            }
+        }
+
         public async Task StartAsync()
         {
             try
@@ -400,10 +402,16 @@ internal sealed class TcpDirectRelay : IDisposable
 
                     _socket = socket;
                     _connectedFlag = true;
+                    RegisterOutboundFlow(remoteEndPoint, socket);
                 }
 
-                RegisterOutboundFlow(remoteEndPoint, socket);
-                _connected.TrySetResult(true);
+                if (!_connected.TrySetResult(true))
+                {
+                    socket.Dispose();
+                    ClearOutboundFlows();
+                    return;
+                }
+
                 QueueSynAck();
 
                 _writerTask = WriterLoopAsync();
@@ -437,6 +445,7 @@ internal sealed class TcpDirectRelay : IDisposable
             bool closeWithoutReset = false;
             bool sendAck = false;
             bool signalWindow = false;
+            bool closeAfterAck = false;
 
             lock (_sync)
             {
@@ -462,7 +471,7 @@ internal sealed class TcpDirectRelay : IDisposable
 
                     if (!ProcessAckLocked(segment))
                     {
-                        FailLocked();
+                        FailLocked("DIRECT TCP relay received an invalid acknowledgement.");
                         closeWithoutReset = false;
                         sendAck = false;
                     }
@@ -483,7 +492,7 @@ internal sealed class TcpDirectRelay : IDisposable
 
                         TryConsumePendingFinLocked();
                         TrySendQueuedToClientLocked();
-                        TryCompleteCloseLocked();
+                        closeAfterAck = TryCompleteCloseLocked();
                         sendAck = true;
                     }
                 }
@@ -503,6 +512,11 @@ internal sealed class TcpDirectRelay : IDisposable
             if (sendAck)
             {
                 InjectClientAcknowledgement();
+            }
+
+            if (closeAfterAck)
+            {
+                CloseClient(injectReset: false);
             }
         }
 
@@ -641,23 +655,24 @@ internal sealed class TcpDirectRelay : IDisposable
             ushort urgentPointer,
             bool urgent)
         {
-            if (_outOfOrder.TryGetValue(sequence, out var existing)
-                && existing.Payload.Length >= payload.Length)
+            _outOfOrder.TryGetValue(sequence, out var existing);
+            if (existing is not null && existing.Payload.Length >= payload.Length)
             {
                 return;
             }
 
-            if (existing is not null)
-            {
-                _outOfOrderBytes -= existing.Payload.Length;
-            }
-
-            if (_outOfOrderBytes + payload.Length > MaxOutOfOrderBytes)
+            var existingLength = existing?.Payload.Length ?? 0;
+            if (_outOfOrderBytes - existingLength + payload.Length > MaxOutOfOrderBytes)
             {
                 return;
             }
 
             var copy = payload.ToArray();
+            if (existing is not null)
+            {
+                _outOfOrderBytes -= existingLength;
+            }
+
             _outOfOrder[sequence] = new PendingClientData(sequence, copy, urgentPointer, urgent);
             _outOfOrderBytes += copy.Length;
         }
@@ -868,7 +883,8 @@ internal sealed class TcpDirectRelay : IDisposable
 
         private async Task ReceiveRemoteLoopAsync()
         {
-            var buffer = new byte[MaxTcpPayload];
+            var maxPayload = GetMaxTcpPayload();
+            var buffer = new byte[maxPayload];
             try
             {
                 await _connected.Task.WaitAsync(_cts.Token).ConfigureAwait(false);
@@ -894,7 +910,7 @@ internal sealed class TcpDirectRelay : IDisposable
                         }
                         else
                         {
-                            readSize = (int)Math.Min(MaxTcpPayload, available);
+                            readSize = (int)Math.Min(maxPayload, available);
                         }
                     }
 
@@ -1046,13 +1062,13 @@ internal sealed class TcpDirectRelay : IDisposable
         {
             if (_packetInjector is null)
             {
-                FailLocked();
+                FailLocked("DIRECT TCP relay has no packet injector.");
                 return;
             }
 
             try
             {
-                _packetInjector(
+                var injected = _packetInjector(
                     _target,
                     outbound.Segment with
                     {
@@ -1060,18 +1076,24 @@ internal sealed class TcpDirectRelay : IDisposable
                         AcknowledgmentNumber = (uint)_clientAcknowledged,
                         Window = GetClientFacingWindowLocked()
                     });
+                if (!injected)
+                {
+                    FailLocked("DIRECT TCP packet injection was rejected.");
+                    return;
+                }
+
                 outbound.Sent = true;
                 outbound.Attempts++;
                 outbound.LastSent = _timeProvider.GetUtcNow();
                 if (outbound.Attempts > MaxRetransmissionAttempts)
                 {
-                    FailLocked();
+                    FailLocked("DIRECT TCP relay exceeded the retransmission limit.");
                 }
             }
             catch (Exception ex)
             {
                 _errorLog($"DIRECT TCP inject failed app={_target.AppLabel} client={_clientKey.ClientAddress}:{_clientKey.ClientPort} target={_target.RemoteEndpoint}: {ex.Message}");
-                FailLocked();
+                FailLocked($"DIRECT TCP inject failed: {ex.Message}");
             }
         }
 
@@ -1094,12 +1116,15 @@ internal sealed class TcpDirectRelay : IDisposable
                     ReadOnlyMemory<byte>.Empty);
                 try
                 {
-                    _packetInjector(_target, segment);
+                    if (!_packetInjector(_target, segment))
+                    {
+                        FailLocked("DIRECT TCP acknowledgement injection was rejected.");
+                    }
                 }
                 catch (Exception ex)
                 {
                     _errorLog($"DIRECT TCP acknowledgement inject failed app={_target.AppLabel}: {ex.Message}");
-                    FailLocked();
+                    FailLocked($"DIRECT TCP acknowledgement inject failed: {ex.Message}");
                 }
             }
         }
@@ -1134,7 +1159,7 @@ internal sealed class TcpDirectRelay : IDisposable
                     return;
                 }
 
-                var mss = (ushort)(_target.RemoteAddress.AddressFamily == AddressFamily.InterNetwork ? 1460 : 1440);
+                var mss = (ushort)Math.Clamp(GetMaxTcpPayload(), 536, ushort.MaxValue);
                 var options = new byte[]
                 {
                     2,
@@ -1284,11 +1309,12 @@ internal sealed class TcpDirectRelay : IDisposable
             TcpSegment segment = default;
             lock (_sync)
             {
-                if (_closed)
+                if (_resourcesDisposed)
                 {
                     return;
                 }
 
+                _closed = true;
                 injectReset = true;
                 segment = new TcpSegment(
                     (uint)_remoteSendNext,
@@ -1298,14 +1324,13 @@ internal sealed class TcpDirectRelay : IDisposable
                     0,
                     ReadOnlyMemory<byte>.Empty,
                     ReadOnlyMemory<byte>.Empty);
-                _closed = true;
             }
 
             if (injectReset && _packetInjector is not null)
             {
                 try
                 {
-                    _packetInjector(_target, segment);
+                    _ = _packetInjector(_target, segment);
                 }
                 catch
                 {
@@ -1315,9 +1340,16 @@ internal sealed class TcpDirectRelay : IDisposable
             DisposeResources();
         }
 
-        private void FailLocked()
+        private void FailLocked(string message)
         {
             _closed = true;
+            if (_failureScheduled)
+            {
+                return;
+            }
+
+            _failureScheduled = true;
+            _ = Task.Run(() => FailClient(message));
         }
 
         private void CloseClient(bool injectReset)
@@ -1325,7 +1357,7 @@ internal sealed class TcpDirectRelay : IDisposable
             TcpSegment reset = default;
             lock (_sync)
             {
-                if (_closed)
+                if (_resourcesDisposed)
                 {
                     return;
                 }
@@ -1348,7 +1380,7 @@ internal sealed class TcpDirectRelay : IDisposable
             {
                 try
                 {
-                    _packetInjector(_target, reset);
+                    _ = _packetInjector(_target, reset);
                 }
                 catch
                 {
@@ -1360,6 +1392,16 @@ internal sealed class TcpDirectRelay : IDisposable
 
         private void DisposeResources(bool removeConnection = true)
         {
+            lock (_sync)
+            {
+                if (_resourcesDisposed)
+                {
+                    return;
+                }
+
+                _resourcesDisposed = true;
+            }
+
             ClearOutboundFlows();
             _connected.TrySetCanceled();
             _handshakeAcknowledged.TrySetCanceled();
@@ -1370,7 +1412,7 @@ internal sealed class TcpDirectRelay : IDisposable
             Pulse(_windowChanged);
             if (removeConnection)
             {
-                _remove(_clientKey);
+                _remove(_flowKey);
             }
         }
 
@@ -1386,6 +1428,11 @@ internal sealed class TcpDirectRelay : IDisposable
         {
             lock (_sync)
             {
+                if (_resourcesDisposed)
+                {
+                    return;
+                }
+
                 _closed = true;
             }
 
@@ -1440,6 +1487,12 @@ internal sealed class TcpDirectRelay : IDisposable
             catch (ObjectDisposedException)
             {
             }
+        }
+
+        private int GetMaxTcpPayload()
+        {
+            var ipHeaderLength = _target.RemoteAddress.AddressFamily == AddressFamily.InterNetwork ? 20 : 40;
+            return Math.Clamp(_target.AdapterMtu - ipHeaderLength - 20, 536, MaxTcpPayload);
         }
 
         private sealed class PendingClientData(

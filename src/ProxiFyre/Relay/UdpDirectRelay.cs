@@ -9,6 +9,7 @@ internal sealed class UdpDirectRelay : IDisposable
 {
     private static readonly TimeSpan TargetTtl = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan CleanupInterval = TimeSpan.FromSeconds(30);
+    private const int MaxFlows = 4096;
 
     private readonly ConcurrentDictionary<UdpRelayKey, DirectRelayTarget> _targets = new();
     private readonly ConcurrentDictionary<UdpRelayKey, Lazy<UdpRelaySocket>> _sockets = new();
@@ -18,7 +19,8 @@ internal sealed class UdpDirectRelay : IDisposable
     private readonly TrafficCounter _trafficCounter;
     private readonly PacketWakeSignal? _packetWakeSignal;
     private readonly TimeProvider _timeProvider;
-    private Action<DirectRelayTarget, IPEndPoint, ReadOnlyMemory<byte>>? _responseInjector;
+    private Func<DirectRelayTarget, IPEndPoint, ReadOnlyMemory<byte>, bool>? _responseInjector;
+    private Func<DirectRelayTarget, bool>? _responseValidator;
     private Action<DirectRelayTarget, IPEndPoint, ReadOnlyMemory<byte>, SocketError>? _errorInjector;
     private Action<RelayOutboundFlow>? _outboundBypassRegister;
     private Action<RelayOutboundFlow>? _outboundBypassUnregister;
@@ -38,7 +40,8 @@ internal sealed class UdpDirectRelay : IDisposable
         _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
-    public void SetResponseInjector(Action<DirectRelayTarget, IPEndPoint, ReadOnlyMemory<byte>> responseInjector)
+    public void SetResponseInjector(
+        Func<DirectRelayTarget, IPEndPoint, ReadOnlyMemory<byte>, bool> responseInjector)
     {
         _responseInjector = responseInjector;
     }
@@ -47,6 +50,11 @@ internal sealed class UdpDirectRelay : IDisposable
         Action<DirectRelayTarget, IPEndPoint, ReadOnlyMemory<byte>, SocketError> errorInjector)
     {
         _errorInjector = errorInjector;
+    }
+
+    public void SetResponseValidator(Func<DirectRelayTarget, bool> responseValidator)
+    {
+        _responseValidator = responseValidator;
     }
 
     public void SetOutboundBypass(
@@ -76,8 +84,10 @@ internal sealed class UdpDirectRelay : IDisposable
             return false;
         }
 
-        _targets[key] = target with { CreatedAt = _timeProvider.GetUtcNow() };
-        return true;
+        return _targets.TryUpdate(
+            key,
+            target with { CreatedAt = _timeProvider.GetUtcNow() },
+            target);
     }
 
     public bool TryGetTarget(UdpRelayKey key, out DirectRelayTarget target)
@@ -106,10 +116,27 @@ internal sealed class UdpDirectRelay : IDisposable
     public void Remove(UdpRelayKey key)
     {
         _targets.TryRemove(key, out _);
-        if (_sockets.TryRemove(key, out var socket) && socket.IsValueCreated)
+        if (!_sockets.TryRemove(key, out var socket))
+        {
+            return;
+        }
+
+        if (socket.IsValueCreated)
         {
             socket.Value.Dispose();
+            return;
         }
+
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                socket.Value.Dispose();
+            }
+            catch
+            {
+            }
+        });
     }
 
     public async Task SendToRemoteAsync(
@@ -120,6 +147,11 @@ internal sealed class UdpDirectRelay : IDisposable
         ushort remotePort)
     {
         Register(key, target);
+        if (!_sockets.ContainsKey(key) && _sockets.Count >= MaxFlows)
+        {
+            throw new InvalidOperationException("UDP relay flow limit reached.");
+        }
+
         var relaySocket = GetOrCreateSocket(key, target);
         await relaySocket.SendToRemoteAsync(
             payload,
@@ -238,6 +270,7 @@ internal sealed class UdpDirectRelay : IDisposable
             _trafficCounter,
             _packetWakeSignal,
             _responseInjector,
+            _responseValidator,
             _errorInjector,
             _detailedLogging ? LogDetail : null,
             _log,
@@ -313,7 +346,8 @@ internal sealed class UdpDirectRelay : IDisposable
         private readonly Action<RelayOutboundFlow>? _outboundBypassUnregister;
         private readonly TrafficCounter _trafficCounter;
         private readonly PacketWakeSignal? _packetWakeSignal;
-        private readonly Action<DirectRelayTarget, IPEndPoint, ReadOnlyMemory<byte>>? _responseInjector;
+        private readonly Func<DirectRelayTarget, IPEndPoint, ReadOnlyMemory<byte>, bool>? _responseInjector;
+        private readonly Func<DirectRelayTarget, bool>? _responseValidator;
         private readonly Action<DirectRelayTarget, IPEndPoint, ReadOnlyMemory<byte>, SocketError>? _errorInjector;
         private readonly Action<string>? _detailLog;
         private readonly Action<string> _errorLog;
@@ -341,7 +375,8 @@ internal sealed class UdpDirectRelay : IDisposable
             Action<RelayOutboundFlow>? outboundBypassUnregister,
             TrafficCounter trafficCounter,
             PacketWakeSignal? packetWakeSignal,
-            Action<DirectRelayTarget, IPEndPoint, ReadOnlyMemory<byte>>? responseInjector,
+            Func<DirectRelayTarget, IPEndPoint, ReadOnlyMemory<byte>, bool>? responseInjector,
+            Func<DirectRelayTarget, bool>? responseValidator,
             Action<DirectRelayTarget, IPEndPoint, ReadOnlyMemory<byte>, SocketError>? errorInjector,
             Action<string>? detailLog,
             Action<string> errorLog,
@@ -359,6 +394,7 @@ internal sealed class UdpDirectRelay : IDisposable
             _trafficCounter = trafficCounter;
             _packetWakeSignal = packetWakeSignal;
             _responseInjector = responseInjector;
+            _responseValidator = responseValidator;
             _errorInjector = errorInjector;
             _detailLog = detailLog;
             _errorLog = errorLog;
@@ -477,6 +513,13 @@ internal sealed class UdpDirectRelay : IDisposable
                     continue;
                 }
 
+                if (!IsAllowedResponseSource(remoteEndPoint))
+                {
+                    _detailLog?.Invoke(
+                        $"DIRECT UDP ignored response from unexpected endpoint app={_target.AppLabel} expected={_remoteEndPoint} actual={remoteEndPoint}");
+                    continue;
+                }
+
                 _lastActivity = _timeProvider.GetUtcNow();
                 _refreshTarget();
                 _remoteEndPoint = remoteEndPoint;
@@ -490,11 +533,35 @@ internal sealed class UdpDirectRelay : IDisposable
                     return;
                 }
 
+                if (_responseValidator is not null && !_responseValidator(_target))
+                {
+                    _errorLog($"UDP relay response owner is no longer valid for app={_target.AppLabel} appLocal={_target.ClientEndpoint} from={remoteEndPoint}.");
+                    _remove(_key);
+                    return;
+                }
+
                 var payload = buffer.AsMemory(0, result.ReceivedBytes).ToArray();
-                _responseInjector(_target, remoteEndPoint, payload);
+                if (!_responseInjector(_target, remoteEndPoint, payload))
+                {
+                    _errorLog($"UDP relay response injection failed for app={_target.AppLabel} appLocal={_target.ClientEndpoint} from={remoteEndPoint}.");
+                    _remove(_key);
+                    return;
+                }
+
                 _packetWakeSignal?.Pulse();
                 LogStats("RECV");
             }
+        }
+
+        private bool IsAllowedResponseSource(IPEndPoint remoteEndPoint)
+        {
+            if (remoteEndPoint.Equals(_remoteEndPoint))
+            {
+                return true;
+            }
+
+            return remoteEndPoint.Address.Equals(_remoteEndPoint.Address)
+                && remoteEndPoint.Port != 0;
         }
 
         private void LogStats(string direction)

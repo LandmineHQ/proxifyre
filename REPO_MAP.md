@@ -218,7 +218,7 @@ process threads. Candidate ordering then uses PID.
 
 | Path | Responsibility |
 | --- | --- |
-| `NdisApi.cs` | Managed `NDISRD` wrapper. Opens the kernel device, issues `DeviceIoControl` requests, reads one packet at a time, sends packets to MSTCP or the adapter, manages adapter mode/events and MTUs, resets queues, and builds source/destination-aware outbound bypass filters. |
+| `NdisApi.cs` | Managed `NDISRD` wrapper. Opens the kernel device, issues `DeviceIoControl` requests, reads one packet at a time, sends packets to MSTCP or the adapter, manages adapter mode/events, MTUs, and VLAN metadata, resets queues, and builds adapter/source/destination-aware outbound bypass filters. |
 
 Key native constants and structures include `IntermediateBuffer`,
 `EthRequest`, `AdapterMode`, `StaticFilter`, and `TcpAdapterList`. The current
@@ -255,7 +255,7 @@ one packet per call.
 | Path | Responsibility |
 | --- | --- |
 | `RelayService.cs` | Owns relay lifetime and task supervision. Starts/stops the packet loop and TCP/UDP relays, watches configuration changes, reports one-second traffic snapshots, and propagates unexpected filter failure. |
-| `TcpDirectRelay.cs` | Tracks TCP connections by adapter and four-tuple; connects outbound sockets; handles random ISN/MSS negotiation, long-unwrapped sequencing, retransmission, ACK processing, client windows, bounded out-of-order data, SYN payload bypass, urgent data best effort, half-close/FIN/RST, pending writes, SNI probing, bypass registration, and maintenance cleanup. |
+| `TcpDirectRelay.cs` | Tracks TCP connections by adapter and full four-tuple; connects outbound sockets; handles random ISN/MSS negotiation using the adapter MTU, long-unwrapped sequencing, retransmission, ACK processing, client windows, bounded out-of-order data, SYN payload bypass, urgent data best effort, half-close/FIN/RST, pending writes, deterministic failure cleanup, SNI probing, bypass registration, and maintenance cleanup. |
 | `UdpDirectRelay.cs` | Tracks one unconnected outbound UDP socket per adapter/four-tuple; handles bind fallback, owner/process validation, alternate response endpoints, broadcast/multicast pass-through, wildcard bypass ownership, DTLS SNI probing, ICMP error callbacks, response injection callbacks, traffic counters, and activity-based cleanup. |
 | `TrafficCounter.cs` | Thread-safe cumulative upload/download counters and current-rate snapshot calculation. |
 
@@ -500,6 +500,8 @@ integration and regression harness.
 - Non-Ethernet link-layer media and IPv6 jumbograms are not modeled.
 - Remote TCP urgent data is best effort because the managed socket API does not
   expose urgent pointer metadata symmetrically.
+- UDP alternate responses are accepted from the same remote address with a
+  changed source port; cross-address endpoint migration is rejected.
 - The NDIS wrapper reads one packet per unsorted-read call.
 - The maximum Ethernet frame handled by packet construction is 1514 bytes;
   larger UDP datagrams are split into IP fragments up to adapter MTU limits.

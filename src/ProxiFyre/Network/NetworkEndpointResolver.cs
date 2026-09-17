@@ -13,7 +13,10 @@ internal static class NetworkEndpointResolver
             return null;
         }
 
-        var address = AddScopeIfNeeded(NetworkAddress.Normalize(target.ClientAddress), target.ClientAddress);
+        var address = AddScopeIfNeeded(
+            NetworkAddress.Normalize(target.ClientAddress),
+            target.ClientAddress,
+            target.InterfaceIndex);
         if (IPAddress.IsLoopback(address) || address.Equals(IPAddress.Any) || address.Equals(IPAddress.IPv6Any))
         {
             return null;
@@ -24,13 +27,18 @@ internal static class NetworkEndpointResolver
 
     public static IPEndPoint CreateRemoteEndPoint(DirectRelayTarget target)
     {
-        var remoteAddress = ResolveRemoteAddress(target.RemoteAddress, target.ClientAddress);
+        var remoteAddress = ResolveRemoteAddress(
+            target.RemoteAddress,
+            target.ClientAddress,
+            target.InterfaceIndex);
         return new IPEndPoint(remoteAddress, target.RemotePort);
     }
 
     public static IPEndPoint CreateRemoteEndPoint(DirectRelayTarget target, IPAddress remoteAddress, ushort remotePort)
     {
-        return new IPEndPoint(ResolveRemoteAddress(remoteAddress, target.ClientAddress), remotePort);
+        return new IPEndPoint(
+            ResolveRemoteAddress(remoteAddress, target.ClientAddress, target.InterfaceIndex),
+            remotePort);
     }
 
     public static IPEndPoint CreateAnyEndPoint(AddressFamily addressFamily)
@@ -40,7 +48,10 @@ internal static class NetworkEndpointResolver
             : new IPEndPoint(IPAddress.IPv6Any, 0);
     }
 
-    private static IPAddress ResolveRemoteAddress(IPAddress remoteAddress, IPAddress? clientAddress)
+    private static IPAddress ResolveRemoteAddress(
+        IPAddress remoteAddress,
+        IPAddress? clientAddress,
+        int interfaceIndex)
     {
         remoteAddress = NetworkAddress.Normalize(remoteAddress);
         if (remoteAddress.AddressFamily != AddressFamily.InterNetworkV6)
@@ -48,17 +59,22 @@ internal static class NetworkEndpointResolver
             return remoteAddress;
         }
 
-        return AddScopeIfNeeded(remoteAddress, clientAddress);
+        return AddScopeIfNeeded(remoteAddress, clientAddress, interfaceIndex);
     }
 
-    private static IPAddress AddScopeIfNeeded(IPAddress address, IPAddress? scopeSource)
+    private static IPAddress AddScopeIfNeeded(
+        IPAddress address,
+        IPAddress? scopeSource,
+        int interfaceIndex)
     {
         if (address.AddressFamily != AddressFamily.InterNetworkV6 || address.ScopeId != 0 || !NeedsScopeId(address))
         {
             return address;
         }
 
-        var scopeId = FindScopeId(scopeSource) ?? FindScopeId(address);
+        var scopeId = interfaceIndex > 0
+            ? interfaceIndex
+            : FindScopeId(scopeSource) ?? FindScopeId(address);
         return scopeId is > 0
             ? new IPAddress(address.GetAddressBytes(), scopeId.Value)
             : address;

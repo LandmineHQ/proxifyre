@@ -16,12 +16,14 @@ internal sealed class CapturedPacketFragment(
     byte[] frame,
     int length,
     IntPtr adapterHandle,
-    uint deviceFlags)
+    uint deviceFlags,
+    uint dot1q)
 {
     public byte[] Frame { get; } = frame;
     public int Length { get; } = length;
     public IntPtr AdapterHandle { get; } = adapterHandle;
     public uint DeviceFlags { get; } = deviceFlags;
+    public uint Dot1q { get; } = dot1q;
 }
 
 internal sealed class ReassembledIpPacket(
@@ -29,18 +31,21 @@ internal sealed class ReassembledIpPacket(
     int length,
     IntPtr adapterHandle,
     uint deviceFlags,
+    uint dot1q,
     IReadOnlyList<CapturedPacketFragment> fragments)
 {
     public byte[] Frame { get; } = frame;
     public int Length { get; } = length;
     public IntPtr AdapterHandle { get; } = adapterHandle;
     public uint DeviceFlags { get; } = deviceFlags;
+    public uint Dot1q { get; } = dot1q;
     public IReadOnlyList<CapturedPacketFragment> Fragments { get; } = fragments;
 }
 
 internal sealed class IpFragmentReassembler
 {
     private static readonly TimeSpan AssemblyTtl = TimeSpan.FromSeconds(30);
+    private const int MaxAssemblies = 256;
     private readonly Dictionary<FragmentKey, FragmentAssembly> _assemblies = [];
     private readonly TimeProvider _timeProvider;
 
@@ -54,6 +59,7 @@ internal sealed class IpFragmentReassembler
         int packetLength,
         IntPtr adapterHandle,
         uint deviceFlags,
+        uint dot1q,
         out ReassembledIpPacket? packet)
     {
         packet = null;
@@ -65,6 +71,7 @@ internal sealed class IpFragmentReassembler
         }
 
         if (fragment.PayloadLength <= 0
+            || (fragment.MoreFragments && (fragment.PayloadLength & 7) != 0)
             || fragment.Offset > ushort.MaxValue
             || fragment.Offset + fragment.PayloadLength > ushort.MaxValue)
         {
@@ -81,12 +88,17 @@ internal sealed class IpFragmentReassembler
 
         if (!_assemblies.TryGetValue(key, out var assembly))
         {
+            if (_assemblies.Count >= MaxAssemblies)
+            {
+                return FragmentAddStatus.Invalid;
+            }
+
             assembly = new FragmentAssembly(_timeProvider.GetUtcNow());
             _assemblies[key] = assembly;
         }
 
         assembly.LastActivity = _timeProvider.GetUtcNow();
-        if (!assembly.TryAdd(fragment, frame, packetLength, adapterHandle, deviceFlags))
+        if (!assembly.TryAdd(fragment, frame, packetLength, adapterHandle, deviceFlags, dot1q))
         {
             _assemblies.Remove(key);
             return FragmentAddStatus.Invalid;
@@ -297,7 +309,8 @@ internal sealed class IpFragmentReassembler
             ReadOnlySpan<byte> frame,
             int packetLength,
             IntPtr adapterHandle,
-            uint deviceFlags)
+            uint deviceFlags,
+            uint dot1q)
         {
             var end = fragment.Offset + fragment.PayloadLength;
             foreach (var stored in _fragments)
@@ -313,7 +326,8 @@ internal sealed class IpFragmentReassembler
                 frame[..packetLength].ToArray(),
                 packetLength,
                 adapterHandle,
-                deviceFlags);
+                deviceFlags,
+                dot1q);
             _fragments.Add(new StoredFragment(fragment, original));
             _fragments.Sort(static (left, right) => left.Fragment.Offset.CompareTo(right.Fragment.Offset));
 
@@ -350,7 +364,13 @@ internal sealed class IpFragmentReassembler
                 header.LinkHeader.CopyTo(frame, 0);
                 ipHeader.CopyTo(frame, header.LinkHeader.Length);
                 var ip = frame.AsSpan(header.LinkHeader.Length, ipHeader.Length);
-                BinaryPrimitives.WriteUInt16BigEndian(ip.Slice(2, 2), checked((ushort)(ip.Length + payload.Length)));
+                var totalLength = ip.Length + payload.Length;
+                if (totalLength > ushort.MaxValue)
+                {
+                    return null;
+                }
+
+                BinaryPrimitives.WriteUInt16BigEndian(ip.Slice(2, 2), (ushort)totalLength);
                 BinaryPrimitives.WriteUInt16BigEndian(ip.Slice(6, 2), 0);
                 BinaryPrimitives.WriteUInt16BigEndian(ip.Slice(10, 2), 0);
                 BinaryPrimitives.WriteUInt16BigEndian(
@@ -362,6 +382,7 @@ internal sealed class IpFragmentReassembler
                     frame.Length,
                     _fragments[0].Original.AdapterHandle,
                     _fragments[0].Original.DeviceFlags,
+                    _fragments[0].Original.Dot1q,
                     _fragments.Select(static item => item.Original).ToArray());
             }
 
@@ -370,16 +391,23 @@ internal sealed class IpFragmentReassembler
             header.LinkHeader.CopyTo(ipv6Frame, 0);
             baseHeader.CopyTo(ipv6Frame, header.LinkHeader.Length);
             var ipv6 = ipv6Frame.AsSpan(header.LinkHeader.Length, baseHeader.Length);
+            var ipv6PayloadLength = ipv6.Length - 40 + payload.Length;
+            if (ipv6PayloadLength > ushort.MaxValue)
+            {
+                return null;
+            }
+
             ipv6[header.PreviousNextHeaderOffset] = header.Protocol;
             BinaryPrimitives.WriteUInt16BigEndian(
                 ipv6.Slice(4, 2),
-                checked((ushort)(ipv6.Length - 40 + payload.Length)));
+                (ushort)ipv6PayloadLength);
             payload.CopyTo(ipv6Frame.AsSpan(header.LinkHeader.Length + baseHeader.Length));
             return new ReassembledIpPacket(
                 ipv6Frame,
                 ipv6Frame.Length,
                 _fragments[0].Original.AdapterHandle,
                 _fragments[0].Original.DeviceFlags,
+                _fragments[0].Original.Dot1q,
                 _fragments.Select(static item => item.Original).ToArray());
         }
 
