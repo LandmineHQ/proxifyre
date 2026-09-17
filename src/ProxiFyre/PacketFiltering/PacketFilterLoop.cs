@@ -486,6 +486,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
     {
         var relayKey = new TcpRelayKey(
             adapterHandle,
+            dot1q,
             packet.SourceAddress,
             packet.DestinationAddress,
             packet.SourcePort,
@@ -573,6 +574,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
     {
         var relayKey = new TcpRelayKey(
             buffer->AdapterOrListFlink,
+            buffer->Dot1q,
             packet.DestinationAddress,
             packet.SourceAddress,
             packet.DestinationPort,
@@ -642,7 +644,8 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
 
     private bool ProcessOutgoingUdp(PacketView packet, IntPtr adapterHandle, uint dot1q)
     {
-        var processInfo = _processLookup.LookupUdpOwner(packet.UdpEndpoint);
+        var processInfo = _processLookup.LookupUdpOwner(
+            CreateUdpEndpointKey(packet.SourceAddress, packet.SourcePort, adapterHandle));
         var processName = processInfo?.Name ?? "unknown";
         var processId = processInfo?.ProcessId ?? 0;
 
@@ -704,7 +707,8 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             _udpRelay.Remove(relayKey);
         }
 
-        var process = processInfo ?? _processLookup.LookupUdpOwner(packet.UdpEndpoint);
+        var process = processInfo ?? _processLookup.LookupUdpOwner(
+            CreateUdpEndpointKey(packet.SourceAddress, packet.SourcePort, adapterHandle));
         if (process is null)
         {
             if (packet.SourcePort == 53 || packet.DestinationPort == 53)
@@ -743,7 +747,10 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
 
     private void ProcessIncomingUdp(NdisApi.IntermediateBuffer* buffer, PacketView packet)
     {
-        var localEndpoint = new UdpEndpointKey(packet.DestinationAddress, packet.DestinationPort);
+        var localEndpoint = CreateUdpEndpointKey(
+            packet.DestinationAddress,
+            packet.DestinationPort,
+            buffer->AdapterOrListFlink);
         var processInfo = _processLookup.LookupUdpOwner(localEndpoint);
         var processName = processInfo?.Name ?? "unknown";
         var processId = processInfo?.ProcessId ?? 0;
@@ -801,12 +808,38 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         }
 
         var owner = _processLookup.LookupUdpOwner(
-            new UdpEndpointKey(target.ClientAddress, target.ClientPort),
+            CreateUdpEndpointKey(
+                target.ClientAddress,
+                target.ClientPort,
+                target.AdapterHandle,
+                target.InterfaceIndex),
             forceRefresh: true);
         return owner is not null
             && owner.ProcessId == target.ProcessId
             && owner.Name.Equals(target.ProcessName, StringComparison.OrdinalIgnoreCase)
             && owner.Path.Equals(target.ProcessPath, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private UdpEndpointKey CreateUdpEndpointKey(
+        IPAddress address,
+        ushort port,
+        IntPtr adapterHandle,
+        int interfaceIndex = 0)
+    {
+        if (interfaceIndex <= 0)
+        {
+            _adapterInterfaceIndices.TryGetValue(adapterHandle, out interfaceIndex);
+        }
+
+        if (address.AddressFamily == AddressFamily.InterNetworkV6
+            && address.ScopeId == 0
+            && interfaceIndex > 0
+            && (address.IsIPv6LinkLocal || address.IsIPv6Multicast || address.IsIPv6SiteLocal))
+        {
+            address = new IPAddress(address.GetAddressBytes(), interfaceIndex);
+        }
+
+        return new UdpEndpointKey(address, port);
     }
 
     private bool InjectTcpSegmentToClient(DirectRelayTarget target, TcpSegment segment)
@@ -1792,7 +1825,8 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             return false;
         }
 
-        var process = _processLookup.LookupUdpOwner(packet.UdpEndpoint);
+        var process = _processLookup.LookupUdpOwner(
+            CreateUdpEndpointKey(packet.SourceAddress, packet.SourcePort, adapterHandle));
 
         var payload = packet.UdpPayload;
         if (payload.Length < 12)

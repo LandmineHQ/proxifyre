@@ -145,6 +145,7 @@ internal sealed class TcpDirectRelay : IDisposable
             : IPAddress.IPv6Any;
         return _relayOutboundFlows.ContainsKey(new TcpRelayKey(
             flowKey.AdapterHandle,
+            flowKey.Dot1q,
             wildcardAddress,
             flowKey.RemoteAddress,
             flowKey.ClientPort,
@@ -187,6 +188,7 @@ internal sealed class TcpDirectRelay : IDisposable
     {
         _relayOutboundFlows[new TcpRelayKey(
             flow.AdapterHandle,
+            flow.Dot1q,
             flow.LocalAddress,
             flow.RemoteAddress,
             flow.LocalPort,
@@ -199,6 +201,7 @@ internal sealed class TcpDirectRelay : IDisposable
         _relayOutboundFlows.TryRemove(
             new TcpRelayKey(
                 flow.AdapterHandle,
+                flow.Dot1q,
                 flow.LocalAddress,
                 flow.RemoteAddress,
                 flow.LocalPort,
@@ -406,12 +409,15 @@ internal sealed class TcpDirectRelay : IDisposable
                 {
                     try
                     {
+                        var optionValue = _target.RemoteAddress.AddressFamily == AddressFamily.InterNetwork
+                            ? IPAddress.HostToNetworkOrder(unchecked((short)_target.InterfaceIndex))
+                            : _target.InterfaceIndex;
                         socket.SetSocketOption(
                             _target.RemoteAddress.AddressFamily == AddressFamily.InterNetwork
                                 ? SocketOptionLevel.IP
                                 : SocketOptionLevel.IPv6,
                             (SocketOptionName)31,
-                            _target.InterfaceIndex);
+                            optionValue);
                     }
                     catch
                     {
@@ -497,8 +503,8 @@ internal sealed class TcpDirectRelay : IDisposable
                 if ((segment.Flags & PacketView.TcpFlagRst) != 0)
                 {
                     var resetSequence = UnwrapNear(segment.SequenceNumber, _clientReceiveNext);
-                    if (resetSequence >= _clientAcknowledged
-                        && resetSequence <= _clientReceiveNext + _clientWindow)
+                    if (resetSequence >= _clientAcknowledged - MaxBufferedClientBytes
+                        && resetSequence <= _clientReceiveNext + MaxBufferedClientBytes)
                     {
                         closeWithoutReset = true;
                     }
@@ -517,7 +523,7 @@ internal sealed class TcpDirectRelay : IDisposable
                     }
 
                     if ((segment.Flags & PacketView.TcpFlagAck) != 0
-                        && !IsClientSequenceInWindow(segment.SequenceNumber))
+                        && !IsClientSequenceRelevant(segment.SequenceNumber))
                     {
                         return;
                     }
@@ -1199,10 +1205,10 @@ internal sealed class TcpDirectRelay : IDisposable
             return (ushort)Math.Clamp(MaxBufferedClientBytes - buffered, 0, ushort.MaxValue);
         }
 
-        private bool IsClientSequenceInWindow(uint sequenceNumber)
+        private bool IsClientSequenceRelevant(uint sequenceNumber)
         {
             var sequence = UnwrapNear(sequenceNumber, _clientReceiveNext);
-            return sequence >= _clientAcknowledged
+            return sequence >= _clientAcknowledged - MaxBufferedClientBytes
                 && sequence <= _clientReceiveNext + MaxBufferedClientBytes;
         }
 
@@ -1363,12 +1369,7 @@ internal sealed class TcpDirectRelay : IDisposable
                     }
                 }
 
-                if (_remoteFinAcknowledged
-                    && now - _remoteFinQueuedAt > InitialRemoteFinLifetime)
-                {
-                    failureMessage = "DIRECT TCP relay closed a stale half-closed connection.";
-                }
-                else if (_remoteFinQueued
+                if (_remoteFinQueued
                     && !_remoteFinAcknowledged
                     && now - _remoteFinQueuedAt > InitialRemoteFinLifetime)
                 {

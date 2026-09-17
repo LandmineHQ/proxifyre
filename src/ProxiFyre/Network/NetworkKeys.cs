@@ -49,7 +49,9 @@ internal readonly record struct UdpEndpointKey
 {
     public UdpEndpointKey(IPAddress localAddress, ushort localPort)
     {
-        LocalAddress = NetworkAddress.Normalize(localAddress);
+        LocalAddress = localAddress.IsIPv4MappedToIPv6
+            ? localAddress.MapToIPv4()
+            : localAddress;
         LocalPort = localPort;
     }
 
@@ -106,12 +108,14 @@ internal readonly record struct TcpRelayKey
 {
     public TcpRelayKey(
         IntPtr adapterHandle,
+        uint dot1q,
         IPAddress clientAddress,
         IPAddress remoteAddress,
         ushort clientPort,
         ushort remotePort)
     {
         AdapterHandle = adapterHandle;
+        Dot1q = dot1q;
         ClientAddress = NetworkAddress.Normalize(clientAddress);
         RemoteAddress = NetworkAddress.Normalize(remoteAddress);
         ClientPort = clientPort;
@@ -127,6 +131,8 @@ internal readonly record struct TcpRelayKey
     public ushort RemotePort { get; }
 
     public IntPtr AdapterHandle { get; }
+
+    public uint Dot1q { get; }
 
     public override string ToString()
     {

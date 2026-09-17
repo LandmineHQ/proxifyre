@@ -49,6 +49,7 @@ internal static class TcpRelaySelfTest
                 });
             var flowKey = new TcpRelayKey(
                 IntPtr.Zero,
+                0,
                 IPAddress.Loopback,
                 IPAddress.Loopback,
                 clientPort,
