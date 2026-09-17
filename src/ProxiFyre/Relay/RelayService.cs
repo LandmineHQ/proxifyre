@@ -6,7 +6,7 @@ namespace ProxiFyre;
 internal sealed class RelayService : IDisposable, IAsyncDisposable
 {
     private readonly Action<string> _log;
-    private readonly Action<string> _trafficOutput;
+    private readonly Action<TrafficSnapshot>? _trafficSink;
     private readonly bool _detailedLogging;
     private readonly TimeProvider _timeProvider;
     private readonly TrafficCounter _trafficCounter = new();
@@ -20,10 +20,10 @@ internal sealed class RelayService : IDisposable, IAsyncDisposable
     private Task? _trafficStatsTask;
     private Task? _configurationWatchTask;
 
-    public RelayService(Action<string> log, bool detailedLogging = false, Action<string>? trafficOutput = null, TimeProvider? timeProvider = null)
+    public RelayService(Action<string> log, bool detailedLogging = false, Action<TrafficSnapshot>? trafficSink = null, TimeProvider? timeProvider = null)
     {
         _log = log;
-        _trafficOutput = trafficOutput ?? log;
+        _trafficSink = trafficSink;
         _detailedLogging = detailedLogging;
         _timeProvider = timeProvider ?? TimeProvider.System;
     }
@@ -140,7 +140,7 @@ internal sealed class RelayService : IDisposable, IAsyncDisposable
             var snapshot = _trafficCounter.Snapshot(previous.UploadBytes, previous.DownloadBytes, elapsed);
             previous = snapshot;
             previousTime = now;
-            _trafficOutput($"TRAFFIC up={snapshot.UploadBytes} down={snapshot.DownloadBytes} upRate={snapshot.UploadBytesPerSecond} downRate={snapshot.DownloadBytesPerSecond}");
+            _trafficSink?.Invoke(snapshot);
         }
     }
 

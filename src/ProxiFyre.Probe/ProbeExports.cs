@@ -3,6 +3,9 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.IO;
+using System.Diagnostics.CodeAnalysis;
+
+[assembly: SuppressMessage("Usage", "CA2255", Justification = "NativeAOT probe uses a module initializer to start its message loop on load.")]
 
 namespace ProxiFyre;
 

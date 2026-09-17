@@ -12,7 +12,6 @@
     <PlatformTarget Condition="'$(RuntimeIdentifier)' == 'win-x86'">x86</PlatformTarget>
   </PropertyGroup>
   <ItemGroup>
-    <Compile Include="..\Shared\LicenseKey.cs" Link="Shared\LicenseKey.cs" />
     <ProjectReference Include="..\ProxiFyre\ProxiFyre.csproj" />
   </ItemGroup>
 </Project>

@@ -9,6 +9,8 @@ internal ref struct PacketView
     public const int EthernetHeaderLength = 14;
     public const ushort EtherTypeIpv4 = 0x0800;
     public const ushort EtherTypeIpv6 = 0x86DD;
+    public const ushort EtherTypeVlan = 0x8100;
+    public const ushort EtherTypeProviderVlan = 0x88A8;
     public const byte ProtocolTcp = 6;
     public const byte ProtocolUdp = 17;
     public const byte TcpFlagFin = 0x01;
@@ -16,8 +18,10 @@ internal ref struct PacketView
     public const byte TcpFlagRst = 0x04;
     public const byte TcpFlagPsh = 0x08;
     public const byte TcpFlagAck = 0x10;
+    public const byte TcpFlagUrg = 0x20;
 
     private readonly Span<byte> _frame;
+    private readonly int _linkHeaderLength;
     private readonly int _sourceAddressOffset;
     private readonly int _destinationAddressOffset;
 
@@ -30,10 +34,12 @@ internal ref struct PacketView
         int ipHeaderLength,
         int transportOffset,
         int transportLength,
+        int linkHeaderLength,
         int sourceAddressOffset,
         int destinationAddressOffset)
     {
         _frame = frame;
+        _linkHeaderLength = linkHeaderLength;
         PacketLength = packetLength;
         AddressFamily = addressFamily;
         Protocol = protocol;
@@ -54,6 +60,8 @@ internal ref struct PacketView
     public int IpOffset { get; }
 
     public int IpHeaderLength { get; }
+
+    public int LinkHeaderLength => _linkHeaderLength;
 
     public int TransportOffset { get; }
 
@@ -95,11 +103,25 @@ internal ref struct PacketView
 
     public ushort TcpWindow => IsTcp ? BinaryPrimitives.ReadUInt16BigEndian(_frame.Slice(TransportOffset + 14, 2)) : (ushort)0;
 
+    public ushort TcpUrgentPointer => IsTcp ? BinaryPrimitives.ReadUInt16BigEndian(_frame.Slice(TransportOffset + 18, 2)) : (ushort)0;
+
     public int TcpHeaderLength => IsTcp ? (_frame[TransportOffset + 12] >> 4) * 4 : 0;
 
     public int TcpPayloadLength => IsTcp ? Math.Max(0, TransportLength - TcpHeaderLength) : 0;
 
+    public ReadOnlySpan<byte> TcpOptions => IsTcp && TcpHeaderLength > 20
+        ? _frame.Slice(TransportOffset + 20, TcpHeaderLength - 20)
+        : [];
+
+    public ushort UdpLength => IsUdp && TransportLength >= 8
+        ? BinaryPrimitives.ReadUInt16BigEndian(_frame.Slice(TransportOffset + 4, 2))
+        : (ushort)0;
+
     public bool IsSynOnly => IsTcp && (TcpFlags & (TcpFlagSyn | TcpFlagAck)) == TcpFlagSyn;
+
+    public bool IsInitialSyn => IsTcp
+        && (TcpFlags & TcpFlagSyn) != 0
+        && (TcpFlags & (TcpFlagAck | TcpFlagFin | TcpFlagRst)) == 0;
 
     public bool IsClosing => IsTcp && (TcpFlags & (TcpFlagFin | TcpFlagRst)) != 0;
 
@@ -126,12 +148,13 @@ internal ref struct PacketView
     {
         get
         {
-            if (!IsUdp || TransportLength < 8)
+            var udpLength = UdpLength;
+            if (!IsUdp || udpLength < 8 || udpLength > TransportLength)
             {
                 return [];
             }
 
-            return _frame.Slice(TransportOffset + 8, TransportLength - 8);
+            return _frame.Slice(TransportOffset + 8, udpLength - 8);
         }
     }
 
@@ -145,12 +168,34 @@ internal ref struct PacketView
         }
 
         var etherType = BinaryPrimitives.ReadUInt16BigEndian(frame.Slice(12, 2));
+        var linkHeaderLength = EthernetHeaderLength;
+        while (etherType is EtherTypeVlan or EtherTypeProviderVlan)
+        {
+            if (packetLength < linkHeaderLength + 4)
+            {
+                return false;
+            }
+
+            etherType = BinaryPrimitives.ReadUInt16BigEndian(frame.Slice(linkHeaderLength + 2, 2));
+            linkHeaderLength += 4;
+        }
+
         return etherType switch
         {
-            EtherTypeIpv4 => TryParseIpv4(frame, packetLength, out packet),
-            EtherTypeIpv6 => TryParseIpv6(frame, packetLength, out packet),
+            EtherTypeIpv4 => TryParseIpv4(frame, packetLength, linkHeaderLength, out packet),
+            EtherTypeIpv6 => TryParseIpv6(frame, packetLength, linkHeaderLength, out packet),
             _ => false
         };
+    }
+
+    public byte[] GetLinkHeader()
+    {
+        return _frame.Slice(0, _linkHeaderLength).ToArray();
+    }
+
+    public bool IsLinkLayerBroadcastOrMulticast()
+    {
+        return _frame.Length >= 1 && (_frame[0] & 0x01) != 0;
     }
 
     public byte[] GetEthernetSource()
@@ -163,10 +208,9 @@ internal ref struct PacketView
         return _frame.Slice(0, 6).ToArray();
     }
 
-    private static bool TryParseIpv4(Span<byte> frame, int packetLength, out PacketView packet)
+    private static bool TryParseIpv4(Span<byte> frame, int packetLength, int ipOffset, out PacketView packet)
     {
         packet = default;
-        var ipOffset = EthernetHeaderLength;
         var version = frame[ipOffset] >> 4;
         var ipHeaderLength = (frame[ipOffset] & 0x0F) * 4;
         if (version != 4 || ipHeaderLength < 20 || packetLength < ipOffset + ipHeaderLength)
@@ -208,15 +252,15 @@ internal ref struct PacketView
             ipHeaderLength,
             transportOffset,
             transportLength,
+            ipOffset,
             ipOffset + 12,
             ipOffset + 16);
         return true;
     }
 
-    private static bool TryParseIpv6(Span<byte> frame, int packetLength, out PacketView packet)
+    private static bool TryParseIpv6(Span<byte> frame, int packetLength, int ipOffset, out PacketView packet)
     {
         packet = default;
-        var ipOffset = EthernetHeaderLength;
         if (packetLength < ipOffset + 40 || frame[ipOffset] >> 4 != 6)
         {
             return false;
@@ -251,6 +295,7 @@ internal ref struct PacketView
                     40,
                     currentOffset,
                     bytesRemaining,
+                    ipOffset,
                     ipOffset + 8,
                     ipOffset + 24);
                 return true;

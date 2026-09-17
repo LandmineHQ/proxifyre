@@ -39,6 +39,8 @@ internal readonly record struct TcpSessionKey
 
     public ushort RemotePort { get; }
 
+    public IntPtr AdapterHandle { get; }
+
     public override string ToString()
     {
         return $"{LocalAddress}:{LocalPort} -> {RemoteAddress}:{RemotePort}";
@@ -60,13 +62,21 @@ internal readonly record struct UdpEndpointKey
 
 internal readonly record struct UdpRelayKey
 {
-    public UdpRelayKey(IPAddress clientAddress, ushort clientPort, IPAddress remoteAddress, ushort remotePort)
+    public UdpRelayKey(
+        IntPtr adapterHandle,
+        IPAddress clientAddress,
+        ushort clientPort,
+        IPAddress remoteAddress,
+        ushort remotePort)
     {
+        AdapterHandle = adapterHandle;
         ClientAddress = NetworkAddress.Normalize(clientAddress);
         ClientPort = clientPort;
         RemoteAddress = NetworkAddress.Normalize(remoteAddress);
         RemotePort = remotePort;
     }
+
+    public IntPtr AdapterHandle { get; }
 
     public IPAddress ClientAddress { get; }
 
@@ -92,26 +102,43 @@ internal readonly record struct TcpClientKey
 
 internal readonly record struct TcpRelayKey
 {
-    public TcpRelayKey(IPAddress remoteAddress, ushort clientPort, ushort remotePort)
+    public TcpRelayKey(
+        IntPtr adapterHandle,
+        IPAddress clientAddress,
+        IPAddress remoteAddress,
+        ushort clientPort,
+        ushort remotePort)
     {
+        AdapterHandle = adapterHandle;
+        ClientAddress = NetworkAddress.Normalize(clientAddress);
         RemoteAddress = NetworkAddress.Normalize(remoteAddress);
         ClientPort = clientPort;
         RemotePort = remotePort;
     }
+
+    public IPAddress ClientAddress { get; }
 
     public IPAddress RemoteAddress { get; }
 
     public ushort ClientPort { get; }
 
     public ushort RemotePort { get; }
+
+    public IntPtr AdapterHandle { get; }
+
+    public override string ToString()
+    {
+        return $"{ClientAddress}:{ClientPort} -> {RemoteAddress}:{RemotePort}";
+    }
 }
 
 internal readonly record struct RelayOutboundFlow
 {
-    public RelayOutboundFlow(IntPtr adapterHandle, byte protocol, IPAddress remoteAddress, ushort localPort, ushort remotePort)
+    public RelayOutboundFlow(IntPtr adapterHandle, byte protocol, IPAddress localAddress, IPAddress remoteAddress, ushort localPort, ushort remotePort)
     {
         AdapterHandle = adapterHandle;
         Protocol = protocol;
+        LocalAddress = NetworkAddress.Normalize(localAddress);
         RemoteAddress = NetworkAddress.Normalize(remoteAddress);
         LocalPort = localPort;
         RemotePort = remotePort;
@@ -120,6 +147,8 @@ internal readonly record struct RelayOutboundFlow
     public IntPtr AdapterHandle { get; }
 
     public byte Protocol { get; }
+
+    public IPAddress LocalAddress { get; }
 
     public IPAddress RemoteAddress { get; }
 
@@ -132,7 +161,7 @@ internal readonly record struct RelayOutboundFlow
         var protocol = Protocol == PacketView.ProtocolTcp
             ? "TCP"
             : Protocol == PacketView.ProtocolUdp ? "UDP" : Protocol.ToString();
-        return $"{protocol} localPort={LocalPort} -> {RemoteAddress}:{RemotePort} adapter=0x{AdapterHandle.ToInt64():X}";
+        return $"{protocol} local={LocalAddress}:{LocalPort} -> {RemoteAddress}:{RemotePort} adapter=0x{AdapterHandle.ToInt64():X}";
     }
 }
 
@@ -147,6 +176,7 @@ internal sealed record DirectRelayTarget(
     IPAddress? ClientAddress = null,
     ushort ClientPort = 0,
     IntPtr AdapterHandle = default,
+    byte[]? LinkHeader = null,
     byte[]? InboundEthernetSource = null,
     byte[]? InboundEthernetDestination = null)
 {

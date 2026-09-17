@@ -31,7 +31,7 @@ function Show-Usage {
     Write-Host "Usage:"
     Write-Host "  .\scripts\proxifyre.ps1 build [-Configuration Debug|Release]"
     Write-Host "  .\scripts\proxifyre.ps1 ui"
-    Write-Host "  .\scripts\proxifyre.ps1 test <tcp|udp|uu|steam> [-Detailed] [-- <test args>]"
+    Write-Host "  .\scripts\proxifyre.ps1 test <tcp|udp|uu|steam|traffic-telemetry|packet-selftest|tcp-selftest|udp-selftest> [-Detailed] [-- <test args>]"
     Write-Host "  .\scripts\proxifyre.ps1 run [-Config .\app-config.json] [-Detailed]"
     Write-Host "  .\scripts\proxifyre.ps1 reset-filter"
     Write-Host "  .\scripts\proxifyre.ps1 license-device"

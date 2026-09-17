@@ -102,7 +102,7 @@ internal static class Cli
                 cts.Cancel();
             };
 
-            await using var service = new RelayService(logger.Info, detailedLogging, Console.WriteLine);
+            await using var service = new RelayService(logger.Info, detailedLogging, PrintTraffic);
             service.Start(configuration, configPath, cts.Token);
             logger.Info("Running. Press Ctrl+C to stop.");
 
@@ -176,6 +176,13 @@ internal static class Cli
         Console.WriteLine($"licenseKey={LicenseKey.CreateKey(deviceId)}");
     }
 
+    private static void PrintTraffic(TrafficSnapshot snapshot)
+    {
+        Console.WriteLine(
+            $"TRAFFIC up={snapshot.UploadBytes} down={snapshot.DownloadBytes} " +
+            $"upRate={snapshot.UploadBytesPerSecond} downRate={snapshot.DownloadBytesPerSecond}");
+    }
+
     private static void AttachConsole()
     {
         try
@@ -193,3 +200,4 @@ internal static class Cli
         public static extern bool AttachConsole(int processId);
     }
 }
+

@@ -15,7 +15,8 @@ internal static class ModuleMessageProtocol
         string? configPath = null,
         string? logPath = null,
         nint replyHwnd = 0,
-        bool detailed = false)
+        bool detailed = false,
+        string? telemetryPipeName = null)
     {
         var values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
@@ -31,6 +32,11 @@ internal static class ModuleMessageProtocol
         if (!string.IsNullOrWhiteSpace(logPath))
         {
             values["logPath"] = logPath;
+        }
+
+        if (!string.IsNullOrWhiteSpace(telemetryPipeName))
+        {
+            values["telemetryPipeName"] = telemetryPipeName;
         }
 
         if (replyHwnd != 0)
@@ -133,3 +139,4 @@ internal static class ModuleMessageProtocol
         return builder.ToString();
     }
 }
+

@@ -147,6 +147,14 @@ Inspect UU or Steam process ports and connections:
 
 Normal relay runs keep logs compact and only record when a configured application starts a TCP or UDP connection. Use `-Detailed` on the script, or `--detailed` on the executable, when packet-level relay diagnostics are needed.
 
+Run the driver-free packet and relay state self-tests:
+
+```powershell
+.\scripts\proxifyre.ps1 test packet-selftest
+.\scripts\proxifyre.ps1 test tcp-selftest
+.\scripts\proxifyre.ps1 test udp-selftest
+```
+
 ## Configuration
 
 Minimal shape:
@@ -189,7 +197,8 @@ Matching rules:
 
 ## Notes
 
-- IPv6 extension headers are parsed for hop-by-hop, routing, and destination options. Fragmented packets are passed through.
-- TCP ownership is resolved from the Windows TCP owner table. A brand-new connection may pass through normally if Windows has not published ownership for the first packet yet.
+- IPv6 extension headers are parsed for hop-by-hop, routing, and destination options. Outgoing IPv4/IPv6 fragments are reassembled before relay, and oversized UDP responses are fragmented to the effective adapter MTU.
+- TCP uses per-connection ISNs, ACK-driven retransmission, client receive-window enforcement, bounded out-of-order buffering, and explicit FIN/RST handling.
+- TCP ownership is resolved from the Windows TCP owner table. A brand-new connection may pass through normally if Windows has not published ownership for the first packet yet; that four-tuple is then kept on the pass-through path to avoid split-brain connections.
 - UDP ownership is resolved from the Windows UDP owner table by local endpoint, with wildcard-bind fallback.
 - The relay module does not open local TCP or UDP listener ports. It still creates outbound sockets to the original destination, so firewall prompts should be limited to normal outbound network access.

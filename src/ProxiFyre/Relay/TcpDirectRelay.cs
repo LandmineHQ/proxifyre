@@ -1,29 +1,58 @@
-using System.Buffers;
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
+using System.Security.Cryptography;
 
 namespace ProxiFyre;
 
+internal readonly record struct TcpSegment(
+    uint SequenceNumber,
+    uint AcknowledgmentNumber,
+    byte Flags,
+    ushort Window,
+    ushort UrgentPointer,
+    ReadOnlyMemory<byte> Payload,
+    ReadOnlyMemory<byte> Options)
+{
+    public int SequenceLength => Payload.Length
+        + (((Flags & PacketView.TcpFlagSyn) != 0) ? 1 : 0)
+        + (((Flags & PacketView.TcpFlagFin) != 0) ? 1 : 0);
+}
+
 internal sealed class TcpDirectRelay : IDisposable
 {
-    private const uint InitialRemoteSequence = 0x4A17C001;
     private const int MaxTcpPayload = 1400;
+    private const int MaxBufferedClientBytes = ushort.MaxValue;
+    private const int MaxOutOfOrderBytes = ushort.MaxValue;
+    private static readonly TimeSpan InitialRetransmissionTimeout = TimeSpan.FromMilliseconds(600);
+    private static readonly TimeSpan MaxRetransmissionTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan ConnectTimeout = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan MaintenanceInterval = TimeSpan.FromMilliseconds(200);
+    private static readonly TimeSpan BypassFlowTtl = TimeSpan.FromMinutes(5);
+
     private readonly ConcurrentDictionary<TcpClientKey, TcpRelayConnection> _connections = new();
     private readonly ConcurrentDictionary<TcpRelayKey, TcpClientKey> _clientsByFlow = new();
     private readonly ConcurrentDictionary<TcpRelayKey, byte> _relayOutboundFlows = new();
-    private readonly TimeSpan _targetTtl = TimeSpan.FromMinutes(5);
+    private readonly ConcurrentDictionary<TcpRelayKey, DateTimeOffset> _bypassedFlows = new();
     private readonly Action<string> _log;
     private readonly bool _detailedLogging;
     private readonly TrafficCounter _trafficCounter;
     private readonly PacketWakeSignal? _packetWakeSignal;
     private readonly TimeProvider _timeProvider;
-    private Action<DirectRelayTarget, uint, uint, byte, ushort, ReadOnlyMemory<byte>>? _packetInjector;
+    private CancellationToken _cancellationToken;
+    private Task? _maintenanceTask;
+    private Action<DirectRelayTarget, TcpSegment>? _packetInjector;
     private Action<RelayOutboundFlow>? _outboundBypassRegister;
     private Action<RelayOutboundFlow>? _outboundBypassUnregister;
 
-    public TcpDirectRelay(Action<string>? log = null, bool detailedLogging = false, TrafficCounter? trafficCounter = null, PacketWakeSignal? packetWakeSignal = null, TimeProvider? timeProvider = null)
+    public TcpDirectRelay(
+        Action<string>? log = null,
+        bool detailedLogging = false,
+        TrafficCounter? trafficCounter = null,
+        PacketWakeSignal? packetWakeSignal = null,
+        TimeProvider? timeProvider = null)
     {
         _log = log ?? Console.WriteLine;
         _detailedLogging = detailedLogging;
@@ -32,12 +61,14 @@ internal sealed class TcpDirectRelay : IDisposable
         _timeProvider = timeProvider ?? TimeProvider.System;
     }
 
-    public void SetPacketInjector(Action<DirectRelayTarget, uint, uint, byte, ushort, ReadOnlyMemory<byte>> packetInjector)
+    public void SetPacketInjector(Action<DirectRelayTarget, TcpSegment> packetInjector)
     {
         _packetInjector = packetInjector;
     }
 
-    public void SetOutboundBypass(Action<RelayOutboundFlow> register, Action<RelayOutboundFlow> unregister)
+    public void SetOutboundBypass(
+        Action<RelayOutboundFlow> register,
+        Action<RelayOutboundFlow> unregister)
     {
         _outboundBypassRegister = register;
         _outboundBypassUnregister = unregister;
@@ -45,34 +76,55 @@ internal sealed class TcpDirectRelay : IDisposable
 
     public void Start(CancellationToken cancellationToken)
     {
+        _cancellationToken = cancellationToken;
+        _maintenanceTask = Task.Run(() => MaintenanceLoopAsync(cancellationToken), cancellationToken);
         LogDetail("Local direct TCP relay uses packet injection; no local TCP listener is opened.");
-        _ = Task.Run(() => CleanupLoopAsync(cancellationToken), cancellationToken);
     }
 
-    public TcpRelayConnection RegisterSyn(TcpRelayKey flowKey, TcpClientKey clientKey, DirectRelayTarget target, uint clientSequenceNumber, ushort clientWindow, CancellationToken cancellationToken)
+    public TcpRelayConnection RegisterSyn(
+        TcpRelayKey flowKey,
+        TcpClientKey clientKey,
+        DirectRelayTarget target,
+        uint clientSequenceNumber,
+        ushort clientWindow,
+        CancellationToken cancellationToken)
     {
+        if (_connections.TryGetValue(clientKey, out var existingConnection))
+        {
+            existingConnection.MarkSynRetransmitted();
+            return existingConnection;
+        }
+
         var connection = new TcpRelayConnection(
             flowKey,
             clientKey,
             target,
-            clientSequenceNumber + 1,
-            InitialRemoteSequence,
+            clientSequenceNumber,
             clientWindow,
+            CreateInitialSequence(),
             _trafficCounter,
             _packetWakeSignal,
             _packetInjector,
-            _outboundBypassRegister,
-            _outboundBypassUnregister,
-            TrackOutboundFlow,
-            UntrackOutboundFlow,
-            Remove,
+            RegisterOutboundFlow,
+            UnregisterOutboundFlow,
+            _remove: Remove,
             _detailedLogging ? LogDetail : null,
             _log,
-            _timeProvider);
+            _timeProvider,
+            cancellationToken);
 
-        _connections[clientKey] = connection;
+        if (!_connections.TryAdd(clientKey, connection))
+        {
+            connection.DisposeWithoutRemoving();
+            if (_connections.TryGetValue(clientKey, out var existing))
+            {
+                existing.MarkSynRetransmitted();
+                return existing;
+            }
+        }
+
         _clientsByFlow[flowKey] = clientKey;
-        _ = connection.ConnectAsync(cancellationToken);
+        _ = connection.StartAsync();
         return connection;
     }
 
@@ -90,17 +142,41 @@ internal sealed class TcpDirectRelay : IDisposable
 
     public bool IsRelayOutboundFlow(TcpRelayKey flowKey)
     {
-        return _relayOutboundFlows.ContainsKey(flowKey);
+        if (_relayOutboundFlows.ContainsKey(flowKey))
+        {
+            return true;
+        }
+
+        var wildcardAddress = flowKey.ClientAddress.AddressFamily == AddressFamily.InterNetwork
+            ? IPAddress.Any
+            : IPAddress.IPv6Any;
+        return _relayOutboundFlows.ContainsKey(new TcpRelayKey(
+            flowKey.AdapterHandle,
+            wildcardAddress,
+            flowKey.RemoteAddress,
+            flowKey.ClientPort,
+            flowKey.RemotePort));
     }
 
-    public void TrackOutboundFlow(TcpRelayKey flowKey)
+    public void MarkBypassedFlow(TcpRelayKey flowKey)
     {
-        _relayOutboundFlows[flowKey] = 0;
+        _bypassedFlows[flowKey] = _timeProvider.GetUtcNow();
     }
 
-    public void UntrackOutboundFlow(TcpRelayKey flowKey)
+    public bool IsBypassedFlow(TcpRelayKey flowKey)
     {
-        _relayOutboundFlows.TryRemove(flowKey, out _);
+        if (!_bypassedFlows.TryGetValue(flowKey, out var markedAt))
+        {
+            return false;
+        }
+
+        if (_timeProvider.GetUtcNow() - markedAt <= BypassFlowTtl)
+        {
+            return true;
+        }
+
+        _bypassedFlows.TryRemove(flowKey, out _);
+        return false;
     }
 
     public void Remove(TcpClientKey clientKey)
@@ -112,6 +188,37 @@ internal sealed class TcpDirectRelay : IDisposable
         }
     }
 
+    private void RegisterOutboundFlow(RelayOutboundFlow flow)
+    {
+        _relayOutboundFlows[new TcpRelayKey(
+            flow.AdapterHandle,
+            flow.LocalAddress,
+            flow.RemoteAddress,
+            flow.LocalPort,
+            flow.RemotePort)] = 0;
+        _outboundBypassRegister?.Invoke(flow);
+    }
+
+    private void UnregisterOutboundFlow(RelayOutboundFlow flow)
+    {
+        _relayOutboundFlows.TryRemove(
+            new TcpRelayKey(
+                flow.AdapterHandle,
+                flow.LocalAddress,
+                flow.RemoteAddress,
+                flow.LocalPort,
+                flow.RemotePort),
+            out _);
+        _outboundBypassUnregister?.Invoke(flow);
+    }
+
+    private static uint CreateInitialSequence()
+    {
+        Span<byte> bytes = stackalloc byte[4];
+        RandomNumberGenerator.Fill(bytes);
+        return BinaryPrimitives.ReadUInt32BigEndian(bytes);
+    }
+
     private void LogDetail(string message)
     {
         if (_detailedLogging)
@@ -120,23 +227,27 @@ internal sealed class TcpDirectRelay : IDisposable
         }
     }
 
-    private async Task CleanupLoopAsync(CancellationToken cancellationToken)
+    private async Task MaintenanceLoopAsync(CancellationToken cancellationToken)
     {
-        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(30), _timeProvider);
+        using var timer = new PeriodicTimer(MaintenanceInterval, _timeProvider);
         while (await timer.WaitForNextTickAsync(cancellationToken).ConfigureAwait(false))
         {
-            CleanupExpiredConnections();
-        }
-    }
-
-    private void CleanupExpiredConnections()
-    {
-        var now = _timeProvider.GetUtcNow();
-        foreach (var pair in _connections)
-        {
-            if (now - pair.Value.LastActivity > _targetTtl)
+            var now = _timeProvider.GetUtcNow();
+            foreach (var connection in _connections.Values)
             {
-                Remove(pair.Key);
+                connection.Maintain(now);
+                if (connection.IsClosed)
+                {
+                    Remove(connection.ClientKey);
+                }
+            }
+
+            foreach (var bypass in _bypassedFlows)
+            {
+                if (now - bypass.Value > BypassFlowTtl)
+                {
+                    _bypassedFlows.TryRemove(bypass.Key, out _);
+                }
             }
         }
     }
@@ -151,65 +262,81 @@ internal sealed class TcpDirectRelay : IDisposable
         _connections.Clear();
         _clientsByFlow.Clear();
         _relayOutboundFlows.Clear();
+        _bypassedFlows.Clear();
     }
 
     internal sealed class TcpRelayConnection : IDisposable
     {
+        private static readonly TimeSpan InitialRemoteFinLifetime = TimeSpan.FromMinutes(5);
+        private const int MaxRetransmissionAttempts = 10;
+
         private readonly object _sync = new();
+        private readonly object _outboundFlowSync = new();
         private readonly TcpRelayKey _flowKey;
         private readonly TcpClientKey _clientKey;
         private readonly DirectRelayTarget _target;
         private readonly TrafficCounter _trafficCounter;
         private readonly PacketWakeSignal? _packetWakeSignal;
-        private readonly Action<DirectRelayTarget, uint, uint, byte, ushort, ReadOnlyMemory<byte>>? _packetInjector;
-        private readonly Action<RelayOutboundFlow>? _outboundBypassRegister;
-        private readonly Action<RelayOutboundFlow>? _outboundBypassUnregister;
-        private readonly Action<TcpRelayKey> _trackOutboundFlow;
-        private readonly Action<TcpRelayKey> _untrackOutboundFlow;
+        private readonly Action<DirectRelayTarget, TcpSegment>? _packetInjector;
+        private readonly Action<RelayOutboundFlow> _registerOutboundFlow;
+        private readonly Action<RelayOutboundFlow> _unregisterOutboundFlow;
         private readonly Action<TcpClientKey> _remove;
         private readonly Action<string>? _detailLog;
         private readonly Action<string> _errorLog;
         private readonly TimeProvider _timeProvider;
-        private readonly uint _remoteInitialSequence;
-        private readonly SemaphoreSlim _sendLock = new(1, 1);
-        private TcpClient? _client;
-        private NetworkStream? _stream;
-        private TcpRelayKey? _outboundFlowKey;
-        private RelayOutboundFlow? _outboundBypassFlow;
-        private Task? _receiveTask;
-        private Queue<byte[]>? _pendingWritePayloads;
-        private SortedDictionary<uint, byte[]>? _pendingOutOfOrderPayloads;
-        private uint? _pendingFinSequence;
-        private byte[]? _sniProbeBuffer;
-        private bool _sniProbeFinished;
-        private bool _connected;
-        private bool _closed;
-        private uint _nextRemoteSequence;
-        private uint _nextClientSequence;
+        private readonly CancellationTokenSource _cts;
+        private readonly TaskCompletionSource<bool> _connected =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource<bool> _handshakeAcknowledged =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly SemaphoreSlim _writeSignal = new(0);
+        private readonly SemaphoreSlim _windowChanged = new(0, 1);
+        private readonly SortedDictionary<long, PendingClientData> _outOfOrder = [];
+        private readonly SortedDictionary<long, OutboundSegment> _outboundToClient = [];
+        private readonly Queue<PendingClientWrite> _writeQueue = new();
+        private readonly List<RelayOutboundFlow> _outboundFlows = [];
+        private Socket? _socket;
+        private Task? _writerTask;
+        private Task? _receiverTask;
+        private long _clientReceiveNext;
+        private long _clientAcknowledged;
+        private long _clientFinSequence = -1;
+        private long? _pendingFinSequence;
+        private long _remoteInitialSequence;
+        private long _remoteSendNext;
+        private long _remoteSendUna;
+        private long _clientAckSequence;
+        private long _remoteFinSequence = -1;
+        private long _outOfOrderBytes;
         private ushort _clientWindow;
-        private DateTimeOffset _lastUpLog;
-        private DateTimeOffset _lastDownLog;
-        private long _upBytes;
-        private long _downBytes;
+        private int _duplicateAckCount;
+        private bool _connectedFlag;
+        private bool _handshakeAcknowledgedFlag;
+        private bool _remoteFinQueued;
+        private bool _remoteFinAcknowledged;
+        private bool _clientFinReceived;
+        private bool _closed;
+        private DateTimeOffset _createdAt;
+        private DateTimeOffset _lastActivity;
+        private TimeSpan _retransmissionTimeout = InitialRetransmissionTimeout;
 
         public TcpRelayConnection(
             TcpRelayKey flowKey,
             TcpClientKey clientKey,
             DirectRelayTarget target,
-            uint nextClientSequence,
-            uint remoteInitialSequence,
+            uint clientSequenceNumber,
             ushort clientWindow,
+            uint remoteInitialSequence,
             TrafficCounter trafficCounter,
             PacketWakeSignal? packetWakeSignal,
-            Action<DirectRelayTarget, uint, uint, byte, ushort, ReadOnlyMemory<byte>>? packetInjector,
-            Action<RelayOutboundFlow>? outboundBypassRegister,
-            Action<RelayOutboundFlow>? outboundBypassUnregister,
-            Action<TcpRelayKey> trackOutboundFlow,
-            Action<TcpRelayKey> untrackOutboundFlow,
-            Action<TcpClientKey> remove,
+            Action<DirectRelayTarget, TcpSegment>? packetInjector,
+            Action<RelayOutboundFlow> registerOutboundFlow,
+            Action<RelayOutboundFlow> unregisterOutboundFlow,
+            Action<TcpClientKey> _remove,
             Action<string>? detailLog,
             Action<string> errorLog,
-            TimeProvider timeProvider)
+            TimeProvider timeProvider,
+            CancellationToken externalCancellationToken)
         {
             _flowKey = flowKey;
             _clientKey = clientKey;
@@ -217,163 +344,100 @@ internal sealed class TcpDirectRelay : IDisposable
             _trafficCounter = trafficCounter;
             _packetWakeSignal = packetWakeSignal;
             _packetInjector = packetInjector;
-            _outboundBypassRegister = outboundBypassRegister;
-            _outboundBypassUnregister = outboundBypassUnregister;
-            _trackOutboundFlow = trackOutboundFlow;
-            _untrackOutboundFlow = untrackOutboundFlow;
-            _remove = remove;
+            _registerOutboundFlow = registerOutboundFlow;
+            _unregisterOutboundFlow = unregisterOutboundFlow;
+            this._remove = _remove;
             _detailLog = detailLog;
             _errorLog = errorLog;
             _timeProvider = timeProvider;
-            _remoteInitialSequence = remoteInitialSequence;
-            _nextRemoteSequence = remoteInitialSequence + 1;
-            _nextClientSequence = nextClientSequence;
+            _cts = CancellationTokenSource.CreateLinkedTokenSource(externalCancellationToken);
+            _createdAt = _timeProvider.GetUtcNow();
+            _lastActivity = _createdAt;
+
+            _clientReceiveNext = (long)clientSequenceNumber + 1;
+            _clientAcknowledged = _clientReceiveNext;
             _clientWindow = clientWindow;
-            LastActivity = _timeProvider.GetUtcNow();
+            _remoteInitialSequence = remoteInitialSequence;
+            _remoteSendNext = _remoteInitialSequence;
+            _remoteSendUna = _remoteInitialSequence;
+            _clientAckSequence = _remoteInitialSequence;
         }
 
         public TcpRelayKey FlowKey => _flowKey;
 
-        public DateTimeOffset LastActivity { get; private set; }
+        public TcpClientKey ClientKey => _clientKey;
 
-        public bool IsConnected
+        public bool IsClosed
         {
             get
             {
                 lock (_sync)
                 {
-                    return _connected;
+                    return _closed;
                 }
             }
         }
 
-        public void AcceptSyn()
+        public async Task StartAsync()
         {
-            Inject(_remoteInitialSequence, _nextClientSequence, PacketView.TcpFlagSyn | PacketView.TcpFlagAck, ReadOnlyMemory<byte>.Empty);
-        }
-
-        public async Task ConnectAsync(CancellationToken cancellationToken)
-        {
-            var remoteEndPoint = NetworkEndpointResolver.CreateRemoteEndPoint(_target);
-            TcpClient? client = null;
-            TcpRelayKey? outboundFlowKey = null;
             try
             {
-                client = CreateRelayTcpClient(remoteEndPoint.AddressFamily);
-                client.Client.Bind(NetworkEndpointResolver.CreateAnyEndPoint(remoteEndPoint.AddressFamily));
+                var socket = CreateRelaySocket(_target.RemoteAddress.AddressFamily);
+                var remoteEndPoint = NetworkEndpointResolver.CreateRemoteEndPoint(_target);
+                socket.Bind(NetworkEndpointResolver.CreateAnyEndPoint(remoteEndPoint.AddressFamily));
+                RegisterOutboundFlow(remoteEndPoint, socket);
 
-                if (client.Client.LocalEndPoint is IPEndPoint localEndPoint)
-                {
-                    outboundFlowKey = new TcpRelayKey(remoteEndPoint.Address, (ushort)localEndPoint.Port, (ushort)remoteEndPoint.Port);
-                    _trackOutboundFlow(outboundFlowKey.Value);
-                    _outboundFlowKey = outboundFlowKey;
-                    RegisterOutboundBypass(PacketView.ProtocolTcp, remoteEndPoint.Address, (ushort)localEndPoint.Port, (ushort)remoteEndPoint.Port);
-                }
+                await socket.ConnectAsync(remoteEndPoint, _cts.Token).ConfigureAwait(false);
 
-                await client.ConnectAsync(remoteEndPoint, cancellationToken).ConfigureAwait(false);
-                await _sendLock.WaitAsync(cancellationToken).ConfigureAwait(false);
-                try
+                lock (_sync)
                 {
-                    NetworkStream stream;
-                    lock (_sync)
+                    if (_closed)
                     {
-                        if (_closed)
-                        {
-                            client.Dispose();
-                            ClearOutboundFlow();
-                            return;
-                        }
-
-                        stream = client.GetStream();
-                        _client = client;
-                        _stream = stream;
-                        _connected = true;
-                        LastActivity = _timeProvider.GetUtcNow();
+                        socket.Dispose();
+                        ClearOutboundFlows();
+                        return;
                     }
 
-                    _detailLog?.Invoke($"DIRECT TCP CONNECT app={_target.AppLabel} appLocal={_target.ClientEndpoint} client={_clientKey.ClientAddress}:{_clientKey.ClientPort} target={_target.RemoteEndpoint} relayProcess={Environment.ProcessId} relayLocal={client.Client.LocalEndPoint}");
-                    AcceptSyn();
-                    var flushedPayloadBytes = await FlushPendingPayloadsAsync(stream, cancellationToken).ConfigureAwait(false);
-                    if (flushedPayloadBytes > 0)
-                    {
-                        Inject(_nextRemoteSequence, _nextClientSequence, PacketView.TcpFlagAck, ReadOnlyMemory<byte>.Empty);
-                    }
-                }
-                finally
-                {
-                    _sendLock.Release();
+                    _socket = socket;
+                    _connectedFlag = true;
                 }
 
-                _receiveTask = Task.Run(() => ReceiveRemoteLoopAsync(cancellationToken), cancellationToken);
+                RegisterOutboundFlow(remoteEndPoint, socket);
+                _connected.TrySetResult(true);
+                QueueSynAck();
+
+                _writerTask = WriterLoopAsync();
+                _receiverTask = ReceiveRemoteLoopAsync();
             }
             catch (OperationCanceledException)
             {
-                if (outboundFlowKey is { } flowKey)
-                {
-                    _untrackOutboundFlow(flowKey);
-                }
-
-                client?.Dispose();
-                _remove(_clientKey);
+                CloseClient(injectReset: false);
             }
             catch (Exception ex)
             {
-                if (outboundFlowKey is { } flowKey)
+                FailClient($"DIRECT TCP connect failed app={_target.AppLabel} appLocal={_target.ClientEndpoint} client={_clientKey.ClientAddress}:{_clientKey.ClientPort} target={_target.RemoteEndpoint}: {ex.Message}");
+            }
+        }
+
+        public void MarkSynRetransmitted()
+        {
+            bool send;
+            lock (_sync)
+            {
+                send = _connectedFlag && !_closed;
+                if (send)
                 {
-                    _untrackOutboundFlow(flowKey);
+                    RetransmitEarliestLocked(force: true);
                 }
-
-                _errorLog($"DIRECT TCP connect failed app={_target.AppLabel} appLocal={_target.ClientEndpoint} client={_clientKey.ClientAddress}:{_clientKey.ClientPort} target={_target.RemoteEndpoint} relayProcess={Environment.ProcessId} relayLocal={TryGetLocalEndPoint(client)}: {ex.Message}");
-                client?.Dispose();
-                CloseNetwork();
             }
         }
 
-        private static TcpClient CreateRelayTcpClient(AddressFamily addressFamily)
+        public void SendClientSegment(TcpSegment segment)
         {
-            return new TcpClient(addressFamily)
-            {
-                NoDelay = true
-            };
-        }
+            bool closeWithoutReset = false;
+            bool sendAck = false;
+            bool signalWindow = false;
 
-        private static string TryGetLocalEndPoint(TcpClient? client)
-        {
-            if (client is null)
-            {
-                return "unknown";
-            }
-
-            try
-            {
-                return client.Client.LocalEndPoint?.ToString() ?? "unknown";
-            }
-            catch
-            {
-                return "unknown";
-            }
-        }
-
-        public async Task SendClientPayloadAsync(uint sequenceNumber, uint acknowledgmentNumber, ushort window, ReadOnlyMemory<byte> payload, bool fin, bool rst, CancellationToken cancellationToken)
-        {
-            await _sendLock.WaitAsync(cancellationToken).ConfigureAwait(false);
-            try
-            {
-                await SendClientPayloadCoreAsync(sequenceNumber, acknowledgmentNumber, window, payload, fin, rst, cancellationToken).ConfigureAwait(false);
-            }
-            finally
-            {
-                _sendLock.Release();
-            }
-        }
-
-        private async Task SendClientPayloadCoreAsync(uint sequenceNumber, uint acknowledgmentNumber, ushort window, ReadOnlyMemory<byte> payload, bool fin, bool rst, CancellationToken cancellationToken)
-        {
-            NetworkStream? stream;
-            bool connected;
-            var acceptedPayloads = new List<byte[]>();
-            var shouldAcknowledgeClient = false;
-            var shouldShutdownSend = false;
             lock (_sync)
             {
                 if (_closed)
@@ -381,253 +445,328 @@ internal sealed class TcpDirectRelay : IDisposable
                     return;
                 }
 
-                _clientWindow = window;
-                LastActivity = _timeProvider.GetUtcNow();
-                if (payload.Length > 0)
-                {
-                    shouldAcknowledgeClient = AcceptClientPayload(sequenceNumber, payload, acceptedPayloads);
-                }
+                _lastActivity = _timeProvider.GetUtcNow();
 
-                if (fin)
+                if ((segment.Flags & PacketView.TcpFlagRst) != 0)
                 {
-                    var finSequence = sequenceNumber + (uint)payload.Length;
-                    if (finSequence == _nextClientSequence)
+                    closeWithoutReset = true;
+                }
+                else
+                {
+                    if ((segment.Flags & PacketView.TcpFlagSyn) != 0
+                        && (segment.Flags & PacketView.TcpFlagAck) == 0)
                     {
-                        _nextClientSequence++;
-                        shouldAcknowledgeClient = true;
-                        shouldShutdownSend = true;
+                        RetransmitEarliestLocked(force: true);
+                        return;
                     }
-                    else if (finSequence > _nextClientSequence)
+
+                    if (!ProcessAckLocked(segment))
                     {
-                        _pendingFinSequence = finSequence;
+                        FailLocked();
+                        closeWithoutReset = false;
+                        sendAck = false;
                     }
                     else
                     {
-                        shouldShutdownSend = true;
-                    }
-                }
+                        _clientWindow = segment.Window;
+                        signalWindow = true;
 
-                if (TryConsumePendingFin())
-                {
-                    shouldAcknowledgeClient = true;
-                    shouldShutdownSend = true;
-                }
-
-                stream = _stream;
-                connected = _connected;
-            }
-
-            if (rst)
-            {
-                Close();
-                return;
-            }
-
-            if (stream is null || !connected)
-            {
-                if (acceptedPayloads.Count > 0)
-                {
-                    lock (_sync)
-                    {
-                        _pendingWritePayloads ??= new Queue<byte[]>();
-                        foreach (var acceptedPayload in acceptedPayloads)
+                        if (segment.Payload.Length > 0)
                         {
-                            _pendingWritePayloads.Enqueue(acceptedPayload);
+                            AcceptClientPayloadLocked(segment);
                         }
-                    }
-                }
 
-                return;
-            }
+                        if ((segment.Flags & PacketView.TcpFlagFin) != 0)
+                        {
+                            HandleClientFinLocked(segment);
+                        }
 
-            try
-            {
-                ProbeClientSni(acceptedPayloads);
-                foreach (var acceptedPayload in acceptedPayloads)
-                {
-                    await stream.WriteAsync(acceptedPayload, cancellationToken).ConfigureAwait(false);
-                    _upBytes += acceptedPayload.Length;
-                    _trafficCounter.AddUpload(acceptedPayload.Length);
-                    _packetWakeSignal?.Pulse();
-                    LogStats("SEND");
-                }
-
-                if (shouldAcknowledgeClient)
-                {
-                    Inject(_nextRemoteSequence, _nextClientSequence, PacketView.TcpFlagAck, ReadOnlyMemory<byte>.Empty);
-                }
-
-                if (shouldShutdownSend)
-                {
-                    try
-                    {
-                        _client?.Client.Shutdown(SocketShutdown.Send);
-                    }
-                    catch
-                    {
+                        TryConsumePendingFinLocked();
+                        TrySendQueuedToClientLocked();
+                        TryCompleteCloseLocked();
+                        sendAck = true;
                     }
                 }
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                _errorLog($"DIRECT TCP send failed app={_target.AppLabel} appLocal={_target.ClientEndpoint} client={_clientKey.ClientAddress}:{_clientKey.ClientPort} target={_target.RemoteEndpoint}: {ex.Message}");
-                Close();
-            }
-        }
 
-        private void ProbeClientSni(IReadOnlyList<byte[]> payloads)
-        {
-            if (_sniProbeFinished || payloads.Count == 0)
+            if (closeWithoutReset)
             {
+                CloseClient(injectReset: false);
                 return;
             }
 
-            foreach (var payload in payloads)
+            if (signalWindow)
             {
-                if (payload.Length == 0)
-                {
-                    continue;
-                }
+                Pulse(_windowChanged);
+            }
 
-                AppendSniProbePayload(payload);
-                if (_sniProbeBuffer is null)
-                {
-                    return;
-                }
-
-                if (TlsSniParser.TryGetTlsServerName(_sniProbeBuffer, out var serverName, out var needMore))
-                {
-                    _errorLog($"APP TCP SNI app={_target.AppLabel} appLocal={_target.ClientEndpoint} client={_clientKey.ClientAddress}:{_clientKey.ClientPort} target={_target.RemoteEndpoint} domain={serverName}");
-                    _sniProbeFinished = true;
-                    _sniProbeBuffer = null;
-                    return;
-                }
-
-                if (!needMore || _sniProbeBuffer.Length >= TlsSniParser.MaxProbeBytes)
-                {
-                    _sniProbeFinished = true;
-                    _sniProbeBuffer = null;
-                    return;
-                }
+            if (sendAck)
+            {
+                InjectClientAcknowledgement();
             }
         }
 
-        private void AppendSniProbePayload(byte[] payload)
+        private bool ProcessAckLocked(TcpSegment segment)
         {
-            var currentLength = _sniProbeBuffer?.Length ?? 0;
-            var remainingLength = TlsSniParser.MaxProbeBytes - currentLength;
-            if (remainingLength <= 0)
+            if ((segment.Flags & PacketView.TcpFlagAck) == 0)
             {
-                _sniProbeFinished = true;
-                _sniProbeBuffer = null;
-                return;
+                return true;
             }
 
-            var appendLength = Math.Min(remainingLength, payload.Length);
-            var nextBuffer = new byte[currentLength + appendLength];
-            if (_sniProbeBuffer is not null)
-            {
-                Buffer.BlockCopy(_sniProbeBuffer, 0, nextBuffer, 0, currentLength);
-            }
-
-            Buffer.BlockCopy(payload, 0, nextBuffer, currentLength, appendLength);
-            _sniProbeBuffer = nextBuffer;
-        }
-
-        private bool AcceptClientPayload(uint sequenceNumber, ReadOnlyMemory<byte> payload, List<byte[]> acceptedPayloads)
-        {
-            var payloadEnd = sequenceNumber + (uint)payload.Length;
-            if (payloadEnd <= _nextClientSequence)
+            var ack = UnwrapNear(segment.AcknowledgmentNumber, _remoteSendNext);
+            if (ack > _remoteSendNext)
             {
                 return false;
             }
 
-            if (sequenceNumber > _nextClientSequence)
+            if (ack < _remoteSendUna)
             {
-                StoreOutOfOrderPayload(sequenceNumber, payload);
                 return true;
             }
 
-            AcceptContiguousPayload(sequenceNumber, payload, acceptedPayloads);
-            FlushOutOfOrderPayloads(acceptedPayloads);
-            return acceptedPayloads.Count > 0;
-        }
-
-        private void AcceptContiguousPayload(uint sequenceNumber, ReadOnlyMemory<byte> payload, List<byte[]> acceptedPayloads)
-        {
-            var offset = sequenceNumber < _nextClientSequence
-                ? (int)(_nextClientSequence - sequenceNumber)
-                : 0;
-            if (offset >= payload.Length)
+            if (ack >= _remoteInitialSequence + 1 && !_handshakeAcknowledgedFlag)
             {
-                return;
+                _handshakeAcknowledgedFlag = true;
+                _handshakeAcknowledged.TrySetResult(true);
             }
 
-            var acceptedPayload = payload[offset..].ToArray();
-            acceptedPayloads.Add(acceptedPayload);
-            _nextClientSequence += (uint)acceptedPayload.Length;
-        }
-
-        private void StoreOutOfOrderPayload(uint sequenceNumber, ReadOnlyMemory<byte> payload)
-        {
-            _pendingOutOfOrderPayloads ??= [];
-            if (_pendingOutOfOrderPayloads.TryGetValue(sequenceNumber, out var existingPayload)
-                && existingPayload.Length >= payload.Length)
+            if (ack > _clientAckSequence)
             {
-                return;
+                _clientAckSequence = ack;
+                _remoteSendUna = ack;
+                _duplicateAckCount = 0;
+                _retransmissionTimeout = InitialRetransmissionTimeout;
+                RemoveAcknowledgedSegmentsLocked(ack);
+            }
+            else if (ack == _clientAckSequence && _outboundToClient.Count > 0)
+            {
+                _duplicateAckCount++;
+                if (_duplicateAckCount >= 3)
+                {
+                    _duplicateAckCount = 0;
+                    RetransmitEarliestLocked(force: true);
+                }
             }
 
-            _pendingOutOfOrderPayloads[sequenceNumber] = payload.ToArray();
-            _detailLog?.Invoke($"DIRECT TCP buffered out-of-order payload app={_target.AppLabel} appLocal={_target.ClientEndpoint} seq={sequenceNumber} expected={_nextClientSequence} bytes={payload.Length}");
+            if (_remoteFinQueued && ack >= _remoteFinSequence + 1)
+            {
+                _remoteFinAcknowledged = true;
+            }
+
+            return true;
         }
 
-        private void FlushOutOfOrderPayloads(List<byte[]> acceptedPayloads)
+        private void RemoveAcknowledgedSegmentsLocked(long ack)
         {
-            while (_pendingOutOfOrderPayloads is { Count: > 0 })
+            while (_outboundToClient.Count > 0)
             {
-                using var enumerator = _pendingOutOfOrderPayloads.GetEnumerator();
+                using var enumerator = _outboundToClient.GetEnumerator();
                 if (!enumerator.MoveNext())
                 {
                     return;
                 }
 
-                var sequenceNumber = enumerator.Current.Key;
-                if (sequenceNumber > _nextClientSequence)
+                var pair = enumerator.Current;
+                if (pair.Value.End <= ack)
+                {
+                    _outboundToClient.Remove(pair.Key);
+                    continue;
+                }
+
+                if (pair.Value.Start < ack && pair.Value.End > ack)
+                {
+                    var trim = (int)(ack - pair.Value.Start);
+                    var trimmedPayload = pair.Value.Segment.Payload[trim..];
+                    var flags = (byte)(pair.Value.Segment.Flags & ~PacketView.TcpFlagSyn);
+                    var trimmed = new TcpSegment(
+                        (uint)ack,
+                        pair.Value.Segment.AcknowledgmentNumber,
+                        flags,
+                        pair.Value.Segment.Window,
+                        pair.Value.Segment.UrgentPointer,
+                        trimmedPayload,
+                        pair.Value.Segment.Options);
+
+                    _outboundToClient.Remove(pair.Key);
+                    _outboundToClient[ack] = OutboundSegment.Create(trimmed);
+                }
+
+                return;
+            }
+        }
+
+        private void AcceptClientPayloadLocked(TcpSegment segment)
+        {
+            var sequence = UnwrapNear(segment.SequenceNumber, _clientReceiveNext);
+            var payload = segment.Payload;
+            if (payload.Length == 0)
+            {
+                return;
+            }
+
+            var end = sequence + payload.Length;
+            if (end <= _clientAcknowledged)
+            {
+                return;
+            }
+
+            var bufferedEnd = Math.Max(_clientReceiveNext, end);
+            if (bufferedEnd - _clientAcknowledged > MaxBufferedClientBytes)
+            {
+                return;
+            }
+
+            if (sequence > _clientReceiveNext)
+            {
+                StoreOutOfOrder(sequence, payload, segment.UrgentPointer, (segment.Flags & PacketView.TcpFlagUrg) != 0);
+                return;
+            }
+
+            var start = Math.Max(sequence, _clientReceiveNext);
+            var offset = checked((int)(start - sequence));
+            if (offset >= payload.Length)
+            {
+                return;
+            }
+
+            var accepted = payload[offset..].ToArray();
+            EnqueueClientWrite(start, accepted, segment.UrgentPointer, (segment.Flags & PacketView.TcpFlagUrg) != 0);
+            _clientReceiveNext = start + accepted.Length;
+            FlushOutOfOrderLocked();
+        }
+
+        private void StoreOutOfOrder(
+            long sequence,
+            ReadOnlyMemory<byte> payload,
+            ushort urgentPointer,
+            bool urgent)
+        {
+            if (_outOfOrder.TryGetValue(sequence, out var existing)
+                && existing.Payload.Length >= payload.Length)
+            {
+                return;
+            }
+
+            if (existing is not null)
+            {
+                _outOfOrderBytes -= existing.Payload.Length;
+            }
+
+            if (_outOfOrderBytes + payload.Length > MaxOutOfOrderBytes)
+            {
+                return;
+            }
+
+            var copy = payload.ToArray();
+            _outOfOrder[sequence] = new PendingClientData(sequence, copy, urgentPointer, urgent);
+            _outOfOrderBytes += copy.Length;
+        }
+
+        private void FlushOutOfOrderLocked()
+        {
+            while (_outOfOrder.Count > 0)
+            {
+                using var enumerator = _outOfOrder.GetEnumerator();
+                if (!enumerator.MoveNext())
                 {
                     return;
                 }
 
-                var payload = enumerator.Current.Value;
-                _pendingOutOfOrderPayloads.Remove(sequenceNumber);
-                if (sequenceNumber + (uint)payload.Length <= _nextClientSequence)
+                var pair = enumerator.Current;
+                if (pair.Key > _clientReceiveNext)
+                {
+                    return;
+                }
+
+                _outOfOrder.Remove(pair.Key);
+                _outOfOrderBytes -= pair.Value.Payload.Length;
+
+                var end = pair.Key + pair.Value.Payload.Length;
+                if (end <= _clientReceiveNext)
                 {
                     continue;
                 }
 
-                AcceptContiguousPayload(sequenceNumber, payload, acceptedPayloads);
+                var offset = checked((int)Math.Max(0, _clientReceiveNext - pair.Key));
+                var payload = pair.Value.Payload[offset..];
+                if (payload.Length == 0)
+                {
+                    continue;
+                }
+
+                EnqueueClientWrite(
+                    _clientReceiveNext,
+                    payload,
+                    pair.Value.UrgentPointer,
+                    pair.Value.Urgent);
+                _clientReceiveNext += payload.Length;
             }
         }
 
-        private bool TryConsumePendingFin()
+        private void HandleClientFinLocked(TcpSegment segment)
         {
-            if (_pendingFinSequence != _nextClientSequence)
+            var finSequence = UnwrapNear(segment.SequenceNumber, _clientReceiveNext) + segment.Payload.Length;
+            if (finSequence < _clientAcknowledged)
             {
-                return false;
+                return;
+            }
+
+            if (finSequence == _clientReceiveNext)
+            {
+                ConsumePendingFinLocked(finSequence);
+            }
+            else if (finSequence > _clientReceiveNext)
+            {
+                _pendingFinSequence = finSequence;
+            }
+        }
+
+        private void TryConsumePendingFinLocked()
+        {
+            if (_pendingFinSequence is not { } pending || pending != _clientReceiveNext)
+            {
+                return;
+            }
+
+            ConsumePendingFinLocked(pending);
+        }
+
+        private void ConsumePendingFinLocked(long finSequence)
+        {
+            if (_clientFinReceived && _clientFinSequence == finSequence)
+            {
+                return;
             }
 
             _pendingFinSequence = null;
-            _nextClientSequence++;
-            return true;
+            _clientFinReceived = true;
+            _clientFinSequence = finSequence;
+            _clientReceiveNext = finSequence + 1;
+            _writeQueue.Enqueue(new PendingClientWrite(finSequence, [], Fin: true, Urgent: false, UrgentPointer: 0));
+            _writeSignal.Release();
         }
 
-        private async Task ReceiveRemoteLoopAsync(CancellationToken cancellationToken)
+        private void EnqueueClientWrite(
+            long sequence,
+            byte[] payload,
+            ushort urgentPointer,
+            bool urgent)
         {
-            var buffer = ArrayPool<byte>.Shared.Rent(MaxTcpPayload);
+            _writeQueue.Enqueue(new PendingClientWrite(sequence, payload, Fin: false, Urgent: urgent, UrgentPointer: urgentPointer));
+            _writeSignal.Release();
+        }
+
+        private async Task WriterLoopAsync()
+        {
             try
             {
-                while (!cancellationToken.IsCancellationRequested)
+                await _connected.Task.WaitAsync(_cts.Token).ConfigureAwait(false);
+
+                while (!_cts.IsCancellationRequested)
                 {
-                    NetworkStream? stream;
+                    await _writeSignal.WaitAsync(_cts.Token).ConfigureAwait(false);
+
+                    PendingClientWrite? item;
                     lock (_sync)
                     {
                         if (_closed)
@@ -635,186 +774,712 @@ internal sealed class TcpDirectRelay : IDisposable
                             return;
                         }
 
-                        stream = _stream;
+                        item = _writeQueue.Count > 0 ? _writeQueue.Dequeue() : null;
                     }
 
-                    if (stream is null)
+                    if (item is null)
                     {
-                        return;
+                        continue;
                     }
 
-                    var read = await stream.ReadAsync(buffer.AsMemory(0, MaxTcpPayload), cancellationToken).ConfigureAwait(false);
-                    if (read == 0)
-                    {
-                        uint seq;
-                        uint ack;
-                        lock (_sync)
-                        {
-                            if (_closed)
-                            {
-                                return;
-                            }
-
-                            seq = _nextRemoteSequence;
-                            ack = _nextClientSequence;
-                            _nextRemoteSequence++;
-                            _closed = true;
-                            LastActivity = _timeProvider.GetUtcNow();
-                        }
-
-                        Inject(seq, ack, PacketView.TcpFlagFin | PacketView.TcpFlagAck, ReadOnlyMemory<byte>.Empty);
-                        CloseNetwork();
-                        return;
-                    }
-
-                    byte[] payload = buffer.AsSpan(0, read).ToArray();
-                    uint packetSequence;
-                    uint packetAck;
+                    Socket? socket;
                     lock (_sync)
                     {
-                        if (_closed)
-                        {
-                            return;
-                        }
-
-                        packetSequence = _nextRemoteSequence;
-                        packetAck = _nextClientSequence;
-                        _nextRemoteSequence += (uint)read;
-                        LastActivity = _timeProvider.GetUtcNow();
+                        socket = _socket;
                     }
 
-                    _downBytes += read;
-                    _trafficCounter.AddDownload(read);
-                    Inject(packetSequence, packetAck, PacketView.TcpFlagPsh | PacketView.TcpFlagAck, payload);
-                    _packetWakeSignal?.Pulse();
-                    LogStats("RECV");
+                    if (socket is null)
+                    {
+                        return;
+                    }
+
+                    if (item.Payload.Length > 0)
+                    {
+                        await SendClientPayloadAsync(socket, item).ConfigureAwait(false);
+                        _trafficCounter.AddUpload(item.Payload.Length);
+                        _packetWakeSignal?.Pulse();
+                    }
+
+                    if (item.Fin)
+                    {
+                        try
+                        {
+                            socket.Shutdown(SocketShutdown.Send);
+                        }
+                        catch (SocketException)
+                        {
+                        }
+                    }
+
+                    bool closeAfter;
+                    lock (_sync)
+                    {
+                        _clientAcknowledged = Math.Max(
+                            _clientAcknowledged,
+                            item.Sequence + item.Payload.Length + (item.Fin ? 1 : 0));
+                        closeAfter = TryCompleteCloseLocked();
+                    }
+
+                    InjectClientAcknowledgement();
+                    if (closeAfter)
+                    {
+                        CloseClient(injectReset: false);
+                        return;
+                    }
                 }
             }
             catch (OperationCanceledException)
             {
             }
-            catch (ObjectDisposedException)
+            catch (Exception ex)
+            {
+                FailClient($"DIRECT TCP send failed app={_target.AppLabel} appLocal={_target.ClientEndpoint} client={_clientKey.ClientAddress}:{_clientKey.ClientPort} target={_target.RemoteEndpoint}: {ex.Message}");
+            }
+        }
+
+        private async Task SendClientPayloadAsync(Socket socket, PendingClientWrite item)
+        {
+            if (!item.Urgent || item.Payload.Length == 0)
+            {
+                await SendAllAsync(socket, item.Payload, SocketFlags.None, _cts.Token).ConfigureAwait(false);
+                return;
+            }
+
+            var urgentIndex = Math.Clamp(item.UrgentPointer, 1, item.Payload.Length);
+            if (urgentIndex > 1)
+            {
+                await SendAllAsync(socket, item.Payload.AsMemory(0, urgentIndex - 1), SocketFlags.None, _cts.Token).ConfigureAwait(false);
+            }
+
+            try
+            {
+                await SendAllAsync(socket, item.Payload.AsMemory(urgentIndex - 1, 1), SocketFlags.OutOfBand, _cts.Token).ConfigureAwait(false);
+            }
+            catch (SocketException)
+            {
+                await SendAllAsync(socket, item.Payload.AsMemory(urgentIndex - 1, 1), SocketFlags.None, _cts.Token).ConfigureAwait(false);
+            }
+
+            if (urgentIndex < item.Payload.Length)
+            {
+                await SendAllAsync(socket, item.Payload.AsMemory(urgentIndex), SocketFlags.None, _cts.Token).ConfigureAwait(false);
+            }
+        }
+
+        private async Task ReceiveRemoteLoopAsync()
+        {
+            var buffer = new byte[MaxTcpPayload];
+            try
+            {
+                await _connected.Task.WaitAsync(_cts.Token).ConfigureAwait(false);
+                await _handshakeAcknowledged.Task.WaitAsync(_cts.Token).ConfigureAwait(false);
+
+                while (!_cts.IsCancellationRequested)
+                {
+                    int readSize;
+                    var waitForWindow = false;
+                    lock (_sync)
+                    {
+                        if (_closed || _remoteFinQueued)
+                        {
+                            return;
+                        }
+
+                        var windowEnd = _clientAckSequence + _clientWindow;
+                        var available = windowEnd - _remoteSendNext;
+                        if (available <= 0)
+                        {
+                            waitForWindow = true;
+                            readSize = 0;
+                        }
+                        else
+                        {
+                            readSize = (int)Math.Min(MaxTcpPayload, available);
+                        }
+                    }
+
+                    if (waitForWindow)
+                    {
+                        await _windowChanged.WaitAsync(_cts.Token).ConfigureAwait(false);
+                        continue;
+                    }
+
+                    Socket? socket;
+                    lock (_sync)
+                    {
+                        socket = _socket;
+                    }
+
+                    if (socket is null)
+                    {
+                        return;
+                    }
+
+                    var read = await socket.ReceiveAsync(
+                        buffer.AsMemory(0, readSize),
+                        SocketFlags.None,
+                        _cts.Token).ConfigureAwait(false);
+
+                    if (read == 0)
+                    {
+                        _detailLog?.Invoke($"DIRECT TCP remote EOF app={_target.AppLabel} client={_clientKey.ClientAddress}:{_clientKey.ClientPort} target={_target.RemoteEndpoint}");
+                        QueueRemoteFin();
+                        return;
+                    }
+
+                    var payload = buffer.AsMemory(0, read).ToArray();
+                    lock (_sync)
+                    {
+                        if (_closed)
+                        {
+                            return;
+                        }
+
+                        var sequence = _remoteSendNext;
+                        var segment = new TcpSegment(
+                            (uint)sequence,
+                            (uint)_clientAcknowledged,
+                            PacketView.TcpFlagPsh | PacketView.TcpFlagAck,
+                            GetClientFacingWindowLocked(),
+                            0,
+                            payload,
+                            ReadOnlyMemory<byte>.Empty);
+                        AddOutboundSegmentLocked(segment);
+                        TrySendQueuedToClientLocked();
+                    }
+
+                    _trafficCounter.AddDownload(read);
+                    _packetWakeSignal?.Pulse();
+                }
+            }
+            catch (OperationCanceledException)
             {
             }
             catch (Exception ex)
             {
-                _errorLog($"DIRECT TCP remote receive failed for {_clientKey.ClientAddress}:{_clientKey.ClientPort} -> {_target.RemoteAddress}:{_target.RemotePort}: {ex.Message}");
-                Close();
-            }
-            finally
-            {
-                ArrayPool<byte>.Shared.Return(buffer);
+                FailClient($"DIRECT TCP remote receive failed for {_clientKey.ClientAddress}:{_clientKey.ClientPort} -> {_target.RemoteAddress}:{_target.RemotePort}: {ex.Message}");
             }
         }
 
-        private async Task<int> FlushPendingPayloadsAsync(NetworkStream stream, CancellationToken cancellationToken)
+        private void QueueRemoteFin()
         {
-            var flushedBytes = 0;
-            while (true)
+            bool signalConnection = false;
+            lock (_sync)
             {
-                byte[]? payload;
-                lock (_sync)
+                if (_closed || _remoteFinQueued)
                 {
-                    payload = _pendingWritePayloads is { Count: > 0 }
-                        ? _pendingWritePayloads.Dequeue()
-                        : null;
+                    return;
                 }
 
-                if (payload is null)
-                {
-                    return flushedBytes;
-                }
+                _remoteFinQueued = true;
+                _remoteFinSequence = _remoteSendNext;
+                var segment = new TcpSegment(
+                    (uint)_remoteFinSequence,
+                    (uint)_clientAcknowledged,
+                    PacketView.TcpFlagFin | PacketView.TcpFlagAck,
+                    GetClientFacingWindowLocked(),
+                    0,
+                    ReadOnlyMemory<byte>.Empty,
+                    ReadOnlyMemory<byte>.Empty);
+                AddOutboundSegmentLocked(segment);
+                TrySendQueuedToClientLocked();
+                signalConnection = TryCompleteCloseLocked();
+            }
 
-                ProbeClientSni([payload]);
-                await stream.WriteAsync(payload, cancellationToken).ConfigureAwait(false);
-                flushedBytes += payload.Length;
-                _upBytes += payload.Length;
-                _trafficCounter.AddUpload(payload.Length);
-                _packetWakeSignal?.Pulse();
-                LogStats("SEND");
+            if (signalConnection)
+            {
+                CloseClient(injectReset: false);
             }
         }
 
-        private void Inject(uint sequenceNumber, uint acknowledgmentNumber, byte flags, ReadOnlyMemory<byte> payload)
+        private void AddOutboundSegmentLocked(TcpSegment segment)
         {
-            _packetInjector?.Invoke(_target, sequenceNumber, acknowledgmentNumber, flags, _clientWindow, payload);
+            var start = (long)segment.SequenceNumber;
+            if (_remoteSendNext != _remoteInitialSequence && start != _remoteSendNext)
+            {
+                start = _remoteSendNext;
+                segment = segment with { SequenceNumber = (uint)start };
+            }
+
+            var outbound = OutboundSegment.Create(segment);
+            _outboundToClient[start] = outbound;
+            _remoteSendNext = outbound.End;
         }
 
-        private void Close()
+        private void TrySendQueuedToClientLocked()
+        {
+            var windowEnd = _clientAckSequence + _clientWindow;
+            foreach (var outbound in _outboundToClient.Values)
+            {
+                if (outbound.Sent)
+                {
+                    continue;
+                }
+
+                if (outbound.End > windowEnd)
+                {
+                    return;
+                }
+
+                SendOutboundSegmentLocked(outbound, force: false);
+            }
+        }
+
+        private void RetransmitEarliestLocked(bool force)
+        {
+            foreach (var outbound in _outboundToClient.Values)
+            {
+                if (!outbound.Sent || force)
+                {
+                    if (outbound.End > _clientAckSequence + _clientWindow)
+                    {
+                        return;
+                    }
+
+                    SendOutboundSegmentLocked(outbound, force);
+                    return;
+                }
+            }
+        }
+
+        private void SendOutboundSegmentLocked(OutboundSegment outbound, bool force)
+        {
+            if (_packetInjector is null)
+            {
+                FailLocked();
+                return;
+            }
+
+            try
+            {
+                _packetInjector(
+                    _target,
+                    outbound.Segment with
+                    {
+                        SequenceNumber = (uint)outbound.Start,
+                        AcknowledgmentNumber = (uint)_clientAcknowledged,
+                        Window = GetClientFacingWindowLocked()
+                    });
+                outbound.Sent = true;
+                outbound.Attempts++;
+                outbound.LastSent = _timeProvider.GetUtcNow();
+                if (outbound.Attempts > MaxRetransmissionAttempts)
+                {
+                    FailLocked();
+                }
+            }
+            catch (Exception ex)
+            {
+                _errorLog($"DIRECT TCP inject failed app={_target.AppLabel} client={_clientKey.ClientAddress}:{_clientKey.ClientPort} target={_target.RemoteEndpoint}: {ex.Message}");
+                FailLocked();
+            }
+        }
+
+        private void InjectClientAcknowledgement()
         {
             lock (_sync)
             {
+                if (_closed || _packetInjector is null)
+                {
+                    return;
+                }
+
+                var segment = new TcpSegment(
+                    (uint)_remoteSendNext,
+                    (uint)_clientAcknowledged,
+                    PacketView.TcpFlagAck,
+                    GetClientFacingWindowLocked(),
+                    0,
+                    ReadOnlyMemory<byte>.Empty,
+                    ReadOnlyMemory<byte>.Empty);
+                try
+                {
+                    _packetInjector(_target, segment);
+                }
+                catch (Exception ex)
+                {
+                    _errorLog($"DIRECT TCP acknowledgement inject failed app={_target.AppLabel}: {ex.Message}");
+                    FailLocked();
+                }
+            }
+        }
+
+        private ushort GetClientFacingWindowLocked()
+        {
+            var buffered = Math.Max(0, _clientReceiveNext - _clientAcknowledged);
+            return (ushort)Math.Clamp(MaxBufferedClientBytes - buffered, 0, ushort.MaxValue);
+        }
+
+        private bool TryCompleteCloseLocked()
+        {
+            if (!_clientFinReceived || !_remoteFinAcknowledged)
+            {
+                return false;
+            }
+
+            if (_writeQueue.Count > 0 || _outboundToClient.Count > 0)
+            {
+                return false;
+            }
+
+            return _clientAcknowledged >= _clientFinSequence + 1;
+        }
+
+        private void QueueSynAck()
+        {
+            lock (_sync)
+            {
+                if (_closed || _remoteSendNext != _remoteInitialSequence)
+                {
+                    return;
+                }
+
+                var mss = (ushort)(_target.RemoteAddress.AddressFamily == AddressFamily.InterNetwork ? 1460 : 1440);
+                var options = new byte[]
+                {
+                    2,
+                    4,
+                    (byte)(mss >> 8),
+                    (byte)mss
+                };
+                var segment = new TcpSegment(
+                    (uint)_remoteInitialSequence,
+                    (uint)_clientReceiveNext,
+                    PacketView.TcpFlagSyn | PacketView.TcpFlagAck,
+                    GetClientFacingWindowLocked(),
+                    0,
+                    ReadOnlyMemory<byte>.Empty,
+                    options);
+                AddOutboundSegmentLocked(segment);
+                TrySendQueuedToClientLocked();
+            }
+
+            _detailLog?.Invoke($"DIRECT TCP CONNECT app={_target.AppLabel} appLocal={_target.ClientEndpoint} client={_clientKey.ClientAddress}:{_clientKey.ClientPort} target={_target.RemoteEndpoint} relayProcess={Environment.ProcessId}");
+        }
+
+        private void RegisterOutboundFlow(IPEndPoint remoteEndPoint, Socket socket)
+        {
+            if (socket.LocalEndPoint is not IPEndPoint localEndPoint || localEndPoint.Port == 0)
+            {
+                return;
+            }
+
+            var localAddress = localEndPoint.Address.AddressFamily == AddressFamily.InterNetwork
+                ? (localEndPoint.Address.Equals(IPAddress.Any) ? IPAddress.Any : localEndPoint.Address)
+                : (localEndPoint.Address.Equals(IPAddress.IPv6Any) ? IPAddress.IPv6Any : localEndPoint.Address);
+            var flow = new RelayOutboundFlow(
+                _target.AdapterHandle,
+                PacketView.ProtocolTcp,
+                localAddress,
+                remoteEndPoint.Address,
+                (ushort)localEndPoint.Port,
+                (ushort)remoteEndPoint.Port);
+
+            lock (_outboundFlowSync)
+            {
+                if (_outboundFlows.Contains(flow))
+                {
+                    return;
+                }
+
+                _outboundFlows.Add(flow);
+            }
+
+            _registerOutboundFlow(flow);
+
+            if (localAddress.Equals(IPAddress.Any) || localAddress.Equals(IPAddress.IPv6Any))
+            {
+                return;
+            }
+
+            var wildcardAddress = localAddress.AddressFamily == AddressFamily.InterNetwork
+                ? IPAddress.Any
+                : IPAddress.IPv6Any;
+            RelayOutboundFlow wildcardFlow;
+            lock (_outboundFlowSync)
+            {
+                wildcardFlow = _outboundFlows.FirstOrDefault(candidate =>
+                    candidate.AdapterHandle == flow.AdapterHandle
+                    && candidate.LocalAddress.Equals(wildcardAddress)
+                    && candidate.LocalPort == flow.LocalPort
+                    && candidate.RemoteAddress.Equals(flow.RemoteAddress)
+                    && candidate.RemotePort == flow.RemotePort);
+                if (wildcardFlow != default)
+                {
+                    _outboundFlows.Remove(wildcardFlow);
+                }
+            }
+
+            if (wildcardFlow != default)
+            {
+                _unregisterOutboundFlow(wildcardFlow);
+            }
+        }
+
+        private void ClearOutboundFlows()
+        {
+            RelayOutboundFlow[] flows;
+            lock (_outboundFlowSync)
+            {
+                flows = _outboundFlows.ToArray();
+                _outboundFlows.Clear();
+            }
+
+            foreach (var flow in flows)
+            {
+                _unregisterOutboundFlow(flow);
+            }
+        }
+
+        internal void Maintain(DateTimeOffset now)
+        {
+            bool fail = false;
+            lock (_sync)
+            {
+                if (_closed)
+                {
+                    return;
+                }
+
+                if (!_connectedFlag && now - _createdAt > ConnectTimeout)
+                {
+                    fail = true;
+                }
+                else if (_outboundToClient.Count > 0)
+                {
+                    using var enumerator = _outboundToClient.GetEnumerator();
+                    if (enumerator.MoveNext())
+                    {
+                        var outbound = enumerator.Current.Value;
+                        if (outbound.Sent
+                            && now - outbound.LastSent >= _retransmissionTimeout
+                            && outbound.End <= _clientAckSequence + _clientWindow)
+                        {
+                            SendOutboundSegmentLocked(outbound, force: true);
+                            _retransmissionTimeout = TimeSpan.FromMilliseconds(
+                                Math.Min(
+                                    MaxRetransmissionTimeout.TotalMilliseconds,
+                                    _retransmissionTimeout.TotalMilliseconds * 2));
+                        }
+                    }
+                }
+
+                if (_remoteFinAcknowledged
+                    && now - _lastActivity > InitialRemoteFinLifetime)
+                {
+                    fail = false;
+                }
+            }
+
+            if (fail)
+            {
+                FailClient("DIRECT TCP relay timed out while connecting.");
+            }
+        }
+
+        private void FailClient(string message)
+        {
+            _errorLog(message);
+            bool injectReset;
+            TcpSegment segment = default;
+            lock (_sync)
+            {
+                if (_closed)
+                {
+                    return;
+                }
+
+                injectReset = true;
+                segment = new TcpSegment(
+                    (uint)_remoteSendNext,
+                    (uint)_clientReceiveNext,
+                    PacketView.TcpFlagRst | PacketView.TcpFlagAck,
+                    0,
+                    0,
+                    ReadOnlyMemory<byte>.Empty,
+                    ReadOnlyMemory<byte>.Empty);
                 _closed = true;
             }
 
-            _remove(_clientKey);
+            if (injectReset && _packetInjector is not null)
+            {
+                try
+                {
+                    _packetInjector(_target, segment);
+                }
+                catch
+                {
+                }
+            }
+
+            DisposeResources();
         }
 
-        private void ClearOutboundFlow()
+        private void FailLocked()
         {
-            if (_outboundFlowKey is { } outboundFlowKey)
-            {
-                _untrackOutboundFlow(outboundFlowKey);
-                _outboundFlowKey = null;
-            }
-
-            if (_outboundBypassFlow is { } outboundBypassFlow)
-            {
-                _outboundBypassUnregister?.Invoke(outboundBypassFlow);
-                _outboundBypassFlow = null;
-            }
+            _closed = true;
         }
 
-        private void RegisterOutboundBypass(byte protocol, IPAddress remoteAddress, ushort localPort, ushort remotePort)
+        private void CloseClient(bool injectReset)
         {
-            if (_target.AdapterHandle == IntPtr.Zero || localPort == 0)
+            TcpSegment reset = default;
+            lock (_sync)
             {
-                return;
+                if (_closed)
+                {
+                    return;
+                }
+
+                _closed = true;
+                if (injectReset)
+                {
+                    reset = new TcpSegment(
+                        (uint)_remoteSendNext,
+                        (uint)_clientReceiveNext,
+                        PacketView.TcpFlagRst | PacketView.TcpFlagAck,
+                        0,
+                        0,
+                        ReadOnlyMemory<byte>.Empty,
+                        ReadOnlyMemory<byte>.Empty);
+                }
             }
 
-            var outboundBypassFlow = new RelayOutboundFlow(_target.AdapterHandle, protocol, remoteAddress, localPort, remotePort);
-            _outboundBypassFlow = outboundBypassFlow;
-            _outboundBypassRegister?.Invoke(outboundBypassFlow);
+            if (injectReset && _packetInjector is not null)
+            {
+                try
+                {
+                    _packetInjector(_target, reset);
+                }
+                catch
+                {
+                }
+            }
+
+            DisposeResources();
         }
 
-        private void CloseNetwork()
+        private void DisposeResources(bool removeConnection = true)
         {
-            ClearOutboundFlow();
-
-            _stream?.Dispose();
-            _client?.Dispose();
-            _stream = null;
-            _client = null;
-            _connected = false;
-        }
-
-        private void LogStats(string direction)
-        {
-            var now = _timeProvider.GetUtcNow();
-            if (_detailLog is null)
+            ClearOutboundFlows();
+            _connected.TrySetCanceled();
+            _handshakeAcknowledged.TrySetCanceled();
+            _cts.Cancel();
+            _socket?.Dispose();
+            _socket = null;
+            Pulse(_writeSignal);
+            Pulse(_windowChanged);
+            if (removeConnection)
             {
-                return;
+                _remove(_clientKey);
             }
-
-            ref var lastStatsLog = ref (direction == "RECV" ? ref _lastDownLog : ref _lastUpLog);
-            if (lastStatsLog != default && now - lastStatsLog < TimeSpan.FromSeconds(5))
-            {
-                return;
-            }
-
-            lastStatsLog = now;
-            _detailLog($"DIRECT TCP {direction} app={_target.AppLabel} appLocal={_target.ClientEndpoint} client={_clientKey.ClientAddress}:{_clientKey.ClientPort} target={_target.RemoteEndpoint} relayProcess={Environment.ProcessId} up={_upBytes} down={_downBytes}");
         }
 
         public void Dispose()
         {
+            CloseClient(injectReset: false);
+            _cts.Dispose();
+            _writeSignal.Dispose();
+            _windowChanged.Dispose();
+        }
+
+        internal void DisposeWithoutRemoving()
+        {
             lock (_sync)
             {
                 _closed = true;
             }
 
-            CloseNetwork();
-            _sendLock.Dispose();
+            DisposeResources(removeConnection: false);
+            _cts.Dispose();
+            _writeSignal.Dispose();
+            _windowChanged.Dispose();
+        }
+
+        private static Socket CreateRelaySocket(AddressFamily addressFamily)
+        {
+            return new Socket(addressFamily, SocketType.Stream, ProtocolType.Tcp)
+            {
+                NoDelay = true
+            };
+        }
+
+        private static async Task SendAllAsync(
+            Socket socket,
+            ReadOnlyMemory<byte> payload,
+            SocketFlags flags,
+            CancellationToken cancellationToken)
+        {
+            var offset = 0;
+            while (offset < payload.Length)
+            {
+                var sent = await socket.SendAsync(payload[offset..], flags, cancellationToken).ConfigureAwait(false);
+                if (sent <= 0)
+                {
+                    throw new IOException("The relay socket sent zero bytes.");
+                }
+
+                offset += sent;
+            }
+        }
+
+        private static long UnwrapNear(uint sequence, long reference)
+        {
+            var delta = (int)(sequence - (uint)reference);
+            return reference + delta;
+        }
+
+        private static void Pulse(SemaphoreSlim semaphore)
+        {
+            try
+            {
+                semaphore.Release();
+            }
+            catch (SemaphoreFullException)
+            {
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+        }
+
+        private sealed class PendingClientData(
+            long sequence,
+            byte[] payload,
+            ushort urgentPointer,
+            bool urgent)
+        {
+            public long Sequence { get; } = sequence;
+            public byte[] Payload { get; } = payload;
+            public ushort UrgentPointer { get; } = urgentPointer;
+            public bool Urgent { get; } = urgent;
+        }
+
+        private sealed record PendingClientWrite(
+            long Sequence,
+            byte[] Payload,
+            bool Fin,
+            bool Urgent,
+            ushort UrgentPointer);
+
+        private sealed class OutboundSegment
+        {
+            private OutboundSegment(long start, TcpSegment segment)
+            {
+                Start = start;
+                Segment = segment;
+            }
+
+            public long Start { get; }
+            public long End => Start + Segment.SequenceLength;
+            public TcpSegment Segment { get; }
+            public bool Sent { get; set; }
+            public int Attempts { get; set; }
+            public DateTimeOffset LastSent { get; set; }
+
+            public static OutboundSegment Create(TcpSegment segment)
+            {
+                return new OutboundSegment((long)segment.SequenceNumber, segment);
+            }
         }
     }
 }

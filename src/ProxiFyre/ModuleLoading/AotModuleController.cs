@@ -23,6 +23,7 @@ internal sealed class AotModuleController : IDisposable
     private ModuleTargetProcess? _targetProcess;
     private string? _runtimeDllPath;
     private readonly string? _moduleLogPath;
+    private readonly string? _telemetryPipeName;
     private bool _relayRunning;
     private bool _disposed;
     private bool _heartbeatInProgress;
@@ -34,13 +35,15 @@ internal sealed class AotModuleController : IDisposable
         WinpkFilterManager winpkFilterManager,
         Action<string> log,
         Action<ModuleEvent> moduleEvent,
-        string? moduleLogPath = null)
+        string? moduleLogPath = null,
+        string? telemetryPipeName = null)
     {
         _configurationStore = configurationStore;
         _winpkFilterManager = winpkFilterManager;
         _log = log;
         _moduleEvent = moduleEvent;
         _moduleLogPath = moduleLogPath;
+        _telemetryPipeName = telemetryPipeName;
     }
 
     public bool IsRunning => _relayRunning;
@@ -311,7 +314,8 @@ internal sealed class AotModuleController : IDisposable
             command,
             Path.GetFullPath(_configurationStore.Path),
             _moduleLogPath ?? Path.Combine(AppContext.BaseDirectory, "proxifyre-core.log"),
-            _messageClient.WindowHandle);
+            _messageClient.WindowHandle,
+            telemetryPipeName: _telemetryPipeName);
 
         return timeout is { } value
             ? _messageClient.SendCommand(_moduleWindow, payload, value)

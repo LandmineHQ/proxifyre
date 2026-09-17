@@ -30,6 +30,7 @@
     <Resource Include="Assets\AppIcon.ico" />
     <Compile Include="..\Shared\LicenseKey.cs" Link="Shared\LicenseKey.cs" />
     <Compile Include="..\Shared\ModuleMessageProtocol.cs" Link="Shared\ModuleMessageProtocol.cs" />
+    <Compile Include="..\Shared\TrafficTelemetry.cs" Link="Shared\TrafficTelemetry.cs" />
     <Content Include="..\..\manifest.json" Link="manifest.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
   <Target Name="CopyNativeAotModule" AfterTargets="Build">
@@ -47,3 +48,4 @@
           Condition="Exists('$(NativeAotProbePath)')" />
   </Target>
 </Project>
+

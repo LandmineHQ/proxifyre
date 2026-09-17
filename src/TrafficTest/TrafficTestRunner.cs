@@ -30,6 +30,32 @@ internal static class TrafficTestRunner
                 return await LeigodRedirectDemo.RunAsync(args.Skip(1).ToArray());
             }
 
+            if (args.Length > 0 && args[0].Equals("traffic-telemetry", StringComparison.OrdinalIgnoreCase))
+            {
+                using var telemetryCts = new CancellationTokenSource();
+                Console.CancelKeyPress += (_, e) =>
+                {
+                    e.Cancel = true;
+                    telemetryCts.Cancel();
+                };
+                return await TrafficTelemetryDiagnostic.RunAsync(telemetryCts.Token);
+            }
+
+            if (args.Length > 0 && args[0].Equals("packet-selftest", StringComparison.OrdinalIgnoreCase))
+            {
+                return PacketSelfTest.Run();
+            }
+
+            if (args.Length > 0 && args[0].Equals("tcp-selftest", StringComparison.OrdinalIgnoreCase))
+            {
+                return await TcpRelaySelfTest.RunAsync();
+            }
+
+            if (args.Length > 0 && args[0].Equals("udp-selftest", StringComparison.OrdinalIgnoreCase))
+            {
+                return await UdpRelaySelfTest.RunAsync();
+            }
+
             if (args.Length > 0 && args[0].Equals("run-leigod-demo", StringComparison.OrdinalIgnoreCase))
             {
                 return await LeigodRedirectDemo.RunChildAsync(args.Skip(1).ToArray());

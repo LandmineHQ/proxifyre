@@ -43,8 +43,10 @@ internal static unsafe class NdisApi
     public const uint TransportLayerValid = 0x00000004;
     public const uint Ipv4 = 0x00000001;
     public const uint Ipv6 = 0x00000002;
+    public const uint Ipv4FilterSourceAddress = 0x00000001;
     public const uint Ipv4FilterDestAddress = 0x00000002;
     public const uint Ipv4FilterProtocol = 0x00000004;
+    public const uint Ipv6FilterSourceAddress = 0x00000001;
     public const uint Ipv6FilterDestAddress = 0x00000002;
     public const uint Ipv6FilterProtocol = 0x00000004;
     public const uint IpSubnetV4Type = 0x00000001;
@@ -199,9 +201,18 @@ internal static unsafe class NdisApi
         return DeviceIoControl(handle, IoctlResetPacketFilters, null, 0, null, 0, out _, IntPtr.Zero);
     }
 
-    public static StaticFilter CreateOutboundPassFilter(IntPtr adapter, byte protocol, IPAddress remoteAddress, ushort sourcePort, ushort destinationPort)
+    public static StaticFilter CreateOutboundPassFilter(
+        IntPtr adapter,
+        byte protocol,
+        IPAddress localAddress,
+        IPAddress remoteAddress,
+        ushort sourcePort,
+        ushort destinationPort)
     {
+        localAddress = NetworkAddress.Normalize(localAddress);
         remoteAddress = NetworkAddress.Normalize(remoteAddress);
+        var matchLocalAddress = !localAddress.Equals(IPAddress.Any)
+            && !localAddress.Equals(IPAddress.IPv6Any);
         var filter = new StaticFilter
         {
             AdapterHandle = adapter.ToInt64(),
@@ -219,17 +230,33 @@ internal static unsafe class NdisApi
 
         if (remoteAddress.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
         {
-            WriteIpv4Filter(&filter, remoteAddress, protocol);
+            WriteIpv4Filter(
+                &filter,
+                remoteAddress,
+                protocol,
+                matchLocalAddress && localAddress.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork
+                    ? localAddress
+                    : null);
         }
         else
         {
-            WriteIpv6Filter(&filter, remoteAddress, protocol);
+            WriteIpv6Filter(
+                &filter,
+                remoteAddress,
+                protocol,
+                matchLocalAddress && localAddress.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6
+                    ? localAddress
+                    : null);
         }
 
         return filter;
     }
 
-    private static void WriteIpv4Filter(StaticFilter* filter, IPAddress destinationAddress, byte protocol)
+    private static void WriteIpv4Filter(
+        StaticFilter* filter,
+        IPAddress destinationAddress,
+        byte protocol,
+        IPAddress? sourceAddress)
     {
         var addressBytes = destinationAddress.GetAddressBytes();
         var address = MemoryMarshal.Read<uint>(addressBytes);
@@ -242,10 +269,23 @@ internal static unsafe class NdisApi
             Protocol = protocol
         };
 
+        if (sourceAddress is not null)
+        {
+            var sourceBytes = sourceAddress.GetAddressBytes();
+            ipv4.ValidFields |= Ipv4FilterSourceAddress;
+            ipv4.SourceAddressType = IpSubnetV4Type;
+            ipv4.SourceAddress = MemoryMarshal.Read<uint>(sourceBytes);
+            ipv4.SourceMask = 0xFFFFFFFF;
+        }
+
         WriteNetworkUnion(filter, &ipv4, sizeof(Ipv4Filter));
     }
 
-    private static void WriteIpv6Filter(StaticFilter* filter, IPAddress destinationAddress, byte protocol)
+    private static void WriteIpv6Filter(
+        StaticFilter* filter,
+        IPAddress destinationAddress,
+        byte protocol,
+        IPAddress? sourceAddress)
     {
         var ipv6 = new Ipv6Filter
         {
@@ -259,6 +299,18 @@ internal static unsafe class NdisApi
         {
             ipv6.DestinationAddress[i] = addressBytes[i];
             ipv6.DestinationMask[i] = 0xFF;
+        }
+
+        if (sourceAddress is not null)
+        {
+            var sourceBytes = sourceAddress.GetAddressBytes();
+            ipv6.ValidFields |= Ipv6FilterSourceAddress;
+            ipv6.SourceAddressType = IpSubnetV6Type;
+            for (var i = 0; i < 16; i++)
+            {
+                ipv6.SourceAddress[i] = sourceBytes[i];
+                ipv6.SourceMask[i] = 0xFF;
+            }
         }
 
         WriteNetworkUnion(filter, &ipv6, sizeof(Ipv6Filter));
@@ -410,6 +462,14 @@ internal static unsafe class NdisApi
             fixed (long* handles = Handles)
             {
                 return (IntPtr)handles[index];
+            }
+        }
+
+        public uint GetMtu(int index)
+        {
+            fixed (ushort* mtus = Mtus)
+            {
+                return mtus[index];
             }
         }
     }

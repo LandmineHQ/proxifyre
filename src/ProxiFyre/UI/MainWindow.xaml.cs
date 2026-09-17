@@ -1,10 +1,8 @@
 using System.Collections.ObjectModel;
 using System.Diagnostics;
-using System.Globalization;
 using System.IO;
 using System.Text;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Interop;
@@ -19,10 +17,6 @@ public partial class MainWindow : Window
     private const int MaxUiLogEntries = 1000;
     private const int SwRestore = 9;
 
-    private static readonly Regex TrafficLinePattern = new(
-        @"(?:^|\s)TRAFFIC up=(?<up>\d+) down=(?<down>\d+) upRate=(?<upRate>\d+) downRate=(?<downRate>\d+)",
-        RegexOptions.Compiled | RegexOptions.CultureInvariant);
-
     private readonly ApplicationRulesManager _rulesManager = new();
     private readonly ObservableCollection<string> _logs = [];
     private readonly object _uiLogSync = new();
@@ -33,6 +27,7 @@ public partial class MainWindow : Window
     private readonly Forms.NotifyIcon _trayIcon;
     private readonly string _uiLogPath = Path.Combine(AppContext.BaseDirectory, "proxifyre-ui.log");
     private readonly StreamWriter _uiLogWriter;
+    private readonly TrafficTelemetryServer _telemetryServer;
     private bool _hasShownTrayHint;
     private bool _hasCheckedForUpdates;
     private bool _isAnnouncementDismissed;
@@ -50,6 +45,10 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
         _uiLogWriter = CreateUiLogWriter(_uiLogPath);
+        _telemetryServer = new TrafficTelemetryServer(
+            snapshot => Dispatcher.InvokeAsync(() => UpdateTrafficStatus(snapshot)),
+            AppendLog);
+        _telemetryServer.Start();
         _trayIcon = CreateTrayIcon();
         Tabs.Apps.ItemsSource = _rulesManager.View;
         Tabs.Logs.ItemsSource = _logs;
@@ -73,7 +72,8 @@ public partial class MainWindow : Window
         _moduleController = new AotModuleController(_configurationStore, _winpkFilterManager, AppendLog, moduleEvent =>
         {
             Dispatcher.InvokeAsync(() => ApplyModuleEvent(moduleEvent));
-        });
+        },
+        telemetryPipeName: _telemetryServer.PipeName);
         LoadLocalManifestInfo();
         SetVersionStatusChecking();
         UpdateCoreProcessInfo();
@@ -102,6 +102,18 @@ public partial class MainWindow : Window
         Header.StartStopEnabled = false;
         try
         {
+            await RefreshExistingModuleAsync(showTargetMissingMessage: true);
+        }
+        finally
+        {
+            Header.StartStopEnabled = true;
+        }
+    }
+
+    private async Task<ModuleAttachResult> RefreshExistingModuleAsync(bool showTargetMissingMessage)
+    {
+        try
+        {
             var result = await _moduleController.TryAttachExistingAsync(RuleEntry.CoreProcessName);
             switch (result)
             {
@@ -110,12 +122,15 @@ public partial class MainWindow : Window
                     break;
                 case ModuleAttachResult.TargetProcessMissing:
                     AppendLog($"未找到模组目标进程：{AppConfiguration.NormalizeCoreProcessName(RuleEntry.CoreProcessName)}。请先启动目标程序。");
-                    MessageBox.Show(
-                        this,
-                        $"未找到模组目标进程：{AppConfiguration.NormalizeCoreProcessName(RuleEntry.CoreProcessName)}\n\n请先启动目标程序，然后再载入模组。",
-                        "ProxiFyre",
-                        MessageBoxButton.OK,
-                        MessageBoxImage.Information);
+                    if (showTargetMissingMessage)
+                    {
+                        MessageBox.Show(
+                            this,
+                            $"未找到模组目标进程：{AppConfiguration.NormalizeCoreProcessName(RuleEntry.CoreProcessName)}\n\n请先启动目标程序，然后再载入模组。",
+                            "ProxiFyre",
+                            MessageBoxButton.OK,
+                            MessageBoxImage.Information);
+                    }
                     break;
                 case ModuleAttachResult.NotLoaded:
                     AppendLog("目标进程已启动，但尚未发现 AOT 模组。");
@@ -124,15 +139,14 @@ public partial class MainWindow : Window
                     AppendLog("发现 AOT 模组窗口，但模组未响应心跳；点击载入模组前请确认目标进程状态。");
                     break;
             }
+            UpdateCoreProcessInfo();
+            return result;
         }
         catch (Exception ex)
         {
             AppendLog($"Module reconnect failed: {ex.Message}");
-        }
-        finally
-        {
-            Header.StartStopEnabled = true;
             UpdateCoreProcessInfo();
+            return ModuleAttachResult.NotLoaded;
         }
     }
 
@@ -471,6 +485,7 @@ public partial class MainWindow : Window
         try
         {
             Header.StartStopEnabled = false;
+            await RefreshExistingModuleAsync(showTargetMissingMessage: false);
             var result = await _moduleController.LoadAndRunAsync(
                 RuleEntry.CoreProcessName,
                 _rulesManager.BuildApps(),
@@ -750,12 +765,6 @@ public partial class MainWindow : Window
         var uiLine = $"{DateTime.Now:HH:mm:ss}  {message}";
         WriteUiLogLine(message);
 
-        if (TryParseTrafficLine(message, out var traffic))
-        {
-            Dispatcher.InvokeAsync(() => UpdateTrafficStatus(traffic));
-            return;
-        }
-
         Dispatcher.InvokeAsync(() =>
         {
             _logs.Add(uiLine);
@@ -796,23 +805,6 @@ public partial class MainWindow : Window
         }
     }
 
-    private static bool TryParseTrafficLine(string message, out TrafficSnapshot snapshot)
-    {
-        snapshot = default;
-        var match = TrafficLinePattern.Match(message);
-        if (!match.Success)
-        {
-            return false;
-        }
-
-        snapshot = new TrafficSnapshot(
-            long.Parse(match.Groups["up"].Value, CultureInfo.InvariantCulture),
-            long.Parse(match.Groups["down"].Value, CultureInfo.InvariantCulture),
-            long.Parse(match.Groups["upRate"].Value, CultureInfo.InvariantCulture),
-            long.Parse(match.Groups["downRate"].Value, CultureInfo.InvariantCulture));
-        return true;
-    }
-
     private void UpdateTrafficStatus(TrafficSnapshot snapshot)
     {
         Tabs.SetTrafficStatus(
@@ -850,6 +842,7 @@ public partial class MainWindow : Window
         _trayIcon.Visible = false;
         _trayIcon.Dispose();
         _moduleController.Dispose();
+        _telemetryServer.Dispose();
         lock (_uiLogSync)
         {
             try

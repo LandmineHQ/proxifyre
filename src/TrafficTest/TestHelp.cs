@@ -36,6 +36,24 @@ internal static class TestHelp
             case "steam":
                 PrintProcessDiagnostic("Steam", "steamwebhelper.exe");
                 break;
+            case "traffic-telemetry":
+                PrintTrafficTelemetry();
+                break;
+            case "packet-selftest":
+                Console.WriteLine("Packet self-test:");
+                Console.WriteLine("  proxifyre.ps1 test packet-selftest");
+                Console.WriteLine("  Verifies packet parsing, VLAN, TCP options/URG, and IPv4/IPv6 fragment reassembly.");
+                break;
+            case "tcp-selftest":
+                Console.WriteLine("TCP relay self-test:");
+                Console.WriteLine("  proxifyre.ps1 test tcp-selftest");
+                Console.WriteLine("  Verifies TCP relay handshake, bidirectional data, ACK, and FIN state transitions on loopback.");
+                break;
+            case "udp-selftest":
+                Console.WriteLine("UDP relay self-test:");
+                Console.WriteLine("  proxifyre.ps1 test udp-selftest");
+                Console.WriteLine("  Verifies UDP flow forwarding and alternate response endpoint handling on loopback.");
+                break;
             case "leigod-redirect":
                 Console.WriteLine("Leigod redirect demo help.");
                 break;
@@ -54,7 +72,7 @@ internal static class TestHelp
     private static void PrintOverview()
     {
         Console.WriteLine("TrafficTest usage:");
-        Console.WriteLine("  proxifyre.ps1 test <tcp|udp|uu|steam|leigod-redirect> [-Detailed] [-- <test args>]");
+        Console.WriteLine("  proxifyre.ps1 test <tcp|udp|uu|steam|leigod-redirect|traffic-telemetry|packet-selftest|tcp-selftest|udp-selftest> [-Detailed] [-- <test args>]");
         Console.WriteLine();
         Console.WriteLine("Modes:");
         Console.WriteLine("  tcp              HTTPS curl relay diagnostic");
@@ -62,6 +80,10 @@ internal static class TestHelp
         Console.WriteLine("  uu               UU process ports and connections");
         Console.WriteLine("  steam            Steam WebHelper process ports and connections");
         Console.WriteLine("  leigod-redirect  Leigod WFP redirect test and demo");
+        Console.WriteLine("  traffic-telemetry  Verify the telemetry named-pipe channel (no driver required)");
+        Console.WriteLine("  packet-selftest  Verify packet parsing and fragment reassembly (no driver required)");
+        Console.WriteLine("  tcp-selftest     Verify TCP relay state transitions on loopback (no driver required)");
+        Console.WriteLine("  udp-selftest     Verify UDP forwarding and alternate response endpoints on loopback (no driver required)");
         Console.WriteLine();
         Console.WriteLine("More help:");
         Console.WriteLine("  proxifyre.ps1 test help tcp");
@@ -97,6 +119,14 @@ internal static class TestHelp
         Console.WriteLine("  --ipv6               Force IPv6.");
     }
 
+    private static void PrintTrafficTelemetry()
+    {
+        Console.WriteLine("Traffic telemetry test:");
+        Console.WriteLine("  proxifyre.ps1 test traffic-telemetry");
+        Console.WriteLine("  Starts the UI-side telemetry pipe server, connects as a client, publishes 3 snapshots,");
+        Console.WriteLine("  and verifies the UI callback receives them. Requires no driver or Administrator.");
+    }
+
     private static void PrintProcessDiagnostic(string label, string defaultProcessName)
     {
         Console.WriteLine($"{label} process diagnostic:");
@@ -107,8 +137,8 @@ internal static class TestHelp
         Console.WriteLine("  --duration-ms <ms>     Sampling duration. Defaults to 1000.");
         Console.WriteLine("  --interval-ms <ms>     Sampling interval. Defaults to 250.");
         Console.WriteLine("  --json                 Print JSON.");
-    }
 
+    }
     private static bool IsHelp(string value)
     {
         return value.Equals("help", StringComparison.OrdinalIgnoreCase)

@@ -18,7 +18,8 @@ internal sealed class ProcessLookup
     private const uint ProcessQueryLimitedInformation = 0x1000;
 
     private readonly TimeSpan _refreshInterval = TimeSpan.FromMilliseconds(250);
-    private readonly ConcurrentDictionary<int, ProcessInfo> _processCache = new();
+    private readonly TimeSpan _processCacheTtl = TimeSpan.FromSeconds(1);
+    private readonly ConcurrentDictionary<int, CachedProcessInfo> _processCache = new();
     private readonly Action<string> _log;
     private readonly TimeProvider _timeProvider;
     private readonly object _sync = new();
@@ -378,16 +379,22 @@ internal sealed class ProcessLookup
         }
     }
 
-    private ProcessInfo? GetProcessInfo(int pid)
+    public ProcessInfo? GetProcessInfo(int pid)
     {
         if (pid == Environment.ProcessId || pid is 0 or 4)
         {
             return null;
         }
 
+        var now = _timeProvider.GetUtcNow();
         if (_processCache.TryGetValue(pid, out var cached))
         {
-            return cached;
+            if (now <= cached.ExpiresAt)
+            {
+                return cached.Process;
+            }
+
+            _processCache.TryRemove(pid, out _);
         }
 
         try
@@ -402,7 +409,7 @@ internal sealed class ProcessLookup
                 ?? name;
 
             var processInfo = new ProcessInfo(pid, name, path);
-            _processCache.TryAdd(pid, processInfo);
+            _processCache[pid] = new CachedProcessInfo(processInfo, now + _processCacheTtl);
             return processInfo;
         }
         catch
@@ -541,4 +548,6 @@ internal sealed class ProcessLookup
         public uint LocalPort;
         public int OwningPid;
     }
+
+    private sealed record CachedProcessInfo(ProcessInfo Process, DateTimeOffset ExpiresAt);
 }

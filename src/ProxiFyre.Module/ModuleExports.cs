@@ -2,6 +2,9 @@ using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Diagnostics.CodeAnalysis;
+
+[assembly: SuppressMessage("Usage", "CA2255", Justification = "NativeAOT module uses a module initializer to start its message loop on load.")]
 
 namespace ProxiFyre;
 
@@ -152,6 +155,7 @@ public static unsafe class ModuleExports
         private static Timer? _heartbeatTimer;
         private static long _lastUiHeartbeatMs;
         private static bool _detailedLogging;
+        private static TrafficTelemetryClient? _telemetryClient;
 
         private delegate nint WndProcDelegate(nint hWnd, uint msg, nint wParam, nint lParam);
 
@@ -204,6 +208,7 @@ public static unsafe class ModuleExports
                 _heartbeatTimer?.Dispose();
                 _heartbeatTimer = null;
                 StopRelay("Module message loop is exiting.", sendStoppedEvent: false);
+                StopTelemetry();
                 _logger?.Dispose();
                 _logger = null;
             }
@@ -337,6 +342,7 @@ public static unsafe class ModuleExports
             var configPath = RequireValue(values, "configPath");
             _configPath = configPath;
             _detailedLogging = ModuleMessageProtocol.GetBool(values, "detailed");
+            values.TryGetValue("telemetryPipeName", out var telemetryPipeName);
 
             if (values.TryGetValue("logPath", out var logPath) && !string.IsNullOrWhiteSpace(logPath))
             {
@@ -362,7 +368,15 @@ public static unsafe class ModuleExports
                     QueueRelayStop(previousRelay, "Replacing stale relay before RUN.", sendStoppedEvent: false);
                 }
 
-                _relayService = new RelayService(LogRelay, _detailedLogging, LogRelay);
+                StopTelemetry();
+                if (!string.IsNullOrWhiteSpace(telemetryPipeName))
+                {
+                    _telemetryClient = new TrafficTelemetryClient(telemetryPipeName);
+                    _telemetryClient.Start();
+                }
+
+                Action<TrafficSnapshot>? trafficSink = _telemetryClient is null ? null : _telemetryClient.TryPublish;
+                _relayService = new RelayService(LogRelay, _detailedLogging, trafficSink);
                 _relayService.Start(configuration, configPath);
             }
 
@@ -405,6 +419,8 @@ public static unsafe class ModuleExports
                 _relayService = null;
             }
 
+            StopTelemetry();
+
             if (relay is null)
             {
                 if (sendStoppedEvent)
@@ -438,6 +454,18 @@ public static unsafe class ModuleExports
                     SendEvent("error", $"Stop failed: {ex.Message}", running: false);
                 }
             });
+        }
+
+        private static void StopTelemetry()
+        {
+            TrafficTelemetryClient? client;
+            lock (Sync)
+            {
+                client = _telemetryClient;
+                _telemetryClient = null;
+            }
+
+            client?.Dispose();
         }
 
         private static void MarkUiHeartbeat()
@@ -513,6 +541,7 @@ public static unsafe class ModuleExports
                 CoreProcessName = processName,
                 LicenseKey = configuration.LicenseKey,
                 ModuleDllName = configuration.ModuleDllName,
+                EnableFakeIpWhitelist = configuration.EnableFakeIpWhitelist,
                 Apps = configuration.Apps
             };
         }
