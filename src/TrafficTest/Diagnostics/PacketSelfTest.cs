@@ -117,6 +117,28 @@ internal static class PacketSelfTest
         Assert(result is not null, "IPv4 fragments were not reassembled.");
         Assert(PacketView.TryParse(result!.Frame, result.Length, out var view), "Reassembled IPv4 packet did not parse.");
         Assert(view.UdpPayload.SequenceEqual(payload), "Reassembled IPv4 UDP payload mismatch.");
+
+        var invalidFragment = BuildIpv4Packet(
+            IPAddress.Parse("192.0.2.14"),
+            IPAddress.Parse("198.51.100.24"),
+            PacketView.ProtocolUdp,
+            4100,
+            5100,
+            [0x01]);
+        BinaryPrimitives.WriteUInt16BigEndian(invalidFragment.AsSpan(20, 2), 0x2000);
+        var invalidStatus = reassembler.Add(
+            invalidFragment,
+            invalidFragment.Length,
+            IntPtr.Zero,
+            1,
+            0,
+            out _,
+            out var fragmentsToPass);
+        Assert(invalidStatus == FragmentAddStatus.Invalid, "Invalid IPv4 fragment was not rejected.");
+        Assert(
+            fragmentsToPass is { Count: 1 }
+                && fragmentsToPass[0].Frame.AsSpan(0, fragmentsToPass[0].Length).SequenceEqual(invalidFragment),
+            "Invalid IPv4 fragment was not returned for transparent replay.");
     }
 
     private static void TestIpv6FragmentReassembly()

@@ -121,20 +121,6 @@ internal sealed class UdpDirectRelay : IDisposable
         Remove(key, expectedSocket: null);
     }
 
-    public void RemoveIfMatches(UdpRelayKey key, DirectRelayTarget target)
-    {
-        lock (_socketCreationSync)
-        {
-            if (!_targets.TryGetValue(key, out var current)
-                || !TargetMatches(current, target))
-            {
-                return;
-            }
-        }
-
-        Remove(key);
-    }
-
     private void Remove(UdpRelayKey key, UdpRelaySocket? expectedSocket)
     {
         UdpRelaySocket? socket;
@@ -177,10 +163,22 @@ internal sealed class UdpDirectRelay : IDisposable
             target,
             remoteAddress,
             remotePort);
-        await relaySocket.SendToRemoteAsync(
-            payload,
-            remoteEndPoint,
-            _cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await relaySocket.SendToRemoteAsync(
+                payload,
+                remoteEndPoint,
+                _cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            Remove(key, relaySocket);
+            throw;
+        }
     }
 
     private UdpRelaySocket GetOrCreateSocket(UdpRelayKey key, DirectRelayTarget target)

@@ -86,6 +86,16 @@ internal static class TcpRelaySelfTest
                 ReadOnlyMemory<byte>.Empty,
                 ReadOnlyMemory<byte>.Empty));
 
+            connection.SendClientSegment(new TcpSegment(
+                clientInitialSequence,
+                serverInitialSequence + 1u,
+                PacketView.TcpFlagRst | PacketView.TcpFlagAck,
+                0,
+                0,
+                ReadOnlyMemory<byte>.Empty,
+                ReadOnlyMemory<byte>.Empty));
+            Assert(!connection.IsClosed, "TCP relay accepted an out-of-window stale RST.");
+
             var clientPayload = "hello"u8.ToArray();
             connection.SendClientSegment(new TcpSegment(
                 clientNextSequence,

@@ -503,8 +503,10 @@ internal sealed class TcpDirectRelay : IDisposable
                 if ((segment.Flags & PacketView.TcpFlagRst) != 0)
                 {
                     var resetSequence = UnwrapNear(segment.SequenceNumber, _clientReceiveNext);
-                    if (resetSequence >= _clientReceiveNext - MaxBufferedClientBytes
-                        && resetSequence <= _clientReceiveNext + GetClientFacingWindowLocked())
+                    var receiveWindow = GetClientFacingWindowLocked();
+                    var windowEnd = _clientAcknowledged + Math.Max(1, (int)receiveWindow);
+                    if (resetSequence >= _clientAcknowledged
+                        && resetSequence < windowEnd)
                     {
                         closeWithoutReset = true;
                     }

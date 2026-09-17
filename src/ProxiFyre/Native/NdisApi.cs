@@ -32,7 +32,8 @@ internal static unsafe class NdisApi
     public const int AdapterListSize = 32;
     public const int AdapterNameSize = 256;
     public const int EthernetAddressLength = 6;
-    public const int MaxEtherFrame = 1518;
+    // WinpkFilter fixes INTERMEDIATE_BUFFER at 1514 bytes; VLAN metadata is carried in Dot1q.
+    public const int MaxEtherFrame = 1514;
 
     public const uint MstcpFlagSentTunnel = 0x00000001;
     public const uint MstcpFlagRecvTunnel = 0x00000002;

@@ -98,6 +98,12 @@ internal sealed class IpFragmentReassembler
             || fragment.Offset > ushort.MaxValue
             || fragment.Offset + fragment.PayloadLength > ushort.MaxValue)
         {
+            fragmentsToPass = [CreateCapturedFragment(
+                frame,
+                packetLength,
+                adapterHandle,
+                deviceFlags,
+                dot1q)];
             return FragmentAddStatus.Invalid;
         }
 

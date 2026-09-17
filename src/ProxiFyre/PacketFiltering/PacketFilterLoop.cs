@@ -285,51 +285,6 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         }
     }
 
-    private bool IsRelayOutboundFragment(
-        ReadOnlySpan<byte> frame,
-        int packetLength,
-        IntPtr adapterHandle,
-        uint dot1q)
-    {
-        if (!IpFragmentReassembler.TryGetIdentity(
-                frame,
-                packetLength,
-                out var sourceAddress,
-                out var destinationAddress,
-                out var protocol))
-        {
-            return false;
-        }
-
-        lock (_outboundBypassSync)
-        {
-            foreach (var flow in _outboundBypassFlows.Keys)
-            {
-                if (flow.AdapterHandle != adapterHandle
-                    || flow.Dot1q != dot1q
-                    || flow.Protocol != protocol
-                    || !AddressesEqual(flow.LocalAddress, sourceAddress)
-                    || !flow.RemoteAddress.Equals(destinationAddress))
-                {
-                    continue;
-                }
-
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    private static bool AddressesEqual(IPAddress expected, IPAddress actual)
-    {
-        expected = NetworkAddress.Normalize(expected);
-        actual = NetworkAddress.Normalize(actual);
-        return expected.Equals(IPAddress.Any)
-            || expected.Equals(IPAddress.IPv6Any)
-            || expected.Equals(actual);
-    }
-
     private bool TryReadAndProcessPacket()
     {
         _fragmentReassembler.FlushExpired(SendCapturedFragmentToAdapter);
@@ -377,16 +332,6 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         {
             if (buffer->DeviceFlags == NdisApi.PacketFlagOnSend)
             {
-                if (IsRelayOutboundFragment(
-                        frame,
-                        length,
-                        buffer->AdapterOrListFlink,
-                        buffer->Dot1q))
-                {
-                    Pass(buffer);
-                    return;
-                }
-
                 var status = _fragmentReassembler.Add(
                     frame,
                     length,
@@ -518,7 +463,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
 
         if (_tcpRelay.TryGetConnection(relayKey, out var existingConnection))
         {
-            if (existingConnection.IsClosed)
+            if (existingConnection.CanBeRemoved)
             {
                 _tcpRelay.Remove(existingConnection);
             }
@@ -809,7 +754,6 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                     }
 
                     _log($"DIRECT UDP send failed app={target.AppLabel} appLocal={target.ClientEndpoint} client={relayKey.ClientAddress}:{relayKey.ClientPort} target={target.RemoteEndpoint}: {ex.Message}");
-                    _udpRelay.RemoveIfMatches(relayKey, target);
                 },
                 CancellationToken.None,
                 TaskContinuationOptions.OnlyOnFaulted,
