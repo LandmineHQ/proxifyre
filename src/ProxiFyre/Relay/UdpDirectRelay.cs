@@ -86,6 +86,7 @@ internal sealed class UdpDirectRelay : IDisposable
     {
         lock (_socketCreationSync)
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             if (!_targets.TryGetValue(key, out var current)
                 || !TargetMatches(current, target))
             {
@@ -291,6 +292,7 @@ internal sealed class UdpDirectRelay : IDisposable
         var bindEndPoint = NetworkEndpointResolver.CreateBindEndPoint(target);
         try
         {
+            TrySetOutboundInterface(socket, target, remoteEndPoint.AddressFamily);
             socket.Bind(
                 bindEndPoint is not null && bindEndPoint.AddressFamily == remoteEndPoint.AddressFamily
                     ? bindEndPoint
@@ -301,6 +303,7 @@ internal sealed class UdpDirectRelay : IDisposable
             _log($"DIRECT UDP bind failed, retrying any app={target.AppLabel} appLocal={target.ClientEndpoint} target={target.RemoteEndpoint} bind={bindEndPoint}: {ex.Message}");
             socket.Dispose();
             socket = CreateUdpSocket(remoteEndPoint.AddressFamily);
+            TrySetOutboundInterface(socket, target, remoteEndPoint.AddressFamily);
             socket.Bind(NetworkEndpointResolver.CreateAnyEndPoint(remoteEndPoint.AddressFamily));
         }
 
@@ -377,6 +380,37 @@ internal sealed class UdpDirectRelay : IDisposable
             _timeProvider);
         relaySocket.Start(_cancellationToken);
         return relaySocket;
+    }
+
+    private void TrySetOutboundInterface(Socket socket, DirectRelayTarget target, AddressFamily remoteFamily)
+    {
+        if (target.InterfaceIndex <= 0)
+        {
+            return;
+        }
+
+        try
+        {
+            var optionValue = remoteFamily == AddressFamily.InterNetwork
+                ? IPAddress.HostToNetworkOrder(target.InterfaceIndex)
+                : target.InterfaceIndex;
+            socket.SetSocketOption(
+                remoteFamily == AddressFamily.InterNetwork
+                    ? SocketOptionLevel.IP
+                    : SocketOptionLevel.IPv6,
+                (SocketOptionName)31,
+                optionValue);
+        }
+        catch (SocketException ex)
+        {
+            _log(
+                $"DIRECT UDP could not pin interfaceIndex={target.InterfaceIndex} app={target.AppLabel} appLocal={target.ClientEndpoint} target={target.RemoteEndpoint}: {ex.Message}");
+        }
+        catch (PlatformNotSupportedException ex)
+        {
+            _log(
+                $"DIRECT UDP interface pinning is unavailable app={target.AppLabel} appLocal={target.ClientEndpoint} target={target.RemoteEndpoint}: {ex.Message}");
+        }
     }
 
     private void LogDetail(string message)
@@ -482,7 +516,7 @@ internal sealed class UdpDirectRelay : IDisposable
         private long _downBytes;
         private byte[] _lastSentPayload = [];
         private bool _sniProbeFinished;
-        private bool _disposed;
+        private int _disposed;
 
         public UdpRelaySocket(
             Socket socket,
@@ -614,6 +648,11 @@ internal sealed class UdpDirectRelay : IDisposable
                 }
                 catch (SocketException ex)
                 {
+                    if (Volatile.Read(ref _disposed) != 0)
+                    {
+                        return;
+                    }
+
                     _errorInjector?.Invoke(_target, _remoteEndPoint, _lastSentPayload, ex.SocketErrorCode);
                     _errorLog($"UDP relay remote receive failed for {_key.ClientAddress}:{_key.ClientPort} -> {_key.RemoteAddress}:{_key.RemotePort}: {ex.Message}");
                     _remove(_key);
@@ -621,6 +660,11 @@ internal sealed class UdpDirectRelay : IDisposable
                 }
                 catch (Exception ex)
                 {
+                    if (Volatile.Read(ref _disposed) != 0)
+                    {
+                        return;
+                    }
+
                     _errorLog($"UDP relay remote receive failed for {_key.ClientAddress}:{_key.ClientPort} -> {_key.RemoteAddress}:{_key.RemotePort}: {ex.Message}");
                     _remove(_key);
                     return;
@@ -711,27 +755,31 @@ internal sealed class UdpDirectRelay : IDisposable
 
         public void Dispose()
         {
-            if (_disposed)
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
             {
                 return;
             }
 
-            _disposed = true;
-            foreach (var flow in _outboundFlows)
+            try
             {
-                _relayOutboundFlows.TryRemove(
-                    new UdpRelayKey(
-                        flow.AdapterHandle,
-                        _target.Dot1q,
-                        flow.LocalAddress,
-                        flow.LocalPort,
-                        flow.RemoteAddress,
-                        flow.RemotePort),
-                    out _);
-                _outboundBypassUnregister?.Invoke(flow);
+                _socket.Dispose();
             }
-
-            _socket.Dispose();
+            finally
+            {
+                foreach (var flow in _outboundFlows)
+                {
+                    _relayOutboundFlows.TryRemove(
+                        new UdpRelayKey(
+                            flow.AdapterHandle,
+                            _target.Dot1q,
+                            flow.LocalAddress,
+                            flow.LocalPort,
+                            flow.RemoteAddress,
+                            flow.RemotePort),
+                        out _);
+                    _outboundBypassUnregister?.Invoke(flow);
+                }
+            }
         }
     }
 

@@ -1,3 +1,4 @@
+using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Buffers.Binary;
@@ -17,6 +18,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
     private static readonly TimeSpan OutboundFilterRetryInterval = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan PassFlowMaintenanceInterval = TimeSpan.FromMilliseconds(500);
     private static readonly TimeSpan PendingRedirectTtl = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan HealthLogInterval = TimeSpan.FromSeconds(30);
 
     private readonly DynamicAppConfiguration _configuration;
     private readonly TcpDirectRelay _tcpRelay;
@@ -25,6 +27,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
     private readonly ProcessLookup _processLookup;
     private readonly IpFragmentReassembler _fragmentReassembler;
     private readonly HashSet<IntPtr> _adapters = [];
+    private readonly Dictionary<IntPtr, string> _adapterNames = [];
     private readonly Dictionary<IntPtr, int> _adapterMtus = [];
     private readonly Dictionary<IntPtr, int> _adapterInterfaceIndices = [];
     private readonly Action<string> _log;
@@ -49,9 +52,15 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
     private long _lastConfigurationGeneration;
     private bool _fragmentCacheEnabled;
     private DateTimeOffset _lastPacketStatsLog;
+    private DateTimeOffset _nextHealthLog;
     private long _packetsRead;
     private long _packetsPassed;
     private long _packetsRedirected;
+    private long _adapterSendSucceeded;
+    private long _adapterSendFailed;
+    private long _mstcpSendSucceeded;
+    private long _mstcpSendFailed;
+    private long _filterApplyFailures;
     private IntPtr _driverHandle;
     private CancellationToken _cancellationToken;
     private bool _disposed;
@@ -120,6 +129,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             }
 
             _log("Packet filter started.");
+            LogHealth(force: true);
 
             while (!cancellationToken.IsCancellationRequested)
             {
@@ -148,6 +158,8 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 }
                 while (drainedAny);
 
+                LogHealth();
+
                 if (driverSignaled && drainedCount == 0)
                 {
                     LogDetail(
@@ -159,9 +171,48 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         }
         finally
         {
-            foreach (var adapter in _adapters)
+            RestoreAdapterState();
+        }
+    }
+
+    private void RestoreAdapterState()
+    {
+        if (_driverHandle == IntPtr.Zero)
+        {
+            return;
+        }
+
+        var adapters = new HashSet<IntPtr>(_adapters);
+        var adapterList = new NdisApi.TcpAdapterList();
+        if (NdisApi.GetTcpipBoundAdaptersInfo(_driverHandle, ref adapterList))
+        {
+            for (var i = 0; i < adapterList.Count; i++)
             {
-                NdisApi.SetPacketEvent(_driverHandle, adapter, IntPtr.Zero);
+                var adapter = adapterList.GetHandle(i);
+                if (adapter != IntPtr.Zero)
+                {
+                    adapters.Add(adapter);
+                }
+            }
+        }
+
+        NdisApi.ResetPacketFilterTable(_driverHandle);
+        foreach (var adapter in adapters)
+        {
+            if (!NdisApi.SetPacketEvent(_driverHandle, adapter, IntPtr.Zero))
+            {
+                _log($"Failed to clear packet event for adapter handle 0x{adapter.ToInt64():X}.");
+            }
+
+            var mode = new NdisApi.AdapterMode { AdapterHandle = adapter, Flags = 0 };
+            if (!NdisApi.SetAdapterMode(_driverHandle, ref mode))
+            {
+                _log($"Failed to restore normal mode for adapter handle 0x{adapter.ToInt64():X}.");
+            }
+
+            if (!NdisApi.FlushAdapterPacketQueue(_driverHandle, adapter))
+            {
+                _log($"Failed to flush adapter queue for adapter handle 0x{adapter.ToInt64():X}.");
             }
         }
     }
@@ -181,10 +232,20 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         }
 
         _log($"WinpkFilter driver version: 0x{NdisApi.GetDriverVersion(_driverHandle):X8}");
-        _fragmentCacheEnabled = NdisApi.SetPacketFragmentCacheState(_driverHandle, enabled: true);
-        _log(_fragmentCacheEnabled
-            ? "WinpkFilter fragment cache enabled for transport-aware kernel pass flows."
-            : "WinpkFilter fragment cache is unavailable; dynamic kernel pass flows are disabled.");
+        NdisApi.ResetPacketFilterTable(_driverHandle);
+        if (_useWfpClassifier)
+        {
+            _fragmentCacheEnabled = NdisApi.SetPacketFragmentCacheState(_driverHandle, enabled: true);
+            _log(_fragmentCacheEnabled
+                ? "WinpkFilter fragment cache enabled for WFP target redirect flows."
+                : "WinpkFilter fragment cache is unavailable; WFP target-only mode cannot use kernel redirects.");
+        }
+        else
+        {
+            _fragmentCacheEnabled = false;
+            NdisApi.SetPacketFragmentCacheState(_driverHandle, enabled: false);
+            _log("WinpkFilter fragment and kernel pass cache disabled in legacy send-tunnel mode.");
+        }
     }
 
     private void ConfigureAdapters()
@@ -192,6 +253,8 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         if (_useWfpClassifier && !_fragmentCacheEnabled)
         {
             _useWfpClassifier = false;
+            _fragmentCacheEnabled = false;
+            NdisApi.SetPacketFragmentCacheState(_driverHandle, enabled: false);
             _log("WFP target-only mode disabled because WinpkFilter fragment cache is unavailable; using legacy send tunnel.");
         }
 
@@ -210,6 +273,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             }
 
             _adapters.Add(adapter);
+            _adapterNames[adapter] = adapterList.GetName(i);
             _adapterMtus[adapter] = adapterList.GetMtu(i) is > 0 and <= ushort.MaxValue
                 ? (int)adapterList.GetMtu(i)
                 : 1500;
@@ -244,7 +308,8 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             throw new InvalidOperationException("No TCP/IP adapters were returned by WinpkFilter.");
         }
 
-        _log($"Filtering {_adapters.Count} adapter(s) on send path.");
+        _log(
+            $"Filtering {_adapters.Count} adapter(s) on send path using {(_useWfpClassifier ? "WFP target-only mode" : "legacy send-tunnel mode without kernel pass cache")}: {string.Join(", ", _adapterNames.Values)}");
     }
 
     private static int ResolveInterfaceIndex(string adapterName, byte[] macAddress)
@@ -258,7 +323,10 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         {
             _outboundBypassFlows.TryGetValue(flow, out var count);
             _outboundBypassFlows[flow] = count + 1;
-            _outboundFilterTableDirty = true;
+            if (_useWfpClassifier || _fragmentCacheEnabled)
+            {
+                _outboundFilterTableDirty = true;
+            }
         }
 
         _wakeSignal.Pulse();
@@ -462,11 +530,14 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             }
             else
             {
-            _outboundBypassFlows[flow] = count - 1;
+                _outboundBypassFlows[flow] = count - 1;
             }
 
-            _outboundFilterTableDirty = true;
-            _forceOutboundFilterApply = true;
+            if (_useWfpClassifier || _fragmentCacheEnabled)
+            {
+                _outboundFilterTableDirty = true;
+                _forceOutboundFilterApply = true;
+            }
         }
 
         _wakeSignal.Pulse();
@@ -511,6 +582,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
 
         if (!NdisApi.SetPacketFilterTable(_driverHandle, filters))
         {
+            _filterApplyFailures++;
             LogThrottled(
                 $"SetPacketFilterTable failed for target redirect flows count={filters.Count} win32={NdisApi.LastWin32Error}",
                 "set-target-filter-failed",
@@ -578,6 +650,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
 
         if (!NdisApi.SetPacketFilterTable(_driverHandle, filters))
         {
+            _filterApplyFailures++;
             LogThrottled(
                 $"SetPacketFilterTable failed for relay outbound pass flows count={filters.Count} win32={NdisApi.LastWin32Error}",
                 "set-static-filter-failed",
@@ -684,6 +757,20 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
     {
         if (_driverHandle == IntPtr.Zero)
         {
+            return;
+        }
+
+        if (!_useWfpClassifier && !_fragmentCacheEnabled)
+        {
+            lock (_outboundBypassSync)
+            {
+                if (_lastConfigurationGeneration != _configuration.Generation)
+                {
+                    _lastConfigurationGeneration = _configuration.Generation;
+                    _temporaryPassFlows.Clear();
+                }
+            }
+
             return;
         }
 
@@ -1176,7 +1263,8 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             _log($"[UDP DNS OUT] {packet.SourceAddress}:{packet.SourcePort} -> {packet.DestinationAddress}:{packet.DestinationPort} (Process={processName} PID={processId} DnsQuery={isDnsQuery} Domain={domain})");
         }
 
-        if (packet.IsLinkLayerBroadcastOrMulticast())
+        if (packet.IsLinkLayerBroadcastOrMulticast()
+            || packet.IsNetworkLayerBroadcastOrMulticast())
         {
             return false;
         }
@@ -1346,10 +1434,19 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 target.AdapterHandle,
                 target.InterfaceIndex),
             forceRefresh: true);
-        return owner is not null
-            && owner.ProcessId == target.ProcessId
-            && owner.Name.Equals(target.ProcessName, StringComparison.OrdinalIgnoreCase)
-            && owner.Path.Equals(target.ProcessPath, StringComparison.OrdinalIgnoreCase);
+        if (owner is not null)
+        {
+            return owner.ProcessId == target.ProcessId
+                && owner.Name.Equals(target.ProcessName, StringComparison.OrdinalIgnoreCase)
+                && owner.Path.Equals(target.ProcessPath, StringComparison.OrdinalIgnoreCase);
+        }
+
+        // UDP endpoint tables can briefly omit a live socket while the process
+        // still exists. Do not tear down the relay flow solely on that miss.
+        var process = _processLookup.GetProcessInfo(target.ProcessId);
+        return process is not null
+            && process.Name.Equals(target.ProcessName, StringComparison.OrdinalIgnoreCase)
+            && process.Path.Equals(target.ProcessPath, StringComparison.OrdinalIgnoreCase);
     }
 
     private UdpEndpointKey CreateUdpEndpointKey(
@@ -1490,8 +1587,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 payloadSpan);
         }
 
-        var request = CreateRequest(&buffer);
-        if (!NdisApi.SendPacketToMstcp(_driverHandle, ref request))
+        if (!SendInjectedPacketToMstcp(&buffer))
         {
             LogDetail(
                 $"TCP inject SendPacketToMstcp failed app={target.AppLabel} appLocal={target.ClientEndpoint} length={packetLength} win32={NdisApi.LastWin32Error}",
@@ -1633,8 +1729,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             BuildIpv6UdpPacket(frame.Slice(linkHeaderLength), remoteAddress, clientAddress, (ushort)remoteEndPoint.Port, target.ClientPort, payloadSpan);
         }
 
-        var request = CreateRequest(&buffer);
-        if (!NdisApi.SendPacketToMstcp(_driverHandle, ref request))
+        if (!SendInjectedPacketToMstcp(&buffer))
         {
             LogDetail(
                 $"UDP inject SendPacketToMstcp failed app={target.AppLabel} appLocal={target.ClientEndpoint} from={remoteEndPoint} length={packetLength} win32={NdisApi.LastWin32Error}",
@@ -1748,8 +1843,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             icmpPayload.CopyTo(ip.Slice(40));
         }
 
-        var request = CreateRequest(&buffer);
-        if (!NdisApi.SendPacketToMstcp(_driverHandle, ref request))
+        if (!SendInjectedPacketToMstcp(&buffer))
         {
             LogDetail(
                 $"ICMP inject SendPacketToMstcp failed app={target.AppLabel} appLocal={target.ClientEndpoint} from={sourceAddress} win32={NdisApi.LastWin32Error}",
@@ -1903,7 +1997,10 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 clientAddress.GetAddressBytes().CopyTo(ip.Slice(16, 4));
                 var ipChecksum = ComputeOnesComplement(ip);
                 BinaryPrimitives.WriteUInt16BigEndian(ip.Slice(10, 2), ipChecksum);
-                udpDatagram.AsSpan(offset, fragmentLength).CopyTo(ip.Slice(20));
+                CopyIpv4UdpFragmentPayload(
+                    frame,
+                    linkHeaderLength,
+                    udpDatagram.AsSpan(offset, fragmentLength));
                 success &= SendInjectedUdpFragment(target, remoteEndPoint, &buffer);
                 offset += fragmentLength;
             }
@@ -1956,13 +2053,20 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         return success;
     }
 
+    internal static void CopyIpv4UdpFragmentPayload(
+        Span<byte> frame,
+        int linkHeaderLength,
+        ReadOnlySpan<byte> payload)
+    {
+        payload.CopyTo(frame.Slice(linkHeaderLength + 20, payload.Length));
+    }
+
     private bool SendInjectedUdpFragment(
         DirectRelayTarget target,
         IPEndPoint remoteEndPoint,
         NdisApi.IntermediateBuffer* buffer)
     {
-        var request = CreateRequest(buffer);
-        if (!NdisApi.SendPacketToMstcp(_driverHandle, ref request))
+        if (!SendInjectedPacketToMstcp(buffer))
         {
             LogDetail(
                 $"UDP fragment SendPacketToMstcp failed app={target.AppLabel} appLocal={target.ClientEndpoint} from={remoteEndPoint} length={buffer->Length} win32={NdisApi.LastWin32Error}",
@@ -1971,6 +2075,19 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             return false;
         }
 
+        return true;
+    }
+
+    private bool SendInjectedPacketToMstcp(NdisApi.IntermediateBuffer* buffer)
+    {
+        var request = CreateRequest(buffer);
+        if (!NdisApi.SendPacketToMstcp(_driverHandle, ref request))
+        {
+            _mstcpSendFailed++;
+            return false;
+        }
+
+        _mstcpSendSucceeded++;
         return true;
     }
 
@@ -2258,6 +2375,50 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         _log($"Packet stats: read={_packetsRead}, passed={_packetsPassed}, redirected={_packetsRedirected}, kernelPassFlows={kernelPassFlows}");
     }
 
+    private void LogHealth(bool force = false)
+    {
+        var now = _timeProvider.GetUtcNow();
+        if (!force
+            && _nextHealthLog != default
+            && now < _nextHealthLog)
+        {
+            return;
+        }
+
+        _nextHealthLog = now + HealthLogInterval;
+        int kernelPassFlows;
+        lock (_outboundBypassSync)
+        {
+            kernelPassFlows = _outboundBypassFlows.Count + _temporaryPassFlows.Count;
+        }
+
+        long queueTotal = 0;
+        uint queueMax = 0;
+        string? queueMaxAdapter = null;
+        foreach (var adapter in _adapters)
+        {
+            if (!NdisApi.GetAdapterPacketQueueSize(_driverHandle, adapter, out var queueSize))
+            {
+                continue;
+            }
+
+            queueTotal += queueSize;
+            if (queueSize <= queueMax)
+            {
+                continue;
+            }
+
+            queueMax = queueSize;
+            queueMaxAdapter = _adapterNames.TryGetValue(adapter, out var name)
+                ? name
+                : $"0x{adapter.ToInt64():X}";
+        }
+
+        var mode = _useWfpClassifier ? "wfp-target-only" : "legacy-send-tunnel";
+        _log(
+            $"Packet loop health: mode={mode} adapters={_adapters.Count} read={_packetsRead} passed={_packetsPassed} redirected={_packetsRedirected} adapterSends={_adapterSendSucceeded} adapterSendFailures={_adapterSendFailed} mstcpSends={_mstcpSendSucceeded} mstcpSendFailures={_mstcpSendFailed} kernelPassFlows={kernelPassFlows} filterApplyFailures={_filterApplyFailures} adapterQueueTotal={queueTotal} adapterQueueMax={queueMax} adapterQueueMaxName={queueMaxAdapter ?? "none"}");
+    }
+
     private void LogDetail(string message, string key, TimeSpan interval)
     {
         if (!_detailedLogging)
@@ -2331,11 +2492,15 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         var request = CreateRequest(buffer);
         if (!NdisApi.SendPacketToMstcp(_driverHandle, ref request))
         {
-            LogDetail(
+            _mstcpSendFailed++;
+            LogThrottled(
                 $"SendPacketToMstcp failed. adapter=0x{request.AdapterHandle.ToInt64():X} length={buffer->Length} flags={buffer->DeviceFlags} win32={NdisApi.LastWin32Error}",
                 "send-mstcp-failed",
                 TimeSpan.FromSeconds(2));
+            return;
         }
+
+        _mstcpSendSucceeded++;
     }
 
     private void SendToAdapter(NdisApi.IntermediateBuffer* buffer)
@@ -2343,11 +2508,17 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         var request = CreateRequest(buffer);
         if (!NdisApi.SendPacketToAdapter(_driverHandle, ref request))
         {
-            LogDetail(
-                $"SendPacketToAdapter failed. adapter=0x{request.AdapterHandle.ToInt64():X} length={buffer->Length} flags={buffer->DeviceFlags} win32={NdisApi.LastWin32Error}",
+            var error = NdisApi.LastWin32Error;
+            _adapterSendFailed++;
+            LogThrottled(
+                $"SendPacketToAdapter failed. adapter=0x{request.AdapterHandle.ToInt64():X} length={buffer->Length} flags={buffer->DeviceFlags} win32={error}",
                 "send-adapter-failed",
                 TimeSpan.FromSeconds(2));
+            throw new IOException(
+                $"Failed to return a captured outbound packet to the network adapter. Win32 error {error}.");
         }
+
+        _adapterSendSucceeded++;
     }
 
     private bool TryHandleDnsSpoof(IntPtr adapterHandle, uint dot1q, PacketView packet)
@@ -2528,18 +2699,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
 
         _disposed = true;
 
-        if (_driverHandle != IntPtr.Zero)
-        {
-            NdisApi.ResetPacketFilterTable(_driverHandle);
-        }
-
-        foreach (var adapter in _adapters)
-        {
-            NdisApi.SetPacketEvent(_driverHandle, adapter, IntPtr.Zero);
-            var mode = new NdisApi.AdapterMode { AdapterHandle = adapter, Flags = 0 };
-            NdisApi.SetAdapterMode(_driverHandle, ref mode);
-            NdisApi.FlushAdapterPacketQueue(_driverHandle, adapter);
-        }
+        RestoreAdapterState();
 
         if (_driverHandle != IntPtr.Zero)
         {

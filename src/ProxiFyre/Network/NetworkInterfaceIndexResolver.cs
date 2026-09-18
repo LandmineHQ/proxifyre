@@ -57,6 +57,12 @@ internal static class NetworkInterfaceIndexResolver
             return true;
         }
 
+        if (!string.IsNullOrWhiteSpace(networkInterface.Id)
+            && adapterName.Contains(networkInterface.Id, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
         if (macAddress.Length == 0)
         {
             return false;

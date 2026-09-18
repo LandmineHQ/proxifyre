@@ -14,6 +14,8 @@ internal static class PacketSelfTest
         try
         {
             TestUdpParsingAndDeclaredLength();
+            TestMulticastDetection();
+            TestIpv4UdpFragmentPayloadCopy();
             TestVlanParsing();
             TestTcpOptionsAndUrgentPointer();
             TestIpv4FragmentReassembly();
@@ -25,7 +27,7 @@ internal static class PacketSelfTest
             TestDisabledApplicationPersistence();
             TestNetworkInterfaceIndexResolution();
             TestRuntimeModuleCopy();
-            Console.WriteLine("PASS: packet parsing, VLAN, TCP fields, fragment reassembly, UU patch profiles/config, interface indexes, and runtime module copies.");
+            Console.WriteLine("PASS: packet parsing, multicast detection, VLAN, TCP fields, fragment reassembly, UU patch profiles/config, interface indexes, and runtime module copies.");
             return 0;
         }
         catch (Exception ex)
@@ -74,6 +76,42 @@ internal static class PacketSelfTest
         Assert(PacketView.TryParse(vlanPacket, vlanPacket.Length, out var view), "VLAN IPv4 packet did not parse.");
         Assert(view.LinkHeaderLength == 18, "VLAN link header length mismatch.");
         Assert(view.UdpPayload.SequenceEqual(payload), "VLAN UDP payload mismatch.");
+    }
+
+    private static void TestIpv4UdpFragmentPayloadCopy()
+    {
+        var frame = new byte[PacketView.EthernetHeaderLength + 20 + 16];
+        var payload = "fragment-payload"u8;
+        PacketFilterLoop.CopyIpv4UdpFragmentPayload(
+            frame,
+            PacketView.EthernetHeaderLength,
+            payload);
+        Assert(
+            frame.AsSpan(PacketView.EthernetHeaderLength + 20, payload.Length).SequenceEqual(payload),
+            "IPv4 UDP fragment payload was copied to the wrong offset.");
+    }
+
+    private static void TestMulticastDetection()
+    {
+        var ipv4Packet = BuildIpv4Packet(
+            IPAddress.Parse("192.0.2.60"),
+            IPAddress.Parse("224.0.0.251"),
+            PacketView.ProtocolUdp,
+            5353,
+            5353,
+            "mdns"u8.ToArray());
+        Assert(PacketView.TryParse(ipv4Packet, ipv4Packet.Length, out var ipv4View), "IPv4 multicast packet did not parse.");
+        Assert(ipv4View.IsNetworkLayerBroadcastOrMulticast(), "IPv4 multicast destination was not detected.");
+
+        var ipv6Packet = BuildIpv6Packet(
+            IPAddress.Parse("2001:db8::60"),
+            IPAddress.Parse("ff02::fb"),
+            PacketView.ProtocolUdp,
+            5353,
+            5353,
+            "mdns"u8.ToArray());
+        Assert(PacketView.TryParse(ipv6Packet, ipv6Packet.Length, out var ipv6View), "IPv6 multicast packet did not parse.");
+        Assert(ipv6View.IsNetworkLayerBroadcastOrMulticast(), "IPv6 multicast destination was not detected.");
     }
 
     private static void TestTcpOptionsAndUrgentPointer()
@@ -319,6 +357,7 @@ internal static class PacketSelfTest
     private static void TestNetworkInterfaceIndexResolution()
     {
         var resolved = 0;
+        var resolvedByDeviceId = 0;
         foreach (var networkInterface in NetworkInterface.GetAllNetworkInterfaces())
         {
             if (!NetworkInterfaceIndexResolver.TryGetIndex(networkInterface, out var index))
@@ -328,9 +367,22 @@ internal static class PacketSelfTest
 
             Assert(index > 0, $"Network interface '{networkInterface.Name}' returned an invalid index.");
             resolved++;
+
+            var winpkFilterName = $@"\DEVICE\{networkInterface.Id}";
+            var resolvedIndex = NetworkInterfaceIndexResolver.FindAdapterIndex(winpkFilterName, Array.Empty<byte>());
+            if (resolvedIndex <= 0)
+            {
+                continue;
+            }
+
+            Assert(
+                resolvedIndex == index,
+                $"WinpkFilter device ID for '{networkInterface.Name}' resolved to the wrong interface index.");
+            resolvedByDeviceId++;
         }
 
         Assert(resolved > 0, "No Windows network interface index could be resolved.");
+        Assert(resolvedByDeviceId > 0, "No WinpkFilter device ID could be resolved through NetworkInterface.Id.");
     }
 
     private static void TestRuntimeModuleCopy()

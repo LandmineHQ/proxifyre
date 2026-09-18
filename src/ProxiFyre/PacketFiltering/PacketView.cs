@@ -198,6 +198,18 @@ internal ref struct PacketView
         return _frame.Length >= 1 && (_frame[0] & 0x01) != 0;
     }
 
+    public bool IsNetworkLayerBroadcastOrMulticast()
+    {
+        var destination = DestinationAddress;
+        if (destination.AddressFamily == AddressFamily.InterNetwork)
+        {
+            var firstOctet = destination.GetAddressBytes()[0];
+            return (firstOctet is >= 224 and <= 239) || destination.Equals(IPAddress.Broadcast);
+        }
+
+        return destination.IsIPv6Multicast;
+    }
+
     public byte[] GetEthernetSource()
     {
         return _frame.Slice(6, 6).ToArray();

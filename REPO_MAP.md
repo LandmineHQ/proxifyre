@@ -219,26 +219,23 @@ Important behavior:
 - When the WFP classifier device is available, the adapter starts in normal
   pass-through mode. WFP resolves the application before the connection is
   emitted and WinpkFilter installs `FILTER_PACKET_REDIRECT` rules only for
-  confirmed target five-tuples. Without WFP, the legacy send-tunnel plus
-  classified PASS-cache mode remains active.
+  confirmed target five-tuples. Without WFP, ProxiFyre uses the legacy
+  send-tunnel path without a kernel PASS cache; every non-target outbound
+  packet is returned to its adapter from user mode.
 - Pended UDP authorization captures and reinjects the first datagram through
   `FwpsInjectTransportSendAsync` after the user-mode verdict. Pending events
   are reaped after five seconds and the user-mode classifier fault stops the
   relay instead of leaving connections blocked.
-- Relay-created outbound socket flows are registered in a WinpkFilter static
-  pass table, preventing the relay from recursively intercepting itself.
-- Definitively non-target TCP flows are classified from their first user-mode
-  packet and then registered in the same kernel pass table with a bounded
-  one-second TTL and a 1024-entry cap. Table changes are coalesced in the packet
-  loop and refreshed at most every 50 ms; a 500-ms maintenance wake handles TTL
-  expiry even when no other packet reaches user mode.
-- Dynamic TCP pass filters require the ACK flag, so SYN/RST/FIN-only packets
-  continue to reach the classifier. Any TCP packet that reaches user mode first
-  revokes an older temporary pass entry before classifying the flow again.
-- The dynamic pass cache remains disabled unless WinpkFilter's fragment cache
-  can be enabled. It is also intentionally disabled for UDP, VLAN-tagged traffic,
-  and reassembled packets; UDP and VLAN need WFP process/fragment metadata to
-  provide the same safety guarantees.
+- Relay-created outbound socket flows are recognized in user mode and returned
+  to their adapter, preventing the relay from recursively intercepting itself.
+- The legacy send-tunnel path intentionally disables WinpkFilter's fragment cache
+  and static PASS table. Kernel filter-table churn can otherwise leave the
+  machine with no working outbound path even while user-mode packet reads
+  continue. WFP target-only mode is the only mode that installs kernel static
+  filters, and it requires fragment cache support.
+- The packet loop logs a health record every 30 seconds with mode, read/pass/
+  redirect totals, adapter and MSTCP send outcomes, filter-table failures, and
+  adapter queue depth. This remains enabled when detailed packet logging is off.
 - TCP relay connections are capped at 4096, matching the UDP socket limit, so
   relay-owned kernel bypass entries cannot grow without bound.
 - TCP interception starts on a SYN-only packet. The first packet passes
@@ -249,7 +246,12 @@ Important behavior:
   explicit half-close/FIN/RST states.
 - UDP state is keyed by adapter, client address/port, and remote address/port.
   An unconnected remote socket is reused per relay key so a response from a
-  changed source endpoint is preserved.
+  changed source endpoint is preserved. Relay sockets pin the captured
+  interface index with `IP_UNICAST_IF`/`IPV6_UNICAST_IF`, so multi-adapter and
+  VPN route changes cannot silently move a relayed flow to another adapter.
+- WinpkFilter adapter names are resolved through Windows
+  `NetworkInterface.Id`/GUID as well as name, description, and MAC address.
+  This is required for Wintun and virtual adapters that have no usable MAC.
 - The relay does not open local listening ports. It does create outbound
   sockets, so normal Windows firewall behavior still applies.
 - IPv4 and IPv6 are supported, including VLAN-tagged Ethernet frames. Outgoing
@@ -321,7 +323,7 @@ process threads. Candidate ordering then uses PID.
 
 | Path | Responsibility |
 | --- | --- |
-| `NdisApi.cs` | Managed `NDISRD` wrapper. Opens the kernel device, issues `DeviceIoControl` requests, reads one packet at a time, sends packets to MSTCP or the adapter, manages adapter mode/events, MTUs, and VLAN metadata, resets queues, and builds adapter/source/destination-aware outbound bypass filters. |
+| `NdisApi.cs` | Managed `NDISRD` wrapper. Opens the kernel device, issues `DeviceIoControl` requests, reads one packet at a time, sends packets to MSTCP or the adapter, manages adapter mode/events, queue-depth queries, MTUs, and VLAN metadata, resets queues, and builds adapter/source/destination-aware outbound filters. |
 
 Key native constants and structures include `IntermediateBuffer`,
 `EthRequest`, `AdapterMode`, `StaticFilter`, and `TcpAdapterList`. The current
@@ -342,7 +344,7 @@ one packet per call.
 
 | Path | Responsibility |
 | --- | --- |
-| `PacketFilterLoop.cs` | Central packet-processing loop. Configures adapters, watches WinpkFilter events, parses or reassembles packets, classifies outgoing TCP/UDP, maintains legacy pass-cache or WFP-selected target `REDIRECT` tables, performs process matching, injects synthetic TCP/UDP/ICMP responses, fragments oversized UDP output, manages bypass filters, handles the fake-IP DNS path, computes checksums, and logs throttled diagnostics with kernel-pass flow counts. |
+| `PacketFilterLoop.cs` | Central packet-processing loop. Configures adapters, watches WinpkFilter events, parses or reassembles packets, classifies outgoing TCP/UDP, uses WFP-selected target `REDIRECT` tables when available, returns legacy non-target traffic from user mode without a kernel PASS cache, performs process matching, injects synthetic TCP/UDP/ICMP responses, fragments oversized UDP output, manages user-mode outbound bypass identity, handles the fake-IP DNS path, computes checksums, restores adapter modes on shutdown or send failure, and logs periodic health stats plus throttled diagnostics. |
 | `OutboundPassFlowRegistry.cs` | Stores dynamically classified non-target flow keys with a bounded capacity and TTL, evicting the oldest key when full and returning expired entries for kernel filter-table removal. |
 | `IpFragmentReassembler.cs` | Reassembles IPv4/IPv6 outgoing fragments with VLAN metadata, per-assembly limits, duplicate detection, overlap validation, and original-fragment preservation for transparent pass-through. |
 | `PacketView.cs` | Zero-copy-ish `ref struct` over an Ethernet or VLAN-tagged frame. Parses IPv4/IPv6, skips supported IPv6 extension headers, exposes addresses, ports, TCP options/urgent pointer, UDP declared length, and payload spans. |
@@ -373,7 +375,7 @@ user-mode side; `Shared/WfpProtocol.h` is the shared wire layout.
 | --- | --- |
 | `RelayService.cs` | Owns relay lifetime and task supervision. Starts/stops the packet loop and TCP/UDP relays, watches configuration changes, reports one-second traffic snapshots, and propagates unexpected filter failure. |
 | `TcpDirectRelay.cs` | Tracks TCP connections by adapter and full four-tuple; connects outbound sockets with a source-address/interface, source-address-only, then wildcard fallback for retryable local route errors; handles random ISN/MSS negotiation using the adapter MTU, long-unwrapped sequencing, retransmission, ACK processing, client windows, bounded out-of-order data, SYN payload bypass, urgent data best effort, half-close/FIN/RST, pending writes, deterministic failure cleanup, SNI probing, bypass registration, and maintenance cleanup. |
-| `UdpDirectRelay.cs` | Tracks one unconnected outbound UDP socket per adapter/four-tuple with serialized creation/removal; handles bind fallback, owner/process validation, same-address alternate response ports, broadcast/multicast pass-through, DTLS SNI probing, ICMP error callbacks, response injection callbacks, traffic counters, and activity-based cleanup. |
+| `UdpDirectRelay.cs` | Tracks one unconnected outbound UDP socket per adapter/four-tuple with serialized creation/removal; pins the captured interface index, handles bind fallback, owner/process validation, same-address alternate response ports, broadcast/multicast pass-through, DTLS SNI probing, ICMP error callbacks, response injection callbacks, traffic counters, and activity-based cleanup. |
 | `TrafficCounter.cs` | Thread-safe cumulative upload/download counters and current-rate snapshot calculation. |
 
 ### `Telemetry/`
@@ -608,6 +610,10 @@ integration and regression harness.
   introduces proxy or service behavior.
 - Do not add local TCP/UDP listener ports for direct relay.
 - Preserve relay outbound bypass filters; removing them creates recursion.
+- Do not enable WinpkFilter fragment cache or static PASS table churn in legacy
+  send-tunnel mode. Kernel pass-cache updates are only valid for the WFP
+  target-only path, which has explicit target flow ownership.
+- If a captured outbound packet cannot be returned to its network adapter, restore every configured adapter to normal mode before terminating the filter loop so a relay failure cannot leave the machine offline.
 - Preserve the outbound TCP fallback order: captured source plus interface, captured source only, then wildcard with no interface pinning. Retry only address, argument, or local route errors with a remaining fallback.
 - Preserve `coreProcessName` exclusion to avoid relay loops in the injected
   process.

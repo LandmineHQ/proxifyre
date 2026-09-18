@@ -25,6 +25,7 @@ internal static unsafe class NdisApi
     private static readonly uint IoctlSetAdapterMode = CtlCode(FileDeviceNdisrd, NdisrdIoctlIndex + 5, MethodBuffered, FileAnyAccess);
     private static readonly uint IoctlFlushAdapterQueue = CtlCode(FileDeviceNdisrd, NdisrdIoctlIndex + 6, MethodBuffered, FileAnyAccess);
     private static readonly uint IoctlSetEvent = CtlCode(FileDeviceNdisrd, NdisrdIoctlIndex + 7, MethodBuffered, FileAnyAccess);
+    private static readonly uint IoctlGetAdapterPacketQueueSize = CtlCode(FileDeviceNdisrd, NdisrdIoctlIndex + 12, MethodBuffered, FileAnyAccess);
     private static readonly uint IoctlSetPacketFilters = CtlCode(FileDeviceNdisrd, NdisrdIoctlIndex + 14, MethodBuffered, FileAnyAccess);
     private static readonly uint IoctlResetPacketFilters = CtlCode(FileDeviceNdisrd, NdisrdIoctlIndex + 15, MethodBuffered, FileAnyAccess);
     private static readonly uint IoctlReadPacketsUnsorted = CtlCode(FileDeviceNdisrd, NdisrdIoctlIndex + 25, MethodBuffered, FileAnyAccess);
@@ -158,6 +159,24 @@ internal static unsafe class NdisApi
     public static bool FlushAdapterPacketQueue(IntPtr handle, IntPtr adapter)
     {
         return DeviceIoControl(handle, IoctlFlushAdapterQueue, &adapter, (uint)sizeof(IntPtr), null, 0, out _, IntPtr.Zero);
+    }
+
+    public static unsafe bool GetAdapterPacketQueueSize(IntPtr handle, IntPtr adapter, out uint queueSize)
+    {
+        queueSize = 0;
+        var adapterHandle = adapter;
+        var queueSizeValue = 0u;
+        var succeeded = DeviceIoControl(
+            handle,
+            IoctlGetAdapterPacketQueueSize,
+            &adapterHandle,
+            (uint)sizeof(IntPtr),
+            &queueSizeValue,
+            (uint)sizeof(uint),
+            out _,
+            IntPtr.Zero);
+        queueSize = queueSizeValue;
+        return succeeded;
     }
 
     public static bool SetPacketEvent(IntPtr handle, IntPtr adapter, SafeWaitHandle win32Event)
