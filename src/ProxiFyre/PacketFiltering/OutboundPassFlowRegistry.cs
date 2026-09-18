@@ -37,6 +37,11 @@ internal sealed class OutboundPassFlowRegistry(int maxFlows, TimeSpan ttl)
         return changed;
     }
 
+    public bool Remove(RelayOutboundFlow flow)
+    {
+        return _flows.Remove(flow);
+    }
+
     public RelayOutboundFlow[] Snapshot()
     {
         return _flows.Keys.ToArray();

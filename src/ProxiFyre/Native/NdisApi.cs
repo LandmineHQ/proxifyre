@@ -56,6 +56,7 @@ internal static unsafe class NdisApi
     public const uint TcpUdp = 0x00000001;
     public const uint TcpUdpSrcPort = 0x00000001;
     public const uint TcpUdpDestPort = 0x00000002;
+    public const uint TcpUdpTcpFlags = 0x00000004;
 
     public static int LastWin32Error => Marshal.GetLastWin32Error();
 
@@ -229,11 +230,13 @@ internal static unsafe class NdisApi
             ValidFields = NetworkLayerValid | TransportLayerValid,
             NetworkSelector = remoteAddress.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork ? Ipv4 : Ipv6,
             TransportSelector = TcpUdp,
-            TransportValidFields = TcpUdpSrcPort | TcpUdpDestPort,
+            TransportValidFields = TcpUdpSrcPort | TcpUdpDestPort
+                | (protocol == PacketView.ProtocolTcp ? TcpUdpTcpFlags : 0),
             TransportSourcePortStart = sourcePort,
             TransportSourcePortEnd = sourcePort,
             TransportDestinationPortStart = destinationPort,
-            TransportDestinationPortEnd = destinationPort
+            TransportDestinationPortEnd = destinationPort,
+            TransportTcpFlags = protocol == PacketView.ProtocolTcp ? PacketView.TcpFlagAck : (byte)0
         };
 
         if (remoteAddress.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)

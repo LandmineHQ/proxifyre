@@ -145,6 +145,9 @@ Important behavior:
   one-second TTL and a 1024-entry cap. Table changes are coalesced in the packet
   loop and refreshed at most every 50 ms; a 500-ms maintenance wake handles TTL
   expiry even when no other packet reaches user mode.
+- Dynamic TCP pass filters require the ACK flag, so SYN/RST/FIN-only packets
+  continue to reach the classifier. Any TCP packet that reaches user mode first
+  revokes an older temporary pass entry before classifying the flow again.
 - The dynamic pass cache remains disabled unless WinpkFilter's fragment cache
   can be enabled. It is also intentionally disabled for UDP, VLAN-tagged traffic,
   and reassembled packets; UDP and VLAN need WFP process/fragment metadata to

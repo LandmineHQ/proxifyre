@@ -399,6 +399,36 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             TimeSpan.FromSeconds(5));
     }
 
+    private void RemoveTemporaryPassFlow(PacketView packet, IntPtr adapterHandle, uint dot1q)
+    {
+        var flow = new RelayOutboundFlow(
+            adapterHandle,
+            PacketView.ProtocolTcp,
+            packet.SourceAddress,
+            packet.DestinationAddress,
+            packet.SourcePort,
+            packet.DestinationPort,
+            dot1q);
+        var removed = false;
+        lock (_outboundBypassSync)
+        {
+            if (_temporaryPassFlows.Remove(flow))
+            {
+                _outboundFilterTableDirty = true;
+                _forceOutboundFilterApply = true;
+                removed = true;
+            }
+        }
+
+        if (removed)
+        {
+            LogDetail(
+                $"Temporary kernel pass flow revoked: {flow}",
+                $"temporary-pass-revoke:{flow}",
+                TimeSpan.FromSeconds(5));
+        }
+    }
+
     private void FlushOutboundFilterTable()
     {
         if (_driverHandle == IntPtr.Zero)
@@ -629,6 +659,8 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 packet.TcpPayloadLength > 0 ? TimeSpan.Zero : TimeSpan.FromSeconds(2));
             return false;
         }
+
+        RemoveTemporaryPassFlow(packet, adapterHandle, dot1q);
 
         if (_tcpRelay.TryGetConnection(relayKey, out var existingConnection))
         {
