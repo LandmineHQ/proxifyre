@@ -81,6 +81,13 @@ internal sealed class RelayService : IDisposable, IAsyncDisposable
             _wfpClassifierTask = Task.Run(async () =>
             {
                 await filter.Started.WaitAsync(_cts.Token).ConfigureAwait(false);
+                if (!filter.WfpModeActive)
+                {
+                    classifier.Dispose();
+                    _wfpClassifier = null;
+                    return;
+                }
+
                 classifier.Start(filter.HandleWfpFlow, _cts.Token);
                 await classifier.Completion.ConfigureAwait(false);
             }, _cts.Token);
@@ -112,6 +119,8 @@ internal sealed class RelayService : IDisposable, IAsyncDisposable
         catch (Exception ex)
         {
             _log($"WFP classifier failed: {ex}");
+            _wfpClassifier?.Dispose();
+            _wfpClassifier = null;
             cts.Cancel();
         }
     }
@@ -205,6 +214,8 @@ internal sealed class RelayService : IDisposable, IAsyncDisposable
         catch (Exception ex)
         {
             _log($"Packet filter failed: {ex}");
+            _wfpClassifier?.Dispose();
+            _wfpClassifier = null;
             cts.Cancel();
         }
     }

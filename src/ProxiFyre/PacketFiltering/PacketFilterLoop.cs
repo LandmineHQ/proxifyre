@@ -60,6 +60,8 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
 
     public Task Started => _started.Task;
 
+    public bool WfpModeActive => _useWfpClassifier;
+
     public PacketFilterLoop(
         DynamicAppConfiguration configuration,
         TcpDirectRelay tcpRelay,
@@ -279,7 +281,10 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         LogDetail($"Registered relay outbound kernel pass flow: {flow}", $"relay-pass-register:{flow}", TimeSpan.FromSeconds(2));
     }
 
-    internal bool RegisterTargetRedirect(RelayOutboundFlow flow)
+    internal bool RegisterTargetRedirect(
+        RelayOutboundFlow flow,
+        ProcessInfo process,
+        DateTimeOffset pendingDeadline)
     {
         if (!_useWfpClassifier || flow.AdapterHandle == IntPtr.Zero || flow.Dot1q != 0)
         {
@@ -298,12 +303,16 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 return false;
             }
 
+            _wfpProcessByFlow[flow] = process;
+            _wfpPendingRedirects[flow] = pendingDeadline;
+            if (existed)
+            {
+                return true;
+            }
+
             if (!ApplyTargetRedirectFilters())
             {
-                if (!existed)
-                {
-                    _targetRedirectFlows.Remove(flow);
-                }
+                RemoveTargetRedirectLocked(flow);
                 return false;
             }
         }
@@ -372,13 +381,14 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             remoteAddress,
             flowEvent.LocalPort,
             flowEvent.RemotePort);
-        if (!RegisterTargetRedirect(flow))
+        if (!RegisterTargetRedirect(
+                flow,
+                process,
+                _timeProvider.GetUtcNow() + PendingRedirectTtl))
         {
             return false;
         }
 
-        _wfpProcessByFlow[flow] = process;
-        _wfpPendingRedirects[flow] = _timeProvider.GetUtcNow() + PendingRedirectTtl;
         LogDetail(
             $"WFP classified target flow pid={flowEvent.ProcessId} {flow}",
             $"wfp-classified:{flowEvent.ProcessId}:{flow}",

@@ -49,6 +49,7 @@ static LONG64 gNextEventId;
 static volatile LONG gUnloading;
 static HANDLE gInjectionHandleV4;
 static HANDLE gInjectionHandleV6;
+static EX_RUNDOWN_REF gRundownRef;
 
 static const GUID PF_WFP_PROVIDER =
 { 0x62c0a0a1, 0x9d00, 0x4d36, { 0x98, 0xa1, 0x73, 0x4b, 0xf0, 0x0d, 0x13, 0x61 } };
@@ -67,7 +68,9 @@ PfWfpFreePending(_Inout_ PPF_WFP_PENDING_EVENT Entry)
 {
     if (Entry->NetBufferList != NULL)
     {
-        FwpsDereferenceNetBufferList(Entry->NetBufferList, FALSE);
+        FwpsDereferenceNetBufferList(
+            Entry->NetBufferList,
+            KeGetCurrentIrql() == DISPATCH_LEVEL);
         Entry->NetBufferList = NULL;
     }
     if (Entry->ControlData != NULL)
@@ -112,7 +115,9 @@ PfWfpInjectUdpEvent(_Inout_ PPF_WFP_PENDING_EVENT Entry)
         NULL,
         0,
         &clonedNetBufferList);
-    FwpsDereferenceNetBufferList(Entry->NetBufferList, FALSE);
+    FwpsDereferenceNetBufferList(
+        Entry->NetBufferList,
+        KeGetCurrentIrql() == DISPATCH_LEVEL);
     Entry->NetBufferList = NULL;
     if (!NT_SUCCESS(status) || clonedNetBufferList == NULL)
     {
@@ -325,7 +330,7 @@ PfWfpFillEvent(
     RtlZeroMemory(event, sizeof(*event));
     event->EventId = (UINT64)InterlockedIncrement64(&gNextEventId);
     event->ProcessId = FWPS_IS_METADATA_FIELD_PRESENT(inMetaValues, FWPS_METADATA_FIELD_PROCESS_ID)
-        ? inMetaValues->processId
+        ? (UINT32)inMetaValues->processId
         : 0;
 
     switch (inFixedValues->layerId)
@@ -421,7 +426,6 @@ PfWfpClassify(
         || !FWPS_IS_METADATA_FIELD_PRESENT(inMetaValues, FWPS_METADATA_FIELD_COMPLETION_HANDLE))
     {
         classifyOut->actionType = FWP_ACTION_PERMIT;
-        classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
         return;
     }
 
@@ -429,7 +433,6 @@ PfWfpClassify(
     if (pending == NULL)
     {
         classifyOut->actionType = FWP_ACTION_PERMIT;
-        classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
         return;
     }
 
@@ -442,7 +445,6 @@ PfWfpClassify(
         {
             PfWfpFreePending(pending);
             classifyOut->actionType = FWP_ACTION_PERMIT;
-            classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
             return;
         }
 
@@ -485,7 +487,6 @@ PfWfpClassify(
             {
                 PfWfpFreePending(pending);
                 classifyOut->actionType = FWP_ACTION_PERMIT;
-                classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
                 return;
             }
 
@@ -502,7 +503,6 @@ PfWfpClassify(
     {
         PfWfpFreePending(pending);
         classifyOut->actionType = FWP_ACTION_PERMIT;
-        classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
         return;
     }
 
@@ -517,7 +517,6 @@ PfWfpClassify(
         KeReleaseInStackQueuedSpinLock(&lockHandle);
         PfWfpCompletePendingEvent(pending);
         classifyOut->actionType = FWP_ACTION_PERMIT;
-        classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
         return;
     }
 
@@ -694,6 +693,14 @@ PfWfpDispatchIoctl(_In_ PDEVICE_OBJECT deviceObject, _Inout_ PIRP irp)
 
     UNREFERENCED_PARAMETER(deviceObject);
 
+    if (!ExAcquireRundownProtection(&gRundownRef))
+    {
+        irp->IoStatus.Status = STATUS_DELETE_PENDING;
+        irp->IoStatus.Information = 0;
+        IoCompleteRequest(irp, IO_NO_INCREMENT);
+        return STATUS_SUCCESS;
+    }
+
     switch (stack->Parameters.DeviceIoControl.IoControlCode)
     {
     case PF_WFP_IOCTL_GET_EVENT:
@@ -807,6 +814,7 @@ PfWfpDispatchIoctl(_In_ PDEVICE_OBJECT deviceObject, _Inout_ PIRP irp)
         break;
     }
 
+    ExReleaseRundownProtection(&gRundownRef);
     irp->IoStatus.Status = status;
     irp->IoStatus.Information = information;
     IoCompleteRequest(irp, IO_NO_INCREMENT);
@@ -842,6 +850,8 @@ PfWfpUnload(_In_ PDRIVER_OBJECT driverObject)
         ZwClose(gReaperThreadHandle);
         gReaperThreadHandle = NULL;
     }
+
+    ExWaitForRundownProtectionRelease(&gRundownRef);
 
     if (gCalloutIdV4 != 0)
     {
@@ -887,7 +897,7 @@ DriverEntry(
 {
     NTSTATUS status;
     UNICODE_STRING deviceName;
-    DECLARE_CONST_UNICODE_STRING(deviceSddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;AU)");
+    DECLARE_CONST_UNICODE_STRING(deviceSddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)");
 
     UNREFERENCED_PARAMETER(registryPath);
 
@@ -896,6 +906,7 @@ DriverEntry(
     KeInitializeSpinLock(&gPendingLock);
     KeInitializeEvent(&gEventAvailable, NotificationEvent, FALSE);
     KeInitializeEvent(&gReaperStopEvent, NotificationEvent, FALSE);
+    ExInitializeRundownProtection(&gRundownRef);
     gUnloading = FALSE;
     gConnectedClients = 0;
     gPendingCount = 0;
@@ -936,9 +947,7 @@ DriverEntry(
     status = PfWfpInitializeCallouts();
     if (!NT_SUCCESS(status))
     {
-        IoDeleteSymbolicLink(&gDosDeviceName);
-        IoDeleteDevice(gDeviceObject);
-        gDeviceObject = NULL;
+        PfWfpUnload(driverObject);
         return status;
     }
 

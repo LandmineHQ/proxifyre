@@ -42,8 +42,8 @@ internal static class WfpProtocol
     public const ushort AddressFamilyInterNetwork = 2;
     public const ushort AddressFamilyInterNetworkV6 = 23;
 
-    public static readonly uint IoctlGetEvent = CtlCode(0x22, 0x900, 0, 0);
-    public static readonly uint IoctlCompleteEvent = CtlCode(0x22, 0x901, 0, 0);
+    public static readonly uint IoctlGetEvent = CtlCode(0x22, 0x900, 0, 1);
+    public static readonly uint IoctlCompleteEvent = CtlCode(0x22, 0x901, 0, 2);
 
     private static uint CtlCode(uint deviceType, uint function, uint method, uint access)
     {

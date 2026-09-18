@@ -165,32 +165,47 @@ internal sealed class UdpDirectRelay : IDisposable
         IPAddress remoteAddress,
         ushort remotePort)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
-        Register(key, target);
-        if (!_sockets.ContainsKey(key) && _sockets.Count >= MaxFlows)
-        {
-            throw new InvalidOperationException("UDP relay flow limit reached.");
-        }
-
-        var relaySocket = GetOrCreateSocket(key, target);
-        var remoteEndPoint = NetworkEndpointResolver.CreateRemoteEndPoint(
-            target,
-            remoteAddress,
-            remotePort);
         try
         {
-            await relaySocket.SendToRemoteAsync(
-                payload,
-                remoteEndPoint,
-                _cancellationToken).ConfigureAwait(false);
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            Register(key, target);
+            if (!_sockets.ContainsKey(key) && _sockets.Count >= MaxFlows)
+            {
+                throw new InvalidOperationException("UDP relay flow limit reached.");
+            }
+
+            var relaySocket = GetOrCreateSocket(key, target);
+            var remoteEndPoint = NetworkEndpointResolver.CreateRemoteEndPoint(
+                target,
+                remoteAddress,
+                remotePort);
+            try
+            {
+                await relaySocket.SendToRemoteAsync(
+                    payload,
+                    remoteEndPoint,
+                    _cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch
+            {
+                Remove(key, relaySocket);
+                throw;
+            }
         }
-        catch (OperationCanceledException)
+        catch (Exception)
         {
-            throw;
-        }
-        catch
-        {
-            Remove(key, relaySocket);
+            _targetRedirectUnregister?.Invoke(new RelayOutboundFlow(
+                key.AdapterHandle,
+                PacketView.ProtocolUdp,
+                key.ClientAddress,
+                key.RemoteAddress,
+                key.ClientPort,
+                key.RemotePort,
+                key.Dot1q));
             throw;
         }
     }
