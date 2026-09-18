@@ -45,9 +45,11 @@ internal sealed class ReassembledIpPacket(
 internal sealed class IpFragmentReassembler
 {
     private static readonly TimeSpan AssemblyTtl = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan CleanupInterval = TimeSpan.FromSeconds(1);
     private const int MaxAssemblies = 256;
     private readonly Dictionary<FragmentKey, FragmentAssembly> _assemblies = [];
     private readonly TimeProvider _timeProvider;
+    private DateTimeOffset _nextCleanupAt;
 
     public IpFragmentReassembler(TimeProvider? timeProvider = null)
     {
@@ -172,6 +174,18 @@ internal sealed class IpFragmentReassembler
     private void CleanupExpired(Action<CapturedPacketFragment>? flush = null)
     {
         var now = _timeProvider.GetUtcNow();
+        if (_assemblies.Count == 0)
+        {
+            _nextCleanupAt = now + CleanupInterval;
+            return;
+        }
+
+        if (_nextCleanupAt != default && now < _nextCleanupAt)
+        {
+            return;
+        }
+
+        _nextCleanupAt = now + CleanupInterval;
         foreach (var pair in _assemblies.ToArray())
         {
             if (now - pair.Value.LastActivity > AssemblyTtl)
