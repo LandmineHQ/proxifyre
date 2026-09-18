@@ -10,14 +10,14 @@ namespace ProxiFyre;
 internal sealed unsafe class PacketFilterLoop : IDisposable
 {
     private const int MaxTemporaryPassFlows = 1024;
-    private const int MaxTargetRedirectFlows = 4096;
+    private const int MaxTargetRedirectFlows = 12288;
     private const int MaxTcpRelayConnections = 4096;
     private static readonly TimeSpan TemporaryPassFlowTtl = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan OutboundFilterApplyInterval = TimeSpan.FromMilliseconds(50);
     private static readonly TimeSpan TemporaryPassCleanupInterval = TimeSpan.FromMilliseconds(500);
     private static readonly TimeSpan OutboundFilterRetryInterval = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan PassFlowMaintenanceInterval = TimeSpan.FromMilliseconds(500);
-    private static readonly TimeSpan TargetRedirectTtl = TimeSpan.FromMinutes(2);
+    private static readonly TimeSpan PendingRedirectTtl = TimeSpan.FromSeconds(30);
 
     private readonly DynamicAppConfiguration _configuration;
     private readonly TcpDirectRelay _tcpRelay;
@@ -36,8 +36,9 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
     private readonly object _outboundBypassSync = new();
     private readonly Dictionary<RelayOutboundFlow, int> _outboundBypassFlows = [];
     private readonly OutboundPassFlowRegistry _targetRedirectFlows =
-        new(MaxTargetRedirectFlows, TargetRedirectTtl);
+        new(MaxTargetRedirectFlows, TimeSpan.FromMinutes(10));
     private readonly ConcurrentDictionary<RelayOutboundFlow, ProcessInfo> _wfpProcessByFlow = new();
+    private readonly ConcurrentDictionary<RelayOutboundFlow, DateTimeOffset> _wfpPendingRedirects = new();
     private readonly OutboundPassFlowRegistry _temporaryPassFlows =
         new(MaxTemporaryPassFlows, TemporaryPassFlowTtl);
     private bool _outboundFilterTableDirty;
@@ -287,10 +288,22 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
 
         lock (_outboundBypassSync)
         {
-            _ = _targetRedirectFlows.Register(flow, _timeProvider.GetUtcNow());
+            var existed = _targetRedirectFlows.Contains(flow);
+            if (!_targetRedirectFlows.TryAdd(flow, _timeProvider.GetUtcNow()))
+            {
+                LogThrottled(
+                    $"WFP target redirect flow limit reached ({MaxTargetRedirectFlows}); passing new target flow directly.",
+                    "wfp-target-limit",
+                    TimeSpan.FromSeconds(5));
+                return false;
+            }
+
             if (!ApplyTargetRedirectFilters())
             {
-                _targetRedirectFlows.Remove(flow);
+                if (!existed)
+                {
+                    _targetRedirectFlows.Remove(flow);
+                }
                 return false;
             }
         }
@@ -304,19 +317,16 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
 
     internal void UnregisterTargetRedirect(RelayOutboundFlow flow)
     {
+        var removed = false;
         lock (_outboundBypassSync)
         {
-            if (!_targetRedirectFlows.Remove(flow))
-            {
-                return;
-            }
-
-            _wfpProcessByFlow.TryRemove(flow, out _);
-            _outboundFilterTableDirty = true;
-            _forceOutboundFilterApply = true;
+            removed = RemoveTargetRedirectLocked(flow);
         }
 
-        _wakeSignal.Pulse();
+        if (removed)
+        {
+            _wakeSignal.Pulse();
+        }
     }
 
     internal void RefreshTargetRedirect(RelayOutboundFlow flow)
@@ -328,7 +338,8 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 return;
             }
 
-            _ = _targetRedirectFlows.Register(flow, _timeProvider.GetUtcNow());
+            _ = _targetRedirectFlows.TryAdd(flow, _timeProvider.GetUtcNow());
+            _wfpPendingRedirects.TryRemove(flow, out _);
         }
     }
 
@@ -363,6 +374,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         }
 
         _wfpProcessByFlow[flow] = process;
+        _wfpPendingRedirects[flow] = _timeProvider.GetUtcNow() + PendingRedirectTtl;
         LogDetail(
             $"WFP classified target flow pid={flowEvent.ProcessId} {flow}",
             $"wfp-classified:{flowEvent.ProcessId}:{flow}",
@@ -684,9 +696,8 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 }
             }
 
-            if (_targetRedirectFlows.RemoveExpired(now))
+            if (ExpirePendingWfpRedirects(now))
             {
-                PruneWfpProcessCache();
                 _outboundFilterTableDirty = true;
                 _forceOutboundFilterApply = true;
             }
@@ -705,16 +716,39 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         }
     }
 
-    private void PruneWfpProcessCache()
+    private bool RemoveTargetRedirectLocked(RelayOutboundFlow flow)
     {
-        var active = _targetRedirectFlows.Snapshot().ToHashSet();
-        foreach (var flow in _wfpProcessByFlow.Keys)
+        if (!_targetRedirectFlows.Remove(flow))
         {
-            if (!active.Contains(flow))
+            return false;
+        }
+
+        _wfpProcessByFlow.TryRemove(flow, out _);
+        _wfpPendingRedirects.TryRemove(flow, out _);
+        return true;
+    }
+
+    private bool ExpirePendingWfpRedirects(DateTimeOffset now)
+    {
+        var changed = false;
+        foreach (var pair in _wfpPendingRedirects)
+        {
+            if (now < pair.Value)
             {
-                _wfpProcessByFlow.TryRemove(flow, out _);
+                continue;
+            }
+
+            if (RemoveTargetRedirectLocked(pair.Key))
+            {
+                changed = true;
+                LogDetail(
+                    $"WFP target redirect expired before first packet: {pair.Key}",
+                    $"wfp-target-orphan:{pair.Key}",
+                    TimeSpan.FromSeconds(5));
             }
         }
+
+        return changed;
     }
 
     private bool TryReadAndProcessPacket()

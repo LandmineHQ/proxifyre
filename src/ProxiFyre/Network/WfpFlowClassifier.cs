@@ -48,6 +48,8 @@ internal sealed class WfpFlowClassifier : IDisposable
         return true;
     }
 
+    public Task Completion => _loopTask ?? Task.CompletedTask;
+
     public void Start(
         Func<WfpFlowEvent, bool> decide,
         CancellationToken cancellationToken)

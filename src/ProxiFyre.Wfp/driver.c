@@ -1,5 +1,5 @@
 #define POOL_ZERO_DOWN_LEVEL_SUPPORT
-#include <ntddk.h>
+#include <ntifs.h>
 
 #pragma warning(push)
 #pragma warning(disable:4201)
@@ -22,6 +22,14 @@ typedef struct _PF_WFP_PENDING_EVENT
     HANDLE CompletionContext;
     LARGE_INTEGER QueuedAt;
     BOOLEAN Delivered;
+    NET_BUFFER_LIST* NetBufferList;
+    UINT64 EndpointHandle;
+    COMPARTMENT_ID CompartmentId;
+    ADDRESS_FAMILY AddressFamily;
+    UINT8 RemoteAddress[PF_WFP_MAX_ADDRESS_BYTES];
+    SCOPE_ID RemoteScopeId;
+    WSACMSGHDR* ControlData;
+    ULONG ControlDataLength;
 } PF_WFP_PENDING_EVENT, *PPF_WFP_PENDING_EVENT;
 
 static PDEVICE_OBJECT gDeviceObject;
@@ -32,10 +40,15 @@ static UINT32 gCalloutIdV6;
 static LIST_ENTRY gPendingList;
 static KSPIN_LOCK gPendingLock;
 static KEVENT gEventAvailable;
+static KEVENT gReaperStopEvent;
+static HANDLE gReaperThreadHandle;
+static PVOID gReaperThreadObject;
 static LONG gConnectedClients;
 static LONG gPendingCount;
 static LONG64 gNextEventId;
 static volatile LONG gUnloading;
+static HANDLE gInjectionHandleV4;
+static HANDLE gInjectionHandleV6;
 
 static const GUID PF_WFP_PROVIDER =
 { 0x62c0a0a1, 0x9d00, 0x4d36, { 0x98, 0xa1, 0x73, 0x4b, 0xf0, 0x0d, 0x13, 0x61 } };
@@ -50,6 +63,97 @@ static const GUID PF_WFP_CALLOUT_V6 =
 { 0x62c0a0a4, 0x9d00, 0x4d36, { 0x98, 0xa1, 0x73, 0x4b, 0xf0, 0x0d, 0x13, 0x61 } };
 
 static VOID
+PfWfpFreePending(_Inout_ PPF_WFP_PENDING_EVENT Entry)
+{
+    if (Entry->NetBufferList != NULL)
+    {
+        FwpsDereferenceNetBufferList(Entry->NetBufferList, FALSE);
+        Entry->NetBufferList = NULL;
+    }
+    if (Entry->ControlData != NULL)
+    {
+        ExFreePoolWithTag(Entry->ControlData, PF_WFP_POOL_TAG);
+        Entry->ControlData = NULL;
+    }
+
+    ExFreePoolWithTag(Entry, PF_WFP_POOL_TAG);
+}
+
+static VOID NTAPI
+PfWfpInjectComplete(
+    _In_ void* context,
+    _Inout_ NET_BUFFER_LIST* netBufferList,
+    _In_ BOOLEAN dispatchLevel)
+{
+    UNREFERENCED_PARAMETER(dispatchLevel);
+    FwpsFreeCloneNetBufferList(netBufferList, 0);
+    PfWfpFreePending((PPF_WFP_PENDING_EVENT)context);
+}
+
+static VOID
+PfWfpInjectUdpEvent(_Inout_ PPF_WFP_PENDING_EVENT Entry)
+{
+    NET_BUFFER_LIST* clonedNetBufferList = NULL;
+    FWPS_TRANSPORT_SEND_PARAMS0 sendArgs = { 0 };
+    HANDLE injectionHandle;
+    NTSTATUS status;
+
+    if (Entry->NetBufferList == NULL
+        || Entry->EndpointHandle == 0
+        || Entry->AddressFamily == AF_UNSPEC)
+    {
+        PfWfpFreePending(Entry);
+        return;
+    }
+
+    status = FwpsAllocateCloneNetBufferList(
+        Entry->NetBufferList,
+        NULL,
+        NULL,
+        0,
+        &clonedNetBufferList);
+    FwpsDereferenceNetBufferList(Entry->NetBufferList, FALSE);
+    Entry->NetBufferList = NULL;
+    if (!NT_SUCCESS(status) || clonedNetBufferList == NULL)
+    {
+        PfWfpFreePending(Entry);
+        return;
+    }
+
+    sendArgs.remoteAddress = Entry->RemoteAddress;
+    sendArgs.remoteScopeId = Entry->RemoteScopeId;
+    sendArgs.controlData = Entry->ControlData;
+    sendArgs.controlDataLength = Entry->ControlDataLength;
+    injectionHandle = Entry->AddressFamily == AF_INET
+        ? gInjectionHandleV4
+        : gInjectionHandleV6;
+
+    if (injectionHandle == NULL)
+    {
+        FwpsFreeCloneNetBufferList(clonedNetBufferList, 0);
+        PfWfpFreePending(Entry);
+        return;
+    }
+
+    status = FwpsInjectTransportSendAsync0(
+        injectionHandle,
+        NULL,
+        Entry->EndpointHandle,
+        0,
+        &sendArgs,
+        Entry->AddressFamily,
+        Entry->CompartmentId,
+        clonedNetBufferList,
+        PfWfpInjectComplete,
+        Entry);
+    if (!NT_SUCCESS(status))
+    {
+        FwpsFreeCloneNetBufferList(clonedNetBufferList, 0);
+        PfWfpFreePending(Entry);
+    }
+}
+
+static VOID
 PfWfpCompletePendingEvent(_Inout_ PPF_WFP_PENDING_EVENT Entry)
 {
     if (Entry->CompletionContext != NULL)
@@ -58,7 +162,13 @@ PfWfpCompletePendingEvent(_Inout_ PPF_WFP_PENDING_EVENT Entry)
         Entry->CompletionContext = NULL;
     }
 
-    ExFreePoolWithTag(Entry, PF_WFP_POOL_TAG);
+    if (Entry->NetBufferList != NULL && !gUnloading)
+    {
+        PfWfpInjectUdpEvent(Entry);
+        return;
+    }
+
+    PfWfpFreePending(Entry);
 }
 
 static VOID
@@ -127,6 +237,32 @@ PfWfpExpirePending(VOID)
     }
 }
 
+static VOID
+PfWfpReaperThread(_In_ PVOID context)
+{
+    UNREFERENCED_PARAMETER(context);
+
+    for (;;)
+    {
+        LARGE_INTEGER timeout;
+        timeout.QuadPart = -10000000LL;
+
+        if (KeWaitForSingleObject(
+                &gReaperStopEvent,
+                Executive,
+                KernelMode,
+                FALSE,
+                &timeout) == STATUS_SUCCESS)
+        {
+            break;
+        }
+
+        PfWfpExpirePending();
+    }
+
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
 static BOOLEAN
 PfWfpIsReauthorize(_In_ const FWPS_INCOMING_VALUES0* inFixedValues)
 {
@@ -146,6 +282,32 @@ PfWfpIsReauthorize(_In_ const FWPS_INCOMING_VALUES0* inFixedValues)
 
     return (inFixedValues->incomingValue[flagsIndex].value.uint32
         & FWP_CONDITION_FLAG_IS_REAUTHORIZE) != 0;
+}
+
+static BOOLEAN
+PfWfpIsInjected(
+    _In_ UINT16 layerId,
+    _In_opt_ void* layerData)
+{
+    FWPS_PACKET_INJECTION_STATE state;
+    HANDLE injectionHandle;
+
+    if (layerData == NULL)
+    {
+        return FALSE;
+    }
+
+    injectionHandle = layerId == FWPS_LAYER_ALE_AUTH_CONNECT_V4
+        ? gInjectionHandleV4
+        : gInjectionHandleV6;
+    if (injectionHandle == NULL)
+    {
+        return FALSE;
+    }
+
+    state = FwpsQueryPacketInjectionState(injectionHandle, layerData, NULL);
+    return state == FWPS_PACKET_INJECTED_BY_SELF
+        || state == FWPS_PACKET_PREVIOUSLY_INJECTED_BY_SELF;
 }
 
 static VOID
@@ -255,6 +417,7 @@ PfWfpClassify(
 
     if (PfWfpIsReauthorize(inFixedValues)
         || InterlockedCompareExchange(&gConnectedClients, 0, 0) <= 0
+        || PfWfpIsInjected(inFixedValues->layerId, layerData)
         || !FWPS_IS_METADATA_FIELD_PRESENT(inMetaValues, FWPS_METADATA_FIELD_COMPLETION_HANDLE))
     {
         classifyOut->actionType = FWP_ACTION_PERMIT;
@@ -272,6 +435,67 @@ PfWfpClassify(
 
     RtlZeroMemory(pending, sizeof(*pending));
     PfWfpFillEvent(inFixedValues, inMetaValues, &pending->Event);
+
+    if (pending->Event.Protocol == IPPROTO_UDP)
+    {
+        if (layerData == NULL)
+        {
+            PfWfpFreePending(pending);
+            classifyOut->actionType = FWP_ACTION_PERMIT;
+            classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
+            return;
+        }
+
+        pending->AddressFamily = (ADDRESS_FAMILY)pending->Event.AddressFamily;
+        pending->NetBufferList = (NET_BUFFER_LIST*)layerData;
+        FwpsReferenceNetBufferList(pending->NetBufferList, TRUE);
+        RtlCopyMemory(
+            pending->RemoteAddress,
+            pending->Event.RemoteAddress,
+            pending->AddressFamily == AF_INET ? 4 : 16);
+
+        if (FWPS_IS_METADATA_FIELD_PRESENT(
+                inMetaValues,
+                FWPS_METADATA_FIELD_TRANSPORT_ENDPOINT_HANDLE))
+        {
+            pending->EndpointHandle = inMetaValues->transportEndpointHandle;
+        }
+        if (FWPS_IS_METADATA_FIELD_PRESENT(
+                inMetaValues,
+                FWPS_METADATA_FIELD_COMPARTMENT_ID))
+        {
+            pending->CompartmentId = inMetaValues->compartmentId;
+        }
+        if (FWPS_IS_METADATA_FIELD_PRESENT(
+                inMetaValues,
+                FWPS_METADATA_FIELD_REMOTE_SCOPE_ID))
+        {
+            pending->RemoteScopeId = inMetaValues->remoteScopeId;
+        }
+        if (FWPS_IS_METADATA_FIELD_PRESENT(
+                inMetaValues,
+                FWPS_METADATA_FIELD_TRANSPORT_CONTROL_DATA)
+            && inMetaValues->controlDataLength > 0)
+        {
+            pending->ControlData = ExAllocatePool2(
+                POOL_FLAG_NON_PAGED,
+                inMetaValues->controlDataLength,
+                PF_WFP_POOL_TAG);
+            if (pending->ControlData == NULL)
+            {
+                PfWfpFreePending(pending);
+                classifyOut->actionType = FWP_ACTION_PERMIT;
+                classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
+                return;
+            }
+
+            RtlCopyMemory(
+                pending->ControlData,
+                inMetaValues->controlData,
+                inMetaValues->controlDataLength);
+            pending->ControlDataLength = inMetaValues->controlDataLength;
+        }
+    }
 
     status = FwpsPendOperation0(inMetaValues->completionHandle, &pending->CompletionContext);
     if (!NT_SUCCESS(status))
@@ -597,6 +821,24 @@ PfWfpUnload(_In_ PDRIVER_OBJECT driverObject)
     InterlockedExchange(&gUnloading, TRUE);
     PfWfpPermitAllPending();
 
+    KeSetEvent(&gReaperStopEvent, IO_NO_INCREMENT, FALSE);
+    if (gReaperThreadObject != NULL)
+    {
+        KeWaitForSingleObject(
+            gReaperThreadObject,
+            Executive,
+            KernelMode,
+            FALSE,
+            NULL);
+        ObDereferenceObject(gReaperThreadObject);
+        gReaperThreadObject = NULL;
+    }
+    if (gReaperThreadHandle != NULL)
+    {
+        ZwClose(gReaperThreadHandle);
+        gReaperThreadHandle = NULL;
+    }
+
     if (gCalloutIdV4 != 0)
     {
         FwpsCalloutUnregisterById0(gCalloutIdV4);
@@ -606,6 +848,17 @@ PfWfpUnload(_In_ PDRIVER_OBJECT driverObject)
     {
         FwpsCalloutUnregisterById0(gCalloutIdV6);
         gCalloutIdV6 = 0;
+    }
+
+    if (gInjectionHandleV4 != NULL)
+    {
+        FwpsInjectionHandleDestroy0(gInjectionHandleV4);
+        gInjectionHandleV4 = NULL;
+    }
+    if (gInjectionHandleV6 != NULL)
+    {
+        FwpsInjectionHandleDestroy0(gInjectionHandleV6);
+        gInjectionHandleV6 = NULL;
     }
 
     if (gEngineHandle != NULL)
@@ -638,6 +891,7 @@ DriverEntry(
     InitializeListHead(&gPendingList);
     KeInitializeSpinLock(&gPendingLock);
     KeInitializeEvent(&gEventAvailable, NotificationEvent, FALSE);
+    KeInitializeEvent(&gReaperStopEvent, NotificationEvent, FALSE);
     gUnloading = FALSE;
     gConnectedClients = 0;
     gPendingCount = 0;
@@ -681,6 +935,59 @@ DriverEntry(
         IoDeleteSymbolicLink(&gDosDeviceName);
         IoDeleteDevice(gDeviceObject);
         gDeviceObject = NULL;
+        return status;
+    }
+
+    status = FwpsInjectionHandleCreate0(
+        AF_INET,
+        FWPS_INJECTION_TYPE_TRANSPORT,
+        &gInjectionHandleV4);
+    if (!NT_SUCCESS(status))
+    {
+        PfWfpUnload(driverObject);
+        return status;
+    }
+
+    status = FwpsInjectionHandleCreate0(
+        AF_INET6,
+        FWPS_INJECTION_TYPE_TRANSPORT,
+        &gInjectionHandleV6);
+    if (!NT_SUCCESS(status))
+    {
+        PfWfpUnload(driverObject);
+        return status;
+    }
+
+    status = PsCreateSystemThread(
+        &gReaperThreadHandle,
+        THREAD_ALL_ACCESS,
+        NULL,
+        NULL,
+        NULL,
+        PfWfpReaperThread,
+        NULL);
+    if (!NT_SUCCESS(status))
+    {
+        PfWfpUnload(driverObject);
+        return status;
+    }
+
+    status = ObReferenceObjectByHandle(
+        gReaperThreadHandle,
+        THREAD_ALL_ACCESS,
+        *PsThreadType,
+        KernelMode,
+        &gReaperThreadObject,
+        NULL);
+    if (!NT_SUCCESS(status))
+    {
+        LARGE_INTEGER waitTimeout;
+        waitTimeout.QuadPart = -10000000LL;
+        KeSetEvent(&gReaperStopEvent, IO_NO_INCREMENT, FALSE);
+        ZwWaitForSingleObject(gReaperThreadHandle, FALSE, &waitTimeout);
+        ZwClose(gReaperThreadHandle);
+        gReaperThreadHandle = NULL;
+        PfWfpUnload(driverObject);
         return status;
     }
 

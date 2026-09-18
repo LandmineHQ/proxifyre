@@ -82,7 +82,9 @@ internal sealed class RelayService : IDisposable, IAsyncDisposable
             {
                 await filter.Started.WaitAsync(_cts.Token).ConfigureAwait(false);
                 classifier.Start(filter.HandleWfpFlow, _cts.Token);
+                await classifier.Completion.ConfigureAwait(false);
             }, _cts.Token);
+            _ = WatchWfpClassifierAsync(_wfpClassifierTask, _cts);
         }
         _trafficStatsTask = Task.Run(() => ReportTrafficStatsAsync(_cts.Token), _cts.Token);
         if (!string.IsNullOrWhiteSpace(configurationPath))
@@ -91,6 +93,27 @@ internal sealed class RelayService : IDisposable, IAsyncDisposable
         }
 
         _ = WatchFilterTaskAsync(_filterTask, _cts);
+    }
+
+    private async Task WatchWfpClassifierAsync(Task classifierTask, CancellationTokenSource cts)
+    {
+        try
+        {
+            await classifierTask.ConfigureAwait(false);
+            if (!cts.IsCancellationRequested)
+            {
+                _log("WFP classifier stopped unexpectedly.");
+                cts.Cancel();
+            }
+        }
+        catch (OperationCanceledException) when (cts.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            _log($"WFP classifier failed: {ex}");
+            cts.Cancel();
+        }
     }
 
     private async Task WatchConfigurationAsync(string configurationPath, CancellationToken cancellationToken)
