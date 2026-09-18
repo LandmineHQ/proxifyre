@@ -371,7 +371,7 @@ user-mode side; `Shared/WfpProtocol.h` is the shared wire layout.
 | Path | Responsibility |
 | --- | --- |
 | `RelayService.cs` | Owns relay lifetime and task supervision. Starts/stops the packet loop and TCP/UDP relays, watches configuration changes, reports one-second traffic snapshots, and propagates unexpected filter failure. |
-| `TcpDirectRelay.cs` | Tracks TCP connections by adapter and full four-tuple; connects outbound sockets; handles random ISN/MSS negotiation using the adapter MTU, long-unwrapped sequencing, retransmission, ACK processing, client windows, bounded out-of-order data, SYN payload bypass, urgent data best effort, half-close/FIN/RST, pending writes, deterministic failure cleanup, SNI probing, bypass registration, and maintenance cleanup. |
+| `TcpDirectRelay.cs` | Tracks TCP connections by adapter and full four-tuple; connects outbound sockets with a source-address/interface, source-address-only, then wildcard fallback for retryable local route errors; handles random ISN/MSS negotiation using the adapter MTU, long-unwrapped sequencing, retransmission, ACK processing, client windows, bounded out-of-order data, SYN payload bypass, urgent data best effort, half-close/FIN/RST, pending writes, deterministic failure cleanup, SNI probing, bypass registration, and maintenance cleanup. |
 | `UdpDirectRelay.cs` | Tracks one unconnected outbound UDP socket per adapter/four-tuple with serialized creation/removal; handles bind fallback, owner/process validation, same-address alternate response ports, broadcast/multicast pass-through, DTLS SNI probing, ICMP error callbacks, response injection callbacks, traffic counters, and activity-based cleanup. |
 | `TrafficCounter.cs` | Thread-safe cumulative upload/download counters and current-rate snapshot calculation. |
 
@@ -593,7 +593,7 @@ Runtime requirements:
 | `steam` | Steam WebHelper process network state. | Steam process for useful output. |
 | `traffic-telemetry` | Named-pipe telemetry protocol and callbacks. | No driver or Administrator requirement. |
 | `packet-selftest` | Packet parsing, VLAN, TCP options/URG, UDP declared length, and IPv4/IPv6 fragment reassembly. | No driver or Administrator requirement. |
-| `tcp-selftest` | Loopback TCP relay handshake, zero-window behavior, ACK/retransmission, bidirectional data, and client FIN transition. | No driver or Administrator requirement. |
+| `tcp-selftest` | Loopback TCP relay handshake, zero-window behavior, ACK/retransmission, bidirectional data, client FIN transition, and unavailable source-address fallback. | No driver or Administrator requirement. |
 | `udp-selftest` | Loopback UDP forwarding and alternate response endpoint handling. | No driver or Administrator requirement. |
 | `leigod-redirect` | Environment-specific Leigod WFP redirection demo. | Leigod/WFP environment and network access. |
 | `inject` | Injects the configured module/probe into a running target PID. | Built AOT DLL and Administrator. |
@@ -607,6 +607,7 @@ integration and regression harness.
   introduces proxy or service behavior.
 - Do not add local TCP/UDP listener ports for direct relay.
 - Preserve relay outbound bypass filters; removing them creates recursion.
+- Preserve the outbound TCP fallback order: captured source plus interface, captured source only, then wildcard with no interface pinning. Retry only address, argument, or local route errors with a remaining fallback.
 - Preserve `coreProcessName` exclusion to avoid relay loops in the injected
   process.
 - Keep packet construction checksum-correct for both IPv4 and IPv6.

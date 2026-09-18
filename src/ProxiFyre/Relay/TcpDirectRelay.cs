@@ -291,6 +291,8 @@ internal sealed class TcpDirectRelay : IDisposable
         private static readonly TimeSpan InitialRemoteFinLifetime = TimeSpan.FromMinutes(5);
         private const int MaxRetransmissionAttempts = 10;
 
+        internal readonly record struct RelayConnectAttempt(IPEndPoint BindEndPoint, bool PinInterface);
+
         private readonly object _sync = new();
         private readonly object _outboundFlowSync = new();
         private readonly TcpRelayKey _flowKey;
@@ -427,33 +429,8 @@ internal sealed class TcpDirectRelay : IDisposable
             Socket? socket = null;
             try
             {
-                socket = CreateRelaySocket(_target.RemoteAddress.AddressFamily);
                 var remoteEndPoint = NetworkEndpointResolver.CreateRemoteEndPoint(_target);
-                if (_target.InterfaceIndex > 0)
-                {
-                    try
-                    {
-                        var optionValue = _target.RemoteAddress.AddressFamily == AddressFamily.InterNetwork
-                            ? IPAddress.HostToNetworkOrder(_target.InterfaceIndex)
-                            : _target.InterfaceIndex;
-                        socket.SetSocketOption(
-                            _target.RemoteAddress.AddressFamily == AddressFamily.InterNetwork
-                                ? SocketOptionLevel.IP
-                                : SocketOptionLevel.IPv6,
-                            (SocketOptionName)31,
-                            optionValue);
-                    }
-                    catch
-                    {
-                    }
-                }
-
-                var bindEndPoint = NetworkEndpointResolver.CreateBindEndPoint(_target)
-                    ?? NetworkEndpointResolver.CreateAnyEndPoint(remoteEndPoint.AddressFamily);
-                socket.Bind(bindEndPoint);
-                RegisterOutboundFlow(remoteEndPoint, socket);
-
-                await socket.ConnectAsync(remoteEndPoint, _cts.Token).ConfigureAwait(false);
+                socket = await ConnectRelaySocketAsync(remoteEndPoint).ConfigureAwait(false);
 
                 lock (_sync)
                 {
@@ -493,6 +470,150 @@ internal sealed class TcpDirectRelay : IDisposable
             {
                 socket?.Dispose();
             }
+        }
+
+        private async Task<Socket> ConnectRelaySocketAsync(IPEndPoint remoteEndPoint)
+        {
+            var attempts = CreateConnectAttempts(_target, remoteEndPoint.AddressFamily);
+            for (var index = 0; index < attempts.Count; index++)
+            {
+                var attempt = attempts[index];
+                var hasFallback = index + 1 < attempts.Count;
+                try
+                {
+                    return await ConnectRelaySocketAttemptAsync(
+                        remoteEndPoint,
+                        attempt.BindEndPoint,
+                        attempt.PinInterface).ConfigureAwait(false);
+                }
+                catch (SocketException ex) when (
+                    hasFallback
+                    && IsRetryableOutboundAddressError(ex.SocketErrorCode))
+                {
+                    _detailLog?.Invoke(
+                        $"DIRECT TCP retrying outbound setup app={_target.AppLabel} attempt={index + 1}/{attempts.Count} bind={attempt.BindEndPoint} interfaceIndex={_target.InterfaceIndex} pinInterface={attempt.PinInterface}: {ex.Message}");
+                }
+                catch (PlatformNotSupportedException ex) when (hasFallback)
+                {
+                    _detailLog?.Invoke(
+                        $"DIRECT TCP retrying outbound setup app={_target.AppLabel} attempt={index + 1}/{attempts.Count} bind={attempt.BindEndPoint} interfaceIndex={_target.InterfaceIndex} pinInterface={attempt.PinInterface}: {ex.Message}");
+                }
+            }
+
+            throw new InvalidOperationException("TCP relay outbound connection attempts were empty.");
+        }
+
+        internal static IReadOnlyList<RelayConnectAttempt> CreateConnectAttempts(
+            DirectRelayTarget target,
+            AddressFamily addressFamily)
+        {
+            var preferredBindEndPoint = NetworkEndpointResolver.CreateBindEndPoint(target)
+                ?? NetworkEndpointResolver.CreateAnyEndPoint(addressFamily);
+            if (IsAnyAddress(preferredBindEndPoint.Address))
+            {
+                return target.InterfaceIndex > 0
+                    ?
+                    [
+                        new RelayConnectAttempt(preferredBindEndPoint, PinInterface: true),
+                        new RelayConnectAttempt(preferredBindEndPoint, PinInterface: false)
+                    ]
+                    : [new RelayConnectAttempt(preferredBindEndPoint, PinInterface: false)];
+            }
+
+            var attempts = new List<RelayConnectAttempt>(3);
+            if (target.InterfaceIndex > 0)
+            {
+                attempts.Add(new RelayConnectAttempt(preferredBindEndPoint, PinInterface: true));
+            }
+
+            attempts.Add(new RelayConnectAttempt(preferredBindEndPoint, PinInterface: false));
+            attempts.Add(new RelayConnectAttempt(
+                NetworkEndpointResolver.CreateAnyEndPoint(addressFamily),
+                PinInterface: false));
+            return attempts;
+        }
+
+        internal static bool IsRetryableOutboundAddressError(SocketError socketError)
+        {
+            return socketError is
+                SocketError.AddressNotAvailable
+                or SocketError.InvalidArgument
+                or SocketError.NetworkDown
+                or SocketError.NetworkUnreachable
+                or SocketError.HostUnreachable;
+        }
+
+        private async Task<Socket> ConnectRelaySocketAttemptAsync(
+            IPEndPoint remoteEndPoint,
+            IPEndPoint bindEndPoint,
+            bool pinInterface)
+        {
+            var socket = CreateRelaySocket(remoteEndPoint.AddressFamily);
+            try
+            {
+                if (pinInterface)
+                {
+                    TrySetOutboundInterface(socket);
+                }
+
+                socket.Bind(bindEndPoint);
+                RegisterOutboundFlow(remoteEndPoint, socket);
+                await socket.ConnectAsync(remoteEndPoint, _cts.Token).ConfigureAwait(false);
+                return socket;
+            }
+            catch
+            {
+                try
+                {
+                    ClearOutboundFlows();
+                }
+                catch (Exception ex)
+                {
+                    _detailLog?.Invoke(
+                        $"DIRECT TCP outbound flow cleanup failed app={_target.AppLabel}: {ex.Message}");
+                }
+
+                socket.Dispose();
+                throw;
+            }
+        }
+
+        private void TrySetOutboundInterface(Socket socket)
+        {
+            if (_target.InterfaceIndex <= 0)
+            {
+                return;
+            }
+
+            try
+            {
+                var optionValue = _target.RemoteAddress.AddressFamily == AddressFamily.InterNetwork
+                    ? IPAddress.HostToNetworkOrder(_target.InterfaceIndex)
+                    : _target.InterfaceIndex;
+                socket.SetSocketOption(
+                    _target.RemoteAddress.AddressFamily == AddressFamily.InterNetwork
+                        ? SocketOptionLevel.IP
+                        : SocketOptionLevel.IPv6,
+                    (SocketOptionName)31,
+                    optionValue);
+            }
+            catch (SocketException ex)
+            {
+                _detailLog?.Invoke(
+                    $"DIRECT TCP could not pin interfaceIndex={_target.InterfaceIndex} app={_target.AppLabel}: {ex.Message}");
+                throw;
+            }
+            catch (PlatformNotSupportedException ex)
+            {
+                _detailLog?.Invoke(
+                    $"DIRECT TCP interface pinning is unavailable app={_target.AppLabel}: {ex.Message}");
+                throw;
+            }
+        }
+
+        private static bool IsAnyAddress(IPAddress address)
+        {
+            return address.Equals(IPAddress.Any) || address.Equals(IPAddress.IPv6Any);
         }
 
         public void MarkSynRetransmitted()
@@ -1351,14 +1472,29 @@ internal sealed class TcpDirectRelay : IDisposable
 
         private void ClearOutboundFlows()
         {
+            RelayOutboundFlow[] flows;
             lock (_outboundFlowSync)
             {
-                foreach (var flow in _outboundFlows)
+                if (_outboundFlows.Count == 0)
+                {
+                    return;
+                }
+
+                flows = _outboundFlows.ToArray();
+                _outboundFlows.Clear();
+            }
+
+            foreach (var flow in flows)
+            {
+                try
                 {
                     _unregisterOutboundFlow(flow);
                 }
-
-                _outboundFlows.Clear();
+                catch (Exception ex)
+                {
+                    _detailLog?.Invoke(
+                        $"DIRECT TCP outbound flow unregister failed flow={flow}: {ex.Message}");
+                }
             }
         }
 

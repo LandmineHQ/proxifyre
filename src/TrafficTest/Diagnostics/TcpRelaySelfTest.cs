@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using ProxiFyre;
 
@@ -202,7 +203,9 @@ internal static class TcpRelaySelfTest
                 segment => segment.AcknowledgmentNumber == clientFinSequence + 1
                     && (segment.Flags & PacketView.TcpFlagAck) != 0,
                 timeout.Token).ConfigureAwait(false);
-            Console.WriteLine("PASS: TCP relay handshake, bidirectional data, ACK/retransmission, and client FIN transition.");
+            await TestUnavailableSourceAddressFallbackAsync(timeout.Token).ConfigureAwait(false);
+            await TestOutboundFlowCleanupAfterConnectFailureAsync(timeout.Token).ConfigureAwait(false);
+            Console.WriteLine("PASS: TCP relay handshake, bidirectional data, ACK/retransmission, client FIN transition, local-address fallback, and failed-connect cleanup.");
             return 0;
         }
         catch (Exception ex)
@@ -215,6 +218,218 @@ internal static class TcpRelaySelfTest
             serverSocket?.Dispose();
             listener.Stop();
         }
+    }
+
+    private static async Task TestUnavailableSourceAddressFallbackAsync(CancellationToken cancellationToken)
+    {
+        var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var serverPort = ((IPEndPoint)listener.LocalEndpoint).Port;
+        var synAckReceived = new TaskCompletionSource<TcpSegment>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var registeredFlows = new List<RelayOutboundFlow>();
+        var logLines = new List<string>();
+        var registeredFlowLock = new object();
+        var logLock = new object();
+        const int interfaceIndex = 19;
+        var unavailableSourceAddress = FindUnavailableIpv4Address();
+
+        using var relay = new TcpDirectRelay(
+            log: message =>
+            {
+                lock (logLock)
+                {
+                    logLines.Add(message);
+                }
+            },
+            detailedLogging: true);
+        relay.SetPacketInjector((_, segment) =>
+        {
+            if ((segment.Flags & (PacketView.TcpFlagSyn | PacketView.TcpFlagAck))
+                == (PacketView.TcpFlagSyn | PacketView.TcpFlagAck))
+            {
+                synAckReceived.TrySetResult(segment);
+            }
+
+            return true;
+        });
+        relay.SetOutboundBypass(
+            flow =>
+            {
+                lock (registeredFlowLock)
+                {
+                    registeredFlows.Add(flow);
+                }
+            },
+            _ => { });
+
+        using var relayCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        relay.Start(relayCancellation.Token);
+
+        Socket? serverSocket = null;
+        try
+        {
+            const ushort clientPort = 40223;
+            const uint clientInitialSequence = 2000;
+            var target = new DirectRelayTarget(
+                IPAddress.Loopback,
+                (ushort)serverPort,
+                DateTimeOffset.UtcNow,
+                ClientAddress: unavailableSourceAddress,
+                ClientPort: clientPort,
+                AdapterHandle: IntPtr.Zero,
+                InterfaceIndex: interfaceIndex);
+            var attempts = TcpDirectRelay.TcpRelayConnection.CreateConnectAttempts(
+                target,
+                AddressFamily.InterNetwork);
+            Assert(attempts.Count == 3, "TCP fallback did not plan all three connection attempts.");
+            Assert(
+                attempts[0].BindEndPoint.Address.Equals(unavailableSourceAddress)
+                && attempts[0].PinInterface,
+                "TCP fallback did not try the captured source address with interface pinning first.");
+            Assert(
+                attempts[1].BindEndPoint.Address.Equals(unavailableSourceAddress)
+                && !attempts[1].PinInterface,
+                "TCP fallback did not try the captured source address without interface pinning second.");
+            Assert(
+                attempts[2].BindEndPoint.Address.Equals(IPAddress.Any)
+                && !attempts[2].PinInterface,
+                "TCP fallback did not use the wildcard address last.");
+
+            var flowKey = new TcpRelayKey(
+                IntPtr.Zero,
+                0,
+                unavailableSourceAddress,
+                IPAddress.Loopback,
+                clientPort,
+                (ushort)serverPort);
+
+            var acceptedTask = listener.AcceptSocketAsync(cancellationToken).AsTask();
+            relay.RegisterSyn(
+                flowKey,
+                new TcpClientKey(unavailableSourceAddress, clientPort),
+                target,
+                clientInitialSequence,
+                65535,
+                cancellationToken);
+
+            serverSocket = await acceptedTask.ConfigureAwait(false);
+            var synAck = await synAckReceived.Task
+                .WaitAsync(TimeSpan.FromSeconds(5), cancellationToken)
+                .ConfigureAwait(false);
+            Assert(
+                synAck.AcknowledgmentNumber == clientInitialSequence + 1,
+                "TCP fallback SYN-ACK acknowledgement is incorrect.");
+
+            lock (registeredFlowLock)
+            {
+                Assert(
+                    registeredFlows.Any(flow =>
+                        flow.RemoteAddress.Equals(IPAddress.Loopback)
+                        && flow.RemotePort == serverPort
+                        && !flow.LocalAddress.Equals(IPAddress.Any)),
+                    "TCP relay did not register the actual local endpoint after address fallback.");
+            }
+
+            lock (logLock)
+            {
+                Assert(
+                    logLines.Any(line => line.Contains("pinInterface=True", StringComparison.Ordinal)),
+                    "TCP fallback did not report the source-address/interface attempt.");
+                Assert(
+                    logLines.Any(line => line.Contains("pinInterface=False", StringComparison.Ordinal)),
+                    "TCP fallback did not report the source-address-only attempt.");
+            }
+        }
+        finally
+        {
+            serverSocket?.Dispose();
+            listener.Stop();
+        }
+    }
+
+    private static async Task TestOutboundFlowCleanupAfterConnectFailureAsync(CancellationToken cancellationToken)
+    {
+        var portProbe = new TcpListener(IPAddress.Loopback, 0);
+        portProbe.Start();
+        var closedPort = ((IPEndPoint)portProbe.LocalEndpoint).Port;
+        portProbe.Stop();
+
+        var registeredCount = 0;
+        var unregisteredCount = 0;
+        using var relay = new TcpDirectRelay(log: _ => { });
+        relay.SetPacketInjector((_, _) => true);
+        relay.SetOutboundBypass(
+            _ => Interlocked.Increment(ref registeredCount),
+            _ =>
+            {
+                Interlocked.Increment(ref unregisteredCount);
+                throw new InvalidOperationException("Simulated outbound bypass cleanup failure.");
+            });
+
+        using var relayCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        relay.Start(relayCancellation.Token);
+
+        const ushort clientPort = 40224;
+        var clientAddress = IPAddress.Loopback;
+        var target = new DirectRelayTarget(
+            IPAddress.Loopback,
+            (ushort)closedPort,
+            DateTimeOffset.UtcNow,
+            ClientAddress: clientAddress,
+            ClientPort: clientPort,
+            AdapterHandle: IntPtr.Zero);
+        var flowKey = new TcpRelayKey(
+            IntPtr.Zero,
+            0,
+            clientAddress,
+            IPAddress.Loopback,
+            clientPort,
+            (ushort)closedPort);
+
+        relay.RegisterSyn(
+            flowKey,
+            new TcpClientKey(clientAddress, clientPort),
+            target,
+            3000,
+            65535,
+            cancellationToken);
+
+        await WaitUntilAsync(
+            () => Volatile.Read(ref registeredCount) == 1
+                && Volatile.Read(ref unregisteredCount) == 1
+                && relay.ConnectionCount == 0,
+            cancellationToken).ConfigureAwait(false);
+        Assert(
+            TcpRelayConnectionErrorsAreClassified(),
+            "TCP outbound address error classification is incorrect.");
+    }
+
+    private static bool TcpRelayConnectionErrorsAreClassified()
+    {
+        return TcpDirectRelay.TcpRelayConnection.IsRetryableOutboundAddressError(SocketError.AddressNotAvailable)
+            && TcpDirectRelay.TcpRelayConnection.IsRetryableOutboundAddressError(SocketError.NetworkUnreachable)
+            && !TcpDirectRelay.TcpRelayConnection.IsRetryableOutboundAddressError(SocketError.ConnectionRefused);
+    }
+
+    private static IPAddress FindUnavailableIpv4Address()
+    {
+        var localAddresses = NetworkInterface.GetAllNetworkInterfaces()
+            .SelectMany(networkInterface => networkInterface.GetIPProperties().UnicastAddresses)
+            .Select(unicast => unicast.Address)
+            .Where(address => address.AddressFamily == AddressFamily.InterNetwork)
+            .ToHashSet();
+
+        for (var host = 1; host < 255; host++)
+        {
+            var candidate = IPAddress.Parse($"192.0.2.{host}");
+            if (!localAddresses.Contains(candidate))
+            {
+                return candidate;
+            }
+        }
+
+        throw new InvalidOperationException("Could not find an unavailable TEST-NET-1 source address.");
     }
 
     private static async Task<TcpSegment> WaitForAsync(
