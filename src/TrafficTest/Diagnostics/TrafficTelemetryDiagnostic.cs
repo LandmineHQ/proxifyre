@@ -14,6 +14,7 @@ internal static class TrafficTelemetryDiagnostic
     public static async Task<int> RunAsync(CancellationToken cancellationToken)
     {
         var received = new List<TrafficSnapshot>();
+        var pipeName = $"ProxiFyre.Telemetry.Test.{Environment.ProcessId}.{Guid.NewGuid():N}";
         using var server = new TrafficTelemetryServer(
             snapshot =>
             {
@@ -22,10 +23,21 @@ internal static class TrafficTelemetryDiagnostic
                     received.Add(snapshot);
                 }
             },
-            Console.WriteLine);
+            Console.WriteLine,
+            pipeName);
+
+        Console.WriteLine($"Telemetry pipe: {server.PipeName}");
+        using (var securityProbe = server.CreateServer())
+        {
+            if (!TrafficTelemetryServer.HasMediumIntegrityLabel(securityProbe.SafePipeHandle))
+            {
+                Console.Error.WriteLine(
+                    "FAIL: telemetry pipe security descriptor is missing the medium integrity label.");
+                return 1;
+            }
+        }
 
         server.Start();
-        Console.WriteLine($"Telemetry pipe: {server.PipeName}");
 
         await using var client = new NamedPipeClientStream(
             ".",

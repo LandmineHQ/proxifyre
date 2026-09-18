@@ -12,16 +12,19 @@ namespace ProxiFyre;
 internal sealed class TrafficTelemetryClient : IDisposable
 {
     private readonly string _pipeName;
+    private readonly Action<string>? _log;
     private readonly CancellationTokenSource _cts = new();
     private readonly object _sync = new();
     private NamedPipeClientStream? _stream;
     private StreamWriter? _writer;
     private long _sequence;
     private bool _disposed;
+    private bool _connectionFailureReported;
 
-    public TrafficTelemetryClient(string pipeName)
+    public TrafficTelemetryClient(string pipeName, Action<string>? log = null)
     {
         _pipeName = pipeName;
+        _log = log;
     }
 
     public void Start()
@@ -64,9 +67,13 @@ internal sealed class TrafficTelemetryClient : IDisposable
             {
                 return;
             }
-            catch
+            catch (Exception ex)
             {
-                // Pipe is not available yet; retry on the next iteration.
+                if (!_connectionFailureReported)
+                {
+                    _connectionFailureReported = true;
+                    _log?.Invoke($"Traffic telemetry connection failed: {ex.Message}");
+                }
             }
 
             try
@@ -105,6 +112,7 @@ internal sealed class TrafficTelemetryClient : IDisposable
                 AutoFlush = true,
                 NewLine = "\n"
             };
+            _connectionFailureReported = false;
         }
     }
 

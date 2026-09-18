@@ -371,7 +371,7 @@ public static unsafe class ModuleExports
                 StopTelemetry();
                 if (!string.IsNullOrWhiteSpace(telemetryPipeName))
                 {
-                    _telemetryClient = new TrafficTelemetryClient(telemetryPipeName);
+                    _telemetryClient = new TrafficTelemetryClient(telemetryPipeName, LogLocal);
                     _telemetryClient.Start();
                 }
 

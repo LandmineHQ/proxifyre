@@ -379,7 +379,7 @@ user-mode side; `Shared/WfpProtocol.h` is the shared wire layout.
 
 | Path | Responsibility |
 | --- | --- |
-| `TrafficTelemetryServer.cs` | UI-side named-pipe server. Accepts one same-user module client, reads newline-delimited snapshots, and invokes the UI callback. |
+| `TrafficTelemetryServer.cs` | UI-side named-pipe server. Accepts one same-user module client through a Medium-integrity pipe DACL so an elevated UI can receive telemetry from non-elevated injected processes, reads newline-delimited snapshots, and invokes the UI callback. |
 
 Wire format is defined in `src/Shared/TrafficTelemetry.cs`. Telemetry is
 best-effort and intentionally separate from logs and the control channel.
@@ -591,7 +591,7 @@ Runtime requirements:
 | `udp` | UDP relay path using a STUN binding request from the injected host. | Same artifacts and privileges as TCP. |
 | `uu` | UU process TCP listeners, UDP endpoints, and TCP connections. | A matching process for useful output. |
 | `steam` | Steam WebHelper process network state. | Steam process for useful output. |
-| `traffic-telemetry` | Named-pipe telemetry protocol and callbacks. | No driver or Administrator requirement. |
+| `traffic-telemetry` | Named-pipe telemetry protocol, callback delivery, and the Medium-integrity security descriptor used across elevated/non-elevated processes. | No driver or Administrator requirement. |
 | `packet-selftest` | Packet parsing, VLAN, TCP options/URG, UDP declared length, and IPv4/IPv6 fragment reassembly. | No driver or Administrator requirement. |
 | `tcp-selftest` | Loopback TCP relay handshake, zero-window behavior, ACK/retransmission, bidirectional data, client FIN transition, and unavailable source-address fallback. | No driver or Administrator requirement. |
 | `udp-selftest` | Loopback UDP forwarding and alternate response endpoint handling. | No driver or Administrator requirement. |
