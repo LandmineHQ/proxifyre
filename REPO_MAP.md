@@ -34,6 +34,8 @@ ProxiFyre.sln
 |   `-- RelayService -> PacketFilterLoop + TCP/UDP direct relays
 |-- ProxiFyre.Module
 |   `-- ModuleExports -> injected RelayService + telemetry client
+|-- ProxiFyre.Wfp
+|   `-- WFP ALE connect callout + user-mode flow event protocol
 |-- TrafficTest
 |   |-- AotModuleTestController -> temporary injected test process
 |   |-- curl TCP diagnostic
@@ -52,6 +54,7 @@ separate assembly.
 | --- | --- | --- |
 | `src/ProxiFyre/ProxiFyre.csproj` | `WinExe`, WPF plus CLI | UI, command parsing, configuration, dependency management, injection control, packet filtering, direct relay core, telemetry server, updates. |
 | `src/ProxiFyre.Module/ProxiFyre.Module.csproj` | NativeAOT shared DLL | Injected relay host. Exports `ProxiFyre_GetMsgProc`, creates a hidden message window, receives commands, starts/stops `RelayService`, and publishes telemetry. |
+| `src/ProxiFyre.Wfp/ProxiFyre.Wfp.vcxproj` | Windows kernel driver | WFP ALE connect classifier built with the WDK; standalone build is `scripts/build-wfp.ps1`. |
 | `src/ProxiFyre.Probe/ProxiFyre.Probe.csproj` | NativeAOT shared DLL | Diagnostic probe. Hooks `DeviceIoControl` and `FilterSendMessage` in a target process and records call buffers. Not the production relay. |
 | `src/TrafficTest/TrafficTest.csproj` | Windows console executable | Focused integration diagnostics. References `ProxiFyre` and uses its internal APIs, test controllers, TCP/UDP clients, and network-table readers. |
 | `src/TrafficTestHost/TrafficTestHost.csproj` | WPF executable | Minimal process with a message loop. Traffic tests copy it to `steamwebhelper.exe` and inject the AOT module into that exact test process. |
@@ -138,6 +141,11 @@ Important behavior:
 
 - Only the adapter send path is tunneled. Incoming traffic normally stays on
   the Windows stack so process attribution remains available.
+- When the WFP classifier device is available, the adapter starts in normal
+  pass-through mode. WFP resolves the application before the connection is
+  emitted and WinpkFilter installs `FILTER_PACKET_REDIRECT` rules only for
+  confirmed target five-tuples. Without WFP, the legacy send-tunnel plus
+  classified PASS-cache mode remains active.
 - Relay-created outbound socket flows are registered in a WinpkFilter static
   pass table, preventing the relay from recursively intercepting itself.
 - Definitively non-target TCP flows are classified from their first user-mode
@@ -246,17 +254,30 @@ one packet per call.
 | `NetworkKeys.cs` | Immutable keys and relay target records: TCP session keys, UDP endpoint/relay keys, relay outbound flows, and `DirectRelayTarget` with process, client, adapter, and Ethernet context. |
 | `NetworkEndpointResolver.cs` | Creates bind endpoints, remote endpoints, wildcard endpoints, and repairs IPv6 scope IDs for link-local, site-local, and multicast destinations. |
 | `TlsSniParser.cs` | Parses TLS ClientHello and DTLS ClientHello SNI values with bounded probing and plausibility checks. Used for diagnostics. |
+| `WfpProtocol.cs` | Mirrors the native WFP flow-event and verdict structures plus control-device IOCTL constants. |
+| `WfpFlowClassifier.cs` | Opens the WFP control device, reads pending ALE connect events, resolves PID/process/config classification, and returns permit verdicts while optionally installing target redirect rules. |
 
 ### `PacketFiltering/`
 
 | Path | Responsibility |
 | --- | --- |
-| `PacketFilterLoop.cs` | Central packet-processing loop. Configures adapters, watches WinpkFilter events, parses or reassembles packets, classifies outgoing TCP/UDP, performs process matching, redirects target flows, registers expiring kernel pass flows for classified non-target TCP traffic, injects synthetic TCP/UDP/ICMP responses, fragments oversized UDP output, manages bypass filters, handles the fake-IP DNS path, computes checksums, and logs throttled diagnostics with kernel-pass flow counts. |
+| `PacketFilterLoop.cs` | Central packet-processing loop. Configures adapters, watches WinpkFilter events, parses or reassembles packets, classifies outgoing TCP/UDP, maintains legacy pass-cache or WFP-selected target `REDIRECT` tables, performs process matching, injects synthetic TCP/UDP/ICMP responses, fragments oversized UDP output, manages bypass filters, handles the fake-IP DNS path, computes checksums, and logs throttled diagnostics with kernel-pass flow counts. |
 | `OutboundPassFlowRegistry.cs` | Stores dynamically classified non-target flow keys with a bounded capacity and TTL, evicting the oldest key when full and returning expired entries for kernel filter-table removal. |
 | `IpFragmentReassembler.cs` | Reassembles IPv4/IPv6 outgoing fragments with VLAN metadata, per-assembly limits, duplicate detection, overlap validation, and original-fragment preservation for transparent pass-through. |
 | `PacketView.cs` | Zero-copy-ish `ref struct` over an Ethernet or VLAN-tagged frame. Parses IPv4/IPv6, skips supported IPv6 extension headers, exposes addresses, ports, TCP options/urgent pointer, UDP declared length, and payload spans. |
 | `PacketWakeSignal.cs` | Auto-reset event used by relay sockets to wake the packet loop after traffic counters or injected packets change. |
 | `PacketFilterReset.cs` | Reset utility for `--reset-filter`. Clears static filters, removes adapter events, resets adapter modes, and flushes queued packets. |
+
+### `ProxiFyre.Wfp/`
+
+| Path | Responsibility |
+| --- | --- |
+| `driver.c` | Native WFP callout driver. Registers ALE_AUTH_CONNECT callouts for IPv4/IPv6, pends connect authorization, publishes PID/five-tuple/interface events through a control device, and permits after a user-mode verdict or on timeout/unload. |
+| `ProxiFyre.Wfp.inf` | Kernel service installation metadata for `ProxiFyre.Wfp.sys`. |
+| `ProxiFyre.Wfp.vcxproj` | Visual Studio/WDK project metadata. The repository build script is authoritative when the installed Visual Studio build tools lack WDK platform-toolset integration. |
+
+`Network/WfpProtocol.cs` and `Network/WfpFlowClassifier.cs` implement the
+user-mode side; `Shared/WfpProtocol.h` is the shared wire layout.
 
 ### `Process/`
 
@@ -441,6 +462,8 @@ The PowerShell wrapper is the normal entry point:
 | `.\scripts\proxifyre.ps1 license-device` | Prints the current device ID and derived key. |
 | `.\scripts\proxifyre.ps1 license-key <device-id>` | Prints the key for a supplied device ID. |
 | `.\scripts\proxifyre.ps1 module-publish` | Publishes only the production NativeAOT module. |
+| `.\scripts\build-wfp.ps1 -Configuration Debug|Release` | Builds the WFP callout driver with the installed WDK into `artifacts/native/<Configuration>/`. |
+| `.\scripts\install-wfp.ps1 -Configuration Debug|Release` | Installs or starts the WFP kernel service; development builds require test signing and a trusted signature. |
 | `.\scripts\proxifyre.ps1 clean` | Cleans solution outputs plus repository-local build directories. |
 
 Output locations:
@@ -448,7 +471,7 @@ Output locations:
 | Path | Contents |
 | --- | --- |
 | `artifacts/bin/<Project>/<configuration>_win-x64/` | Normal .NET project outputs. |
-| `artifacts/native/<Configuration>/` | `ProxiFyre.Module.dll` and `ProxiFyre.Probe.dll`. |
+| `artifacts/native/<Configuration>/` | `ProxiFyre.Module.dll`, `ProxiFyre.Probe.dll`, and `ProxiFyre.Wfp.sys` when built. |
 | `artifacts/tmp/aot-test-host/` | Temporary renamed test hosts created by relay tests. |
 | `artifacts/obj/` | Intermediate build output. |
 | `<app output>/runtime/<Configuration>/` | Timestamped module DLL copies prepared for injection. |

@@ -41,6 +41,7 @@ internal static unsafe class NdisApi
     public const uint PacketFlagOnSend = 0x00000001;
     public const uint PacketFlagOnReceive = 0x00000002;
     public const uint FilterPacketPass = 0x00000001;
+    public const uint FilterPacketRedirect = 0x00000003;
     public const uint NetworkLayerValid = 0x00000002;
     public const uint TransportLayerValid = 0x00000004;
     public const uint Ipv4 = 0x00000001;
@@ -218,6 +219,46 @@ internal static unsafe class NdisApi
         ushort sourcePort,
         ushort destinationPort)
     {
+        return CreateOutboundFilter(
+            adapter,
+            protocol,
+            localAddress,
+            remoteAddress,
+            sourcePort,
+            destinationPort,
+            FilterPacketPass,
+            requireTcpAck: true);
+    }
+
+    public static StaticFilter CreateOutboundRedirectFilter(
+        IntPtr adapter,
+        byte protocol,
+        IPAddress localAddress,
+        IPAddress remoteAddress,
+        ushort sourcePort,
+        ushort destinationPort)
+    {
+        return CreateOutboundFilter(
+            adapter,
+            protocol,
+            localAddress,
+            remoteAddress,
+            sourcePort,
+            destinationPort,
+            FilterPacketRedirect,
+            requireTcpAck: false);
+    }
+
+    private static StaticFilter CreateOutboundFilter(
+        IntPtr adapter,
+        byte protocol,
+        IPAddress localAddress,
+        IPAddress remoteAddress,
+        ushort sourcePort,
+        ushort destinationPort,
+        uint action,
+        bool requireTcpAck)
+    {
         localAddress = NetworkAddress.Normalize(localAddress);
         remoteAddress = NetworkAddress.Normalize(remoteAddress);
         var matchLocalAddress = !localAddress.Equals(IPAddress.Any)
@@ -226,17 +267,19 @@ internal static unsafe class NdisApi
         {
             AdapterHandle = adapter.ToInt64(),
             DirectionFlags = PacketFlagOnSend,
-            FilterAction = FilterPacketPass,
+            FilterAction = action,
             ValidFields = NetworkLayerValid | TransportLayerValid,
             NetworkSelector = remoteAddress.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork ? Ipv4 : Ipv6,
             TransportSelector = TcpUdp,
             TransportValidFields = TcpUdpSrcPort | TcpUdpDestPort
-                | (protocol == PacketView.ProtocolTcp ? TcpUdpTcpFlags : 0),
+                | (requireTcpAck && protocol == PacketView.ProtocolTcp ? TcpUdpTcpFlags : 0),
             TransportSourcePortStart = sourcePort,
             TransportSourcePortEnd = sourcePort,
             TransportDestinationPortStart = destinationPort,
             TransportDestinationPortEnd = destinationPort,
-            TransportTcpFlags = protocol == PacketView.ProtocolTcp ? PacketView.TcpFlagAck : (byte)0
+            TransportTcpFlags = requireTcpAck && protocol == PacketView.ProtocolTcp
+                ? PacketView.TcpFlagAck
+                : (byte)0
         };
 
         if (remoteAddress.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)

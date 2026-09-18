@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Net;
+using System.Runtime.InteropServices;
 using ProxiFyre;
 
 namespace TrafficTest;
@@ -16,6 +17,7 @@ internal static class PacketSelfTest
             TestIpv4FragmentReassembly();
             TestIpv6FragmentReassembly();
             TestOutboundPassFlowRegistry();
+            TestWfpProtocolLayout();
             Console.WriteLine("PASS: packet parsing, VLAN, TCP fields, and fragment reassembly.");
             return 0;
         }
@@ -221,6 +223,16 @@ internal static class PacketSelfTest
             registry.RemoveExpired(now.AddSeconds(17)),
             "Outbound pass flow registry did not expire the refreshed flow.");
         Assert(registry.Count == 0, "Outbound pass flow registry retained expired flows.");
+    }
+
+    private static void TestWfpProtocolLayout()
+    {
+        Assert(
+            Marshal.SizeOf<WfpFlowEvent>() == 72,
+            "WFP flow event layout does not match the native protocol.");
+        Assert(
+            Marshal.SizeOf<WfpVerdict>() == 16,
+            "WFP verdict layout does not match the native protocol.");
     }
 
     private static byte[] BuildIpv4Packet(

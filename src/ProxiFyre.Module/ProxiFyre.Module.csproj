@@ -28,6 +28,8 @@
     <Compile Include="..\ProxiFyre\Network\NetworkEndpointResolver.cs" Link="Network\NetworkEndpointResolver.cs" />
     <Compile Include="..\ProxiFyre\Network\NetworkKeys.cs" Link="Network\NetworkKeys.cs" />
     <Compile Include="..\ProxiFyre\Network\TlsSniParser.cs" Link="Network\TlsSniParser.cs" />
+    <Compile Include="..\ProxiFyre\Network\WfpFlowClassifier.cs" Link="Network\WfpFlowClassifier.cs" />
+    <Compile Include="..\ProxiFyre\Network\WfpProtocol.cs" Link="Network\WfpProtocol.cs" />
     <Compile Include="..\ProxiFyre\PacketFiltering\PacketFilterLoop.cs" Link="PacketFiltering\PacketFilterLoop.cs" />
     <Compile Include="..\ProxiFyre\PacketFiltering\PacketView.cs" Link="PacketFiltering\PacketView.cs" />
     <Compile Include="..\ProxiFyre\PacketFiltering\PacketWakeSignal.cs" Link="PacketFiltering\PacketWakeSignal.cs" />

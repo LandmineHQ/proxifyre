@@ -25,6 +25,7 @@ internal sealed class UdpDirectRelay : IDisposable
     private Action<DirectRelayTarget, IPEndPoint, ReadOnlyMemory<byte>, SocketError>? _errorInjector;
     private Action<RelayOutboundFlow>? _outboundBypassRegister;
     private Action<RelayOutboundFlow>? _outboundBypassUnregister;
+    private Action<RelayOutboundFlow>? _targetRedirectUnregister;
     private CancellationToken _cancellationToken;
     private bool _disposed;
 
@@ -65,6 +66,11 @@ internal sealed class UdpDirectRelay : IDisposable
     {
         _outboundBypassRegister = register;
         _outboundBypassUnregister = unregister;
+    }
+
+    public void SetTargetRedirectUnregister(Action<RelayOutboundFlow> unregister)
+    {
+        _targetRedirectUnregister = unregister;
     }
 
     public void Start(CancellationToken cancellationToken)
@@ -142,6 +148,14 @@ internal sealed class UdpDirectRelay : IDisposable
         }
 
         socket?.Dispose();
+        _targetRedirectUnregister?.Invoke(new RelayOutboundFlow(
+            key.AdapterHandle,
+            PacketView.ProtocolUdp,
+            key.ClientAddress,
+            key.RemoteAddress,
+            key.ClientPort,
+            key.RemotePort,
+            key.Dot1q));
     }
 
     public async Task SendToRemoteAsync(
@@ -351,6 +365,17 @@ internal sealed class UdpDirectRelay : IDisposable
 
             _disposed = true;
             sockets = _sockets.Values.ToArray();
+            foreach (var pair in _targets)
+            {
+                _targetRedirectUnregister?.Invoke(new RelayOutboundFlow(
+                    pair.Key.AdapterHandle,
+                    PacketView.ProtocolUdp,
+                    pair.Key.ClientAddress,
+                    pair.Key.RemoteAddress,
+                    pair.Key.ClientPort,
+                    pair.Key.RemotePort,
+                    pair.Key.Dot1q));
+            }
             _sockets.Clear();
         }
 

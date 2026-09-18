@@ -10,12 +10,14 @@ namespace ProxiFyre;
 internal sealed unsafe class PacketFilterLoop : IDisposable
 {
     private const int MaxTemporaryPassFlows = 1024;
+    private const int MaxTargetRedirectFlows = 4096;
     private const int MaxTcpRelayConnections = 4096;
     private static readonly TimeSpan TemporaryPassFlowTtl = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan OutboundFilterApplyInterval = TimeSpan.FromMilliseconds(50);
     private static readonly TimeSpan TemporaryPassCleanupInterval = TimeSpan.FromMilliseconds(500);
     private static readonly TimeSpan OutboundFilterRetryInterval = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan PassFlowMaintenanceInterval = TimeSpan.FromMilliseconds(500);
+    private static readonly TimeSpan TargetRedirectTtl = TimeSpan.FromMinutes(2);
 
     private readonly DynamicAppConfiguration _configuration;
     private readonly TcpDirectRelay _tcpRelay;
@@ -28,10 +30,14 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
     private readonly Dictionary<IntPtr, int> _adapterInterfaceIndices = [];
     private readonly Action<string> _log;
     private readonly bool _detailedLogging;
+    private bool _useWfpClassifier;
     private readonly TimeProvider _timeProvider;
     private readonly ConcurrentDictionary<string, DateTimeOffset> _detailLogTimes = new();
     private readonly object _outboundBypassSync = new();
     private readonly Dictionary<RelayOutboundFlow, int> _outboundBypassFlows = [];
+    private readonly OutboundPassFlowRegistry _targetRedirectFlows =
+        new(MaxTargetRedirectFlows, TargetRedirectTtl);
+    private readonly ConcurrentDictionary<RelayOutboundFlow, ProcessInfo> _wfpProcessByFlow = new();
     private readonly OutboundPassFlowRegistry _temporaryPassFlows =
         new(MaxTemporaryPassFlows, TemporaryPassFlowTtl);
     private bool _outboundFilterTableDirty;
@@ -48,8 +54,20 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
     private IntPtr _driverHandle;
     private CancellationToken _cancellationToken;
     private bool _disposed;
+    private readonly TaskCompletionSource<bool> _started =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-    public PacketFilterLoop(DynamicAppConfiguration configuration, TcpDirectRelay tcpRelay, UdpDirectRelay udpRelay, PacketWakeSignal wakeSignal, Action<string>? log = null, bool detailedLogging = false, TimeProvider? timeProvider = null)
+    public Task Started => _started.Task;
+
+    public PacketFilterLoop(
+        DynamicAppConfiguration configuration,
+        TcpDirectRelay tcpRelay,
+        UdpDirectRelay udpRelay,
+        PacketWakeSignal wakeSignal,
+        Action<string>? log = null,
+        bool detailedLogging = false,
+        TimeProvider? timeProvider = null,
+        bool useWfpClassifier = false)
     {
         _configuration = configuration;
         _tcpRelay = tcpRelay;
@@ -57,6 +75,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         _wakeSignal = wakeSignal;
         _log = log ?? Console.WriteLine;
         _detailedLogging = detailedLogging;
+        _useWfpClassifier = useWfpClassifier;
         _timeProvider = timeProvider ?? TimeProvider.System;
         _processLookup = new ProcessLookup(timeProvider: _timeProvider);
         _fragmentReassembler = new IpFragmentReassembler(_timeProvider);
@@ -67,6 +86,8 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         _udpRelay.SetErrorInjector(InjectUdpErrorToClient);
         _tcpRelay.SetOutboundBypass(RegisterOutboundBypass, UnregisterOutboundBypass);
         _udpRelay.SetOutboundBypass(RegisterOutboundBypass, UnregisterOutboundBypass);
+        _tcpRelay.SetTargetRedirectUnregister(UnregisterTargetRedirect);
+        _udpRelay.SetTargetRedirectUnregister(UnregisterTargetRedirect);
     }
 
     public Task RunAsync(CancellationToken cancellationToken)
@@ -79,6 +100,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         _cancellationToken = cancellationToken;
         OpenDriver();
         ConfigureAdapters();
+        _started.TrySetResult(true);
 
         using var packetEvent = new ManualResetEvent(false);
         using var passFlowMaintenanceTimer = new Timer(
@@ -164,6 +186,12 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
 
     private void ConfigureAdapters()
     {
+        if (_useWfpClassifier && !_fragmentCacheEnabled)
+        {
+            _useWfpClassifier = false;
+            _log("WFP target-only mode disabled because WinpkFilter fragment cache is unavailable; using legacy send tunnel.");
+        }
+
         var adapterList = new NdisApi.TcpAdapterList();
         if (!NdisApi.GetTcpipBoundAdaptersInfo(_driverHandle, ref adapterList))
         {
@@ -194,7 +222,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 AdapterHandle = adapter,
                 // Direct relay only needs to inspect app-originated packets. Keeping
                 // receive traffic on the normal stack preserves Windows traffic attribution.
-                Flags = NdisApi.MstcpFlagSentTunnel
+                Flags = _useWfpClassifier ? 0 : NdisApi.MstcpFlagSentTunnel
             };
 
             if (!NdisApi.SetAdapterMode(_driverHandle, ref mode))
@@ -250,6 +278,151 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         LogDetail($"Registered relay outbound kernel pass flow: {flow}", $"relay-pass-register:{flow}", TimeSpan.FromSeconds(2));
     }
 
+    internal bool RegisterTargetRedirect(RelayOutboundFlow flow)
+    {
+        if (!_useWfpClassifier || flow.AdapterHandle == IntPtr.Zero || flow.Dot1q != 0)
+        {
+            return false;
+        }
+
+        lock (_outboundBypassSync)
+        {
+            _ = _targetRedirectFlows.Register(flow, _timeProvider.GetUtcNow());
+            if (!ApplyTargetRedirectFilters())
+            {
+                _targetRedirectFlows.Remove(flow);
+                return false;
+            }
+        }
+
+        LogDetail(
+            $"Registered WFP target redirect flow: {flow}",
+            $"wfp-target-register:{flow}",
+            TimeSpan.FromSeconds(2));
+        return true;
+    }
+
+    internal void UnregisterTargetRedirect(RelayOutboundFlow flow)
+    {
+        lock (_outboundBypassSync)
+        {
+            if (!_targetRedirectFlows.Remove(flow))
+            {
+                return;
+            }
+
+            _wfpProcessByFlow.TryRemove(flow, out _);
+            _outboundFilterTableDirty = true;
+            _forceOutboundFilterApply = true;
+        }
+
+        _wakeSignal.Pulse();
+    }
+
+    internal void RefreshTargetRedirect(RelayOutboundFlow flow)
+    {
+        lock (_outboundBypassSync)
+        {
+            if (_targetRedirectFlows.Count == 0)
+            {
+                return;
+            }
+
+            _ = _targetRedirectFlows.Register(flow, _timeProvider.GetUtcNow());
+        }
+    }
+
+    internal bool HandleWfpFlow(WfpFlowEvent flowEvent)
+    {
+        if (!_useWfpClassifier
+            || flowEvent.Protocol is not (PacketView.ProtocolTcp or PacketView.ProtocolUdp)
+            || !TryResolveAdapterHandle(flowEvent.InterfaceIndex, out var adapterHandle)
+            || CreateAddress(flowEvent.AddressFamily, flowEvent.LocalAddress) is not { } localAddress
+            || CreateAddress(flowEvent.AddressFamily, flowEvent.RemoteAddress) is not { } remoteAddress)
+        {
+            return false;
+        }
+
+        var process = _processLookup.GetProcessInfo((int)flowEvent.ProcessId);
+        if (process is null
+            || !_configuration.Current.TryGetMatchingPattern(process, out _, out _))
+        {
+            return false;
+        }
+
+        var flow = new RelayOutboundFlow(
+            adapterHandle,
+            flowEvent.Protocol,
+            localAddress,
+            remoteAddress,
+            flowEvent.LocalPort,
+            flowEvent.RemotePort);
+        if (!RegisterTargetRedirect(flow))
+        {
+            return false;
+        }
+
+        _wfpProcessByFlow[flow] = process;
+        LogDetail(
+            $"WFP classified target flow pid={flowEvent.ProcessId} {flow}",
+            $"wfp-classified:{flowEvent.ProcessId}:{flow}",
+            TimeSpan.FromSeconds(2));
+        return true;
+    }
+
+    private bool TryResolveAdapterHandle(uint interfaceIndex, out IntPtr adapterHandle)
+    {
+        if (interfaceIndex > 0)
+        {
+            foreach (var pair in _adapterInterfaceIndices)
+            {
+                if (pair.Value == (int)interfaceIndex)
+                {
+                    adapterHandle = pair.Key;
+                    return true;
+                }
+            }
+        }
+
+        adapterHandle = IntPtr.Zero;
+        return false;
+    }
+
+    private static IPAddress? CreateAddress(ushort addressFamily, byte[]? bytes)
+    {
+        if (bytes is null)
+        {
+            return null;
+        }
+
+        if (addressFamily == WfpProtocol.AddressFamilyInterNetwork && bytes.Length >= 4)
+        {
+            return new IPAddress(bytes.AsSpan(0, 4));
+        }
+
+        if (addressFamily == WfpProtocol.AddressFamilyInterNetworkV6 && bytes.Length >= 16)
+        {
+            return new IPAddress(bytes.AsSpan(0, 16));
+        }
+
+        return null;
+    }
+
+    private static RelayOutboundFlow CreateOutboundFlow(
+        PacketView packet,
+        IntPtr adapterHandle,
+        uint dot1q)
+    {
+        return new RelayOutboundFlow(
+            adapterHandle,
+            packet.IsTcp ? PacketView.ProtocolTcp : PacketView.ProtocolUdp,
+            packet.SourceAddress,
+            packet.DestinationAddress,
+            packet.SourcePort,
+            packet.DestinationPort,
+            dot1q);
+    }
+
     private void UnregisterOutboundBypass(RelayOutboundFlow flow)
     {
         lock (_outboundBypassSync)
@@ -276,11 +449,63 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         LogDetail($"Unregistered relay outbound kernel pass flow: {flow}", $"relay-pass-unregister:{flow}", TimeSpan.FromSeconds(2));
     }
 
-    private void ApplyOutboundBypassFilters()
+    private bool ApplyOutboundFilters()
     {
         if (_driverHandle == IntPtr.Zero)
         {
-            return;
+            return false;
+        }
+
+        return _useWfpClassifier
+            ? ApplyTargetRedirectFilters()
+            : ApplyLegacyPassFilters();
+    }
+
+    private bool ApplyTargetRedirectFilters()
+    {
+        if (!_fragmentCacheEnabled)
+        {
+            return false;
+        }
+
+        var filters = new List<NdisApi.StaticFilter>(_targetRedirectFlows.Count);
+        foreach (var flow in _targetRedirectFlows.Snapshot())
+        {
+            if (flow.AdapterHandle == IntPtr.Zero || flow.Dot1q != 0)
+            {
+                continue;
+            }
+
+            filters.Add(NdisApi.CreateOutboundRedirectFilter(
+                flow.AdapterHandle,
+                flow.Protocol,
+                flow.LocalAddress,
+                flow.RemoteAddress,
+                flow.LocalPort,
+                flow.RemotePort));
+        }
+
+        if (!NdisApi.SetPacketFilterTable(_driverHandle, filters))
+        {
+            LogThrottled(
+                $"SetPacketFilterTable failed for target redirect flows count={filters.Count} win32={NdisApi.LastWin32Error}",
+                "set-target-filter-failed",
+                TimeSpan.FromSeconds(2));
+            return false;
+        }
+
+        _outboundFilterTableDirty = false;
+        _forceOutboundFilterApply = false;
+        _lastOutboundFilterApply = _timeProvider.GetUtcNow();
+        _nextOutboundFilterRetry = default;
+        return true;
+    }
+
+    private bool ApplyLegacyPassFilters()
+    {
+        if (_driverHandle == IntPtr.Zero)
+        {
+            return false;
         }
 
         if (!_fragmentCacheEnabled)
@@ -299,7 +524,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 _nextOutboundFilterRetry = _lastOutboundFilterApply + OutboundFilterRetryInterval;
             }
 
-            return;
+            return false;
         }
 
         var passFlows = new HashSet<RelayOutboundFlow>(_outboundBypassFlows.Keys);
@@ -343,18 +568,19 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 _outboundFilterTableDirty = false;
                 _forceOutboundFilterApply = false;
                 _nextOutboundFilterRetry = default;
-                return;
+                return false;
             }
 
             _outboundFilterTableDirty = true;
             _lastOutboundFilterApply = _timeProvider.GetUtcNow();
             _nextOutboundFilterRetry = _lastOutboundFilterApply + OutboundFilterRetryInterval;
-            return;
+            return false;
         }
 
         _outboundFilterTableDirty = false;
         _lastOutboundFilterApply = _timeProvider.GetUtcNow();
         _nextOutboundFilterRetry = default;
+        return true;
     }
 
     private void RegisterTemporaryPassFlow(
@@ -366,6 +592,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         // UDP can begin fragmenting after any datagram, so a transport-only kernel
         // PASS rule cannot safely preserve fragment ordering without WFP metadata.
         if (!allowPassFilter
+            || _useWfpClassifier
             || !packet.IsTcp
             || !_fragmentCacheEnabled
             || dot1q != 0
@@ -457,6 +684,13 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 }
             }
 
+            if (_targetRedirectFlows.RemoveExpired(now))
+            {
+                PruneWfpProcessCache();
+                _outboundFilterTableDirty = true;
+                _forceOutboundFilterApply = true;
+            }
+
             if (!_outboundFilterTableDirty
                 || (!_forceOutboundFilterApply
                     && ((_nextOutboundFilterRetry != default && now < _nextOutboundFilterRetry)
@@ -467,7 +701,19 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             }
 
             _forceOutboundFilterApply = false;
-            ApplyOutboundBypassFilters();
+            _ = ApplyOutboundFilters();
+        }
+    }
+
+    private void PruneWfpProcessCache()
+    {
+        var active = _targetRedirectFlows.Snapshot().ToHashSet();
+        foreach (var flow in _wfpProcessByFlow.Keys)
+        {
+            if (!active.Contains(flow))
+            {
+                _wfpProcessByFlow.TryRemove(flow, out _);
+            }
         }
     }
 
@@ -660,6 +906,12 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             return false;
         }
 
+        var outboundFlow = CreateOutboundFlow(packet, adapterHandle, dot1q);
+        if (_useWfpClassifier)
+        {
+            RefreshTargetRedirect(outboundFlow);
+        }
+
         RemoveTemporaryPassFlow(packet, adapterHandle, dot1q);
 
         if (_tcpRelay.TryGetConnection(relayKey, out var existingConnection))
@@ -683,11 +935,17 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
 
         if (!packet.IsInitialSyn)
         {
-            var nonSynProcess = LookupTcpOwner(packet);
+            var nonSynProcess = _wfpProcessByFlow.TryGetValue(outboundFlow, out var wfpProcess)
+                ? wfpProcess
+                : LookupTcpOwner(packet);
             if (nonSynProcess is not null
                 && !_configuration.Current.TryGetMatchingPattern(nonSynProcess, out _, out _))
             {
                 RegisterTemporaryPassFlow(packet, adapterHandle, dot1q, allowPassFilter);
+            }
+            else if (_useWfpClassifier)
+            {
+                UnregisterTargetRedirect(outboundFlow);
             }
 
             return false;
@@ -704,16 +962,26 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             return false;
         }
 
-        var process = LookupTcpOwner(packet);
+        var process = _wfpProcessByFlow.TryGetValue(outboundFlow, out var wfpTargetProcess)
+            ? wfpTargetProcess
+            : LookupTcpOwner(packet);
         if (process is null)
         {
             _tcpRelay.MarkBypassedFlow(relayKey);
+            if (_useWfpClassifier)
+            {
+                UnregisterTargetRedirect(outboundFlow);
+            }
             return false;
         }
 
         if (!_configuration.Current.TryGetMatchingPattern(process, out var matchedPattern, out _))
         {
             RegisterTemporaryPassFlow(packet, adapterHandle, dot1q, allowPassFilter);
+            if (_useWfpClassifier)
+            {
+                UnregisterTargetRedirect(outboundFlow);
+            }
             return false;
         }
 
@@ -869,6 +1137,16 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             return false;
         }
 
+        var outboundFlow = CreateOutboundFlow(packet, adapterHandle, dot1q);
+        if (_useWfpClassifier)
+        {
+            RefreshTargetRedirect(outboundFlow);
+            if (_wfpProcessByFlow.TryGetValue(outboundFlow, out var wfpProcess))
+            {
+                processInfo = wfpProcess;
+            }
+        }
+
         if (_udpRelay.TryGetTarget(relayKey, out var existingTarget))
         {
             var existingProcess = processInfo ?? _processLookup.GetProcessInfo(existingTarget.ProcessId);
@@ -903,6 +1181,10 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                     TimeSpan.FromSeconds(5));
             }
 
+            if (_useWfpClassifier)
+            {
+                UnregisterTargetRedirect(outboundFlow);
+            }
             return false;
         }
 
@@ -916,6 +1198,10 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                     TimeSpan.FromSeconds(5));
             }
 
+            if (_useWfpClassifier)
+            {
+                UnregisterTargetRedirect(outboundFlow);
+            }
             return false;
         }
 

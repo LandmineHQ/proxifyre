@@ -45,6 +45,7 @@ internal sealed class TcpDirectRelay : IDisposable
     private Func<DirectRelayTarget, TcpSegment, bool>? _packetInjector;
     private Action<RelayOutboundFlow>? _outboundBypassRegister;
     private Action<RelayOutboundFlow>? _outboundBypassUnregister;
+    private Action<RelayOutboundFlow>? _targetRedirectUnregister;
 
     public TcpDirectRelay(
         Action<string>? log = null,
@@ -71,6 +72,11 @@ internal sealed class TcpDirectRelay : IDisposable
     {
         _outboundBypassRegister = register;
         _outboundBypassUnregister = unregister;
+    }
+
+    public void SetTargetRedirectUnregister(Action<RelayOutboundFlow> unregister)
+    {
+        _targetRedirectUnregister = unregister;
     }
 
     public void Start(CancellationToken cancellationToken)
@@ -182,6 +188,14 @@ internal sealed class TcpDirectRelay : IDisposable
             && _connections.TryRemove(
                 new KeyValuePair<TcpRelayKey, TcpRelayConnection>(connection.FlowKey, connection)))
         {
+            _targetRedirectUnregister?.Invoke(new RelayOutboundFlow(
+                connection.FlowKey.AdapterHandle,
+                PacketView.ProtocolTcp,
+                connection.FlowKey.ClientAddress,
+                connection.FlowKey.RemoteAddress,
+                connection.FlowKey.ClientPort,
+                connection.FlowKey.RemotePort,
+                connection.FlowKey.Dot1q));
             connection.Dispose();
         }
     }
@@ -256,6 +270,14 @@ internal sealed class TcpDirectRelay : IDisposable
     {
         foreach (var connection in _connections.Values)
         {
+            _targetRedirectUnregister?.Invoke(new RelayOutboundFlow(
+                connection.FlowKey.AdapterHandle,
+                PacketView.ProtocolTcp,
+                connection.FlowKey.ClientAddress,
+                connection.FlowKey.RemoteAddress,
+                connection.FlowKey.ClientPort,
+                connection.FlowKey.RemotePort,
+                connection.FlowKey.Dot1q));
             connection.Dispose();
         }
 

@@ -17,6 +17,8 @@ internal sealed class RelayService : IDisposable, IAsyncDisposable
     private UdpDirectRelay? _udpRelay;
     private PacketFilterLoop? _filter;
     private Task? _filterTask;
+    private WfpFlowClassifier? _wfpClassifier;
+    private Task? _wfpClassifierTask;
     private Task? _trafficStatsTask;
     private Task? _configurationWatchTask;
 
@@ -61,8 +63,27 @@ internal sealed class RelayService : IDisposable, IAsyncDisposable
         _udpRelay = new UdpDirectRelay(_log, _detailedLogging, _trafficCounter, _packetWakeSignal, _timeProvider);
         _tcpRelay.Start(_cts.Token);
         _udpRelay.Start(_cts.Token);
-        _filter = new PacketFilterLoop(_configuration, _tcpRelay, _udpRelay, _packetWakeSignal, _log, _detailedLogging, _timeProvider);
+        _ = WfpFlowClassifier.TryOpen(_log, out _wfpClassifier);
+        _filter = new PacketFilterLoop(
+            _configuration,
+            _tcpRelay,
+            _udpRelay,
+            _packetWakeSignal,
+            _log,
+            _detailedLogging,
+            _timeProvider,
+            useWfpClassifier: _wfpClassifier is not null);
         _filterTask = _filter.RunAsync(_cts.Token);
+        if (_wfpClassifier is not null)
+        {
+            var classifier = _wfpClassifier;
+            var filter = _filter;
+            _wfpClassifierTask = Task.Run(async () =>
+            {
+                await filter.Started.WaitAsync(_cts.Token).ConfigureAwait(false);
+                classifier.Start(filter.HandleWfpFlow, _cts.Token);
+            }, _cts.Token);
+        }
         _trafficStatsTask = Task.Run(() => ReportTrafficStatsAsync(_cts.Token), _cts.Token);
         if (!string.IsNullOrWhiteSpace(configurationPath))
         {
@@ -201,7 +222,19 @@ internal sealed class RelayService : IDisposable, IAsyncDisposable
             }
         }
 
+        if (_wfpClassifierTask is not null)
+        {
+            try
+            {
+                await _wfpClassifierTask.WaitAsync(TimeSpan.FromSeconds(2));
+            }
+            catch
+            {
+            }
+        }
+
         _filter?.Dispose();
+        _wfpClassifier?.Dispose();
         _udpRelay?.Dispose();
         _tcpRelay?.Dispose();
         _cts?.Dispose();
@@ -211,6 +244,8 @@ internal sealed class RelayService : IDisposable, IAsyncDisposable
         _configuration = null;
         _cts = null;
         _filterTask = null;
+        _wfpClassifier = null;
+        _wfpClassifierTask = null;
         _trafficStatsTask = null;
         _configurationWatchTask = null;
         _log("Stopped.");

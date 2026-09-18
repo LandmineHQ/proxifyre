@@ -59,6 +59,8 @@ Use the wrapper for normal work:
 .\scripts\proxifyre.ps1 test <tcp|udp|uu|steam|traffic-telemetry> [-Detailed]
 .\scripts\proxifyre.ps1 reset-filter
 .\scripts\proxifyre.ps1 clean
+.\scripts\build-wfp.ps1 -Configuration Debug
+.\scripts\install-wfp.ps1 -Configuration Debug
 ```
 
 - `build` publishes the NativeAOT module/probe/test host and builds the
@@ -69,6 +71,10 @@ Use the wrapper for normal work:
   WinpkFilter, and Administrator privileges. `traffic-telemetry` does not.
 - `packet-selftest`, `tcp-selftest`, and `udp-selftest` validate packet and
   relay state logic without WinpkFilter or Administrator privileges.
+- `build-wfp` compiles the optional WFP ALE callout driver with the installed
+  WDK. Loading an unsigned development driver requires test signing or a
+  trusted test signature; `install-wfp` is an explicit elevated deployment
+  step.
 - Prefer adding a focused diagnostic mode to `TrafficTest` when a regression
   needs repeatable coverage.
 - Report the exact commands run and whether WinpkFilter or Administrator
