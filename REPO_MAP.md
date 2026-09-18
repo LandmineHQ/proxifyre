@@ -393,7 +393,7 @@ best-effort and intentionally separate from logs and the control channel.
 | `HeaderBar.xaml`, `HeaderBar.xaml.cs` | Branding, source link, local/remote version display, running badge, and start/stop command. |
 | `AnnouncementPanel.xaml`, `AnnouncementPanel.xaml.cs` | Displays dismissible manifest announcements. |
 | `RuleEntryBar.xaml`, `RuleEntryBar.xaml.cs` | Collects `coreProcessName`, custom rules, application paths, and directory paths. |
-| `ApplicationRulesTab.xaml`, `ApplicationRulesTab.xaml.cs` | Searchable application-rule list with edit and remove actions. |
+| `ApplicationRulesTab.xaml`, `ApplicationRulesTab.xaml.cs` | Searchable application-rule list with enable/disable, edit, and remove actions. |
 | `ApplicationRulesManager.cs` | Observable rule collection, filtering, sorting, duplicate checks, add/replace/remove/toggle operations, and conversion to enabled or disabled configuration patterns. |
 | `ConfiguredApplication.cs` | UI model for executable, directory, and custom rule entries, including the persisted enabled/disabled state. |
 | `ApplicationRuleKind.cs` | Rule-kind enum used for sorting and presentation. |
@@ -424,6 +424,7 @@ best-effort and intentionally separate from logs and the control channel.
 
 | Path | Responsibility |
 | --- | --- |
+| `UuElevation.cs` | Checks whether ProxiFyre is elevated, recognizes the elevated-UI launch argument, and restarts the WPF process through `runas` before UU process inspection or memory patching. |
 | `UuPatchCatalog.cs` | Loads and validates UU patch profiles from `UuPatchProfiles.json`, parses hex byte arrays and RVAs, and resolves a profile by source or patched SHA256. |
 | `UuRuntimePatcher.cs` | Scans running UU processes for loaded `local_proxy.dll` modules, validates each target function, applies or restores code bytes with `VirtualProtectEx`/`WriteProcessMemory`, suspends the target process during writes, and flushes the instruction cache. |
 
