@@ -74,6 +74,16 @@
             <ListBox.ItemTemplate>
                 <DataTemplate>
                     <Grid Margin="8,5">
+                        <Grid.Style>
+                            <Style TargetType="Grid">
+                                <Setter Property="Opacity" Value="1" />
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding IsEnabled}" Value="False">
+                                        <Setter Property="Opacity" Value="0.55" />
+                                    </DataTrigger>
+                                </Style.Triggers>
+                            </Style>
+                        </Grid.Style>
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="*" />
                             <ColumnDefinition Width="Auto" />
@@ -118,6 +128,11 @@
                                                    FontSize="10"
                                                    Foreground="#475467" />
                                     </Border>
+                                    <TextBlock Text="{Binding EnabledStateText}"
+                                               FontSize="10"
+                                               Foreground="#667085"
+                                               VerticalAlignment="Center"
+                                               Margin="8,0,0,0" />
                                 </StackPanel>
                                 <TextBlock Text="{Binding Detail}"
                                            FontSize="11"
@@ -130,6 +145,14 @@
                                     Orientation="Horizontal"
                                     VerticalAlignment="Center"
                                     Margin="12,0,0,0">
+                            <Button Content="{Binding ToggleEnabledActionText}"
+                                    Click="ToggleEnabledButton_Click"
+                                    MinWidth="52"
+                                    MinHeight="28"
+                                    Padding="10,4"
+                                    Background="#EEF2F7"
+                                    Foreground="#1F2937"
+                                    Margin="0,0,6,0" />
                             <Button Content="{Binding PrimaryActionText}"
                                     Click="EditAppButton_Click"
                                     MinWidth="56"

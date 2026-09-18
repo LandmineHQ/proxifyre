@@ -17,6 +17,11 @@ public partial class RuntimeInfoTab : UserControl
         ConfigPathText.Text = configPath;
     }
 
+    public void SetLicenseKey(string? licenseKey)
+    {
+        LicenseKeyText.Text = licenseKey ?? string.Empty;
+    }
+
     public void SetCoreProcessInfo(string text, string networkOwnerHint)
     {
         CoreProcessText.Text = text;

@@ -12,6 +12,11 @@ application traffic through WinpkFilter, identifies the owning process, creates
 normal outbound sockets for selected flows, and injects synthetic response
 packets back into Windows TCP/IP without opening local TCP or UDP listeners.
 
+The WPF Settings tab also provides an optional UU Game Booster compatibility
+toggle. It applies a SHA256-validated, reversible code patch to the loaded
+`local_proxy.dll` image in a running UU process. It never modifies the
+installed DLL from the UI and preserves UU's process ACL.
+
 The repository has two execution modes:
 
 - No command-line arguments: launch the WPF UI.
@@ -79,9 +84,54 @@ items by `ProxiFyre`, `ProxiFyre.Module`, and in some cases other projects.
 | `global.json` | Pins the expected .NET SDK to `10.0.100` with latest-feature roll-forward. |
 | `manifest.json` | Local version, source URL, and announcement metadata copied into application output. |
 | `scripts/proxifyre.ps1` | Main PowerShell development wrapper for build, UI, run, tests, config, license, publishing, reset, and clean operations. |
+| `scripts/patch-uu-whitelist.ps1` | SHA256-profile binary patcher for UU `local_proxy.dll`. It keeps the existing process ACL and disables the TCP/UDP domain and destination allow/deny gates before UU writes the active proxy settings to `uuwfp.sys`. |
+| `src/Shared/UuPatchProfiles.json` | Shared UU patch profile catalog used by both the WPF runtime patcher and the offline PowerShell patcher. Each profile contains the source SHA256, patched SHA256, function RVAs, and expected original/replacement bytes. |
+| `docs/UU_ACCELERATOR.md` | UU architecture, WFP driver interface, whitelist processing, runtime patch semantics, UI behavior, and known limitations. |
+| `.github/workflows/build.yml` | Windows x64 Release build, packet self-test, release staging, and named build-artifact upload. |
+| `.github/workflows/release.yml` | Manual promotion of a successful Build artifact into a GitHub Release. |
 | `.gitignore` | Excludes build output, logs, caches, local `app-config.json`, and temporary files. |
 | `app-config.json` | Local runtime configuration. It is intentionally ignored by Git. |
 | `LICENSE` | Repository license. |
+
+## GitHub Workflows
+
+### Build
+
+`.github/workflows/build.yml` runs on pushes to any branch, `v*` tags, pull
+requests targeting `main`, and manual dispatch.
+
+The Windows job:
+
+1. Installs the .NET 10 SDK and restores through the NuGet cache.
+2. Runs `.\scripts\proxifyre.ps1 build -Configuration Release`.
+3. Runs `.\scripts\proxifyre.ps1 test packet-selftest -Configuration Release`.
+4. Stages the WPF application, NativeAOT module/probe, `manifest.json`,
+   `UuPatchProfiles.json`, `README.md`, and `docs/UU_ACCELERATOR.md`.
+5. Excludes local configuration, logs, and PDB files.
+6. Includes `ProxiFyre.Wfp.sys` and `ProxiFyre.Wfp.inf` when the optional WFP
+   build output exists.
+7. Validates that every required release file exists, creates
+   `release/proxifyre-win-x64.zip`, and uploads it as the
+   `proxifyre-win-x64` artifact for 90 days.
+
+The required ZIP entries are `ProxiFyre.exe`, `ProxiFyre.dll`,
+`ProxiFyre.deps.json`, `ProxiFyre.runtimeconfig.json`,
+`ProxiFyre.Module.dll`, `ProxiFyre.Probe.dll`, `manifest.json`, and
+`UuPatchProfiles.json`.
+
+### Release
+
+`.github/workflows/release.yml` is manual. It takes the successful Build
+workflow's numeric `build_id` and a semantic `version`.
+
+The job validates that the referenced workflow run completed successfully,
+downloads the exact `proxifyre-win-x64` artifact, and names the release asset
+`proxifyre-<version>-build-<build_id>-<short-sha>.zip`.
+
+When the version does not exist, the workflow creates a draft GitHub Release
+targeting the build commit. When it already exists, the workflow uploads or
+replaces the matching asset with `gh release upload --clobber`. The job summary
+reports the version, build ID, asset path, and SHA256.
 
 ## End-to-End Runtime Flows
 
@@ -111,6 +161,30 @@ items by `ProxiFyre`, `ProxiFyre.Module`, and in some cases other projects.
     messages. The module emits `loaded`, `running`, `reloaded`, `stopped`,
     `status`, `log`, `lost`, and `error` events.
 11. The injected DLL remains resident until the target process exits.
+
+### UU runtime patch
+
+1. The Settings tab raises `UuPatchToggleRequested` when the UU switch changes.
+2. `UuRuntimePatcher` scans processes whose executable is under a NetEase UU
+   installation root and locates loaded `local_proxy.dll` modules.
+3. The module file is hashed and matched against `UuPatchProfiles.json`.
+4. Each target RVA is read from the live process. The patcher accepts only the
+   exact original bytes or the exact known patched bytes.
+5. Enabling the switch asks for confirmation, then suspends the UU process,
+   changes the target page to `PAGE_EXECUTE_READWRITE`, writes the replacement
+   stubs, flushes the instruction cache, and restores page protection.
+6. Disabling the switch writes the original bytes back while the process is
+   suspended.
+7. The installed DLL is never changed by the WPF UI. Restarting UU removes the
+   runtime patch until the toggle is applied again.
+8. If ProxiFyre exits normally after applying a patch in the current UI
+   session, it performs a best-effort restore before closing.
+9. When `enableUuWhitelistPatch` is true, a 3-second UI timer re-inspects UU
+   and automatically reapplies the patch after UU restarts or reloads
+   `local_proxy.dll`.
+10. If UU requires elevation, enabling the persisted setting restarts the WPF
+    UI through the `runas` verb. The elevated UI waits for the previous
+    single-instance mutex before starting the monitor.
 
 ### CLI relay startup
 
@@ -204,10 +278,12 @@ Supported configuration fields:
 | --- | --- |
 | `coreProcessName` | Process name used to select the AOT injection target. Defaults to `steamwebhelper.exe`. |
 | `apps` | Direct application patterns. |
+| `disabledApps` | Direct application patterns retained in the UI but excluded from relay matching. |
 | `proxies[].appNames` | Legacy migration input. Other proxy fields are ignored. |
 | `licenseKey` | Device-bound registration key stored in the configuration. |
 | `moduleDllName` | DLL injected into the target. Defaults to `ProxiFyre.Module.dll`; the probe can be selected explicitly. |
 | `enableFakeIpWhitelist` | Enables the special fake-IP DNS response path in `PacketFilterLoop`. |
+| `enableUuWhitelistPatch` | Persists the Settings-tab UU runtime patch preference and enables the 3-second UU module monitor. |
 
 Configuration hot reload currently keys on `coreProcessName` plus `apps`.
 Changes limited to `enableFakeIpWhitelist`, `moduleDllName`, or `licenseKey`
@@ -318,16 +394,17 @@ best-effort and intentionally separate from logs and the control channel.
 | `AnnouncementPanel.xaml`, `AnnouncementPanel.xaml.cs` | Displays dismissible manifest announcements. |
 | `RuleEntryBar.xaml`, `RuleEntryBar.xaml.cs` | Collects `coreProcessName`, custom rules, application paths, and directory paths. |
 | `ApplicationRulesTab.xaml`, `ApplicationRulesTab.xaml.cs` | Searchable application-rule list with edit and remove actions. |
-| `ApplicationRulesManager.cs` | Observable rule collection, filtering, sorting, duplicate checks, add/replace/remove operations, and conversion to configuration patterns. |
-| `ConfiguredApplication.cs` | UI model for executable, directory, and custom rule entries. |
+| `ApplicationRulesManager.cs` | Observable rule collection, filtering, sorting, duplicate checks, add/replace/remove/toggle operations, and conversion to enabled or disabled configuration patterns. |
+| `ConfiguredApplication.cs` | UI model for executable, directory, and custom rule entries, including the persisted enabled/disabled state. |
 | `ApplicationRuleKind.cs` | Rule-kind enum used for sorting and presentation. |
 | `FuzzyMatcher.cs` | Search matcher that ignores spaces, hyphens, and underscores and supports ordered character subsequences. |
 | `IconLoader.cs` | Extracts and freezes executable icons for WPF display. |
 | `RuleEditDialog.cs` | Modal editor for custom application rules. |
 | `RegistrationDialog.cs` | Device-ID display and license-key validation dialog. |
-| `RuntimeInfoTab.xaml`, `RuntimeInfoTab.xaml.cs` | Shows relay mode, protocols, module target, socket ownership hint, config path, and reload action. |
-| `SettingsTab.xaml`, `SettingsTab.xaml.cs` | Displays license key and WinpkFilter status with install/uninstall action. |
-| `SettingsViewModel.cs` | Observable presentation state for license and WinpkFilter controls. |
+| `RuntimeInfoTab.xaml`, `RuntimeInfoTab.xaml.cs` | Shows relay mode, protocols, module target, socket ownership hint, config path, selectable read-only license key, and reload action. |
+| `SettingsTab.xaml`, `SettingsTab.xaml.cs` | Displays WinpkFilter status with install/uninstall action and the UU runtime-patch toggle with confirmation/status events. |
+| `SettingsViewModel.cs` | Observable presentation state for WinpkFilter and UU runtime-patch controls. |
+| `UuPatchToggleRequestedEventArgs.cs` | Carries the requested enabled state from the Settings toggle to the MainWindow controller. |
 | `LogsTab.xaml`, `LogsTab.xaml.cs` | Virtualized log list with select-all/selected copy and Ctrl+C support. |
 | `MainTabs.xaml`, `MainTabs.xaml.cs` | Composes the four tabs and bridges child-control events to `MainWindow`. |
 | `TrafficStatusBar.xaml`, `TrafficStatusBar.xaml.cs` | Displays upload/download totals and rates. |
@@ -342,6 +419,13 @@ best-effort and intentionally separate from logs and the control channel.
 | `Updates/UpdateChecker.cs` | Reads the assembly version and remote `manifest.json`; falls back through ghproxy; returns no-update, update-available, or failed results. |
 | `Properties/AssemblyInfo.cs` | Grants `InternalsVisibleTo("TrafficTest")`. |
 | `Assets/AppIcon.ico` | Application and tray icon resource. |
+
+### `Uu/`
+
+| Path | Responsibility |
+| --- | --- |
+| `UuPatchCatalog.cs` | Loads and validates UU patch profiles from `UuPatchProfiles.json`, parses hex byte arrays and RVAs, and resolves a profile by source or patched SHA256. |
+| `UuRuntimePatcher.cs` | Scans running UU processes for loaded `local_proxy.dll` modules, validates each target function, applies or restores code bytes with `VirtualProtectEx`/`WriteProcessMemory`, suspends the target process during writes, and flushes the instruction cache. |
 
 ## `src/ProxiFyre.Module`
 
@@ -380,7 +464,7 @@ loop.
 | `Curl/CurlTest.cs` | Runs system `curl.exe` without proxy environment variables and considers a 2xx response successful. |
 | `Diagnostics/ProcessNetworkDiagnostic.cs` | Samples process TCP listeners, UDP endpoints, and TCP connections; supports text and JSON output. |
 | `Diagnostics/TrafficTelemetryDiagnostic.cs` | Starts a telemetry server and client, sends three snapshots, and verifies delivery without WinpkFilter or Administrator rights. |
-| `Diagnostics/PacketSelfTest.cs` | Driver-free parser, VLAN, TCP option/URG, UDP declared-length, IPv4/IPv6 fragment reassembly, and outbound pass-flow registry capacity/TTL checks. |
+| `Diagnostics/PacketSelfTest.cs` | Driver-free parser, VLAN, TCP option/URG, UDP declared-length, IPv4/IPv6 fragment reassembly, UU patch-profile catalog, and outbound pass-flow registry capacity/TTL checks. |
 | `Diagnostics/TcpRelaySelfTest.cs` | Driver-free loopback validation for TCP handshake, zero-window flow control, retransmission, bidirectional data, and the client FIN transition. |
 | `Diagnostics/UdpRelaySelfTest.cs` | Driver-free loopback validation for UDP forwarding and alternate response endpoint preservation. |
 | `Diagnostics/WindowsNetworkTable.cs` | Reads IPv4/IPv6 TCP and UDP owner tables from `iphlpapi.dll` for diagnostics. |
@@ -466,6 +550,7 @@ The PowerShell wrapper is the normal entry point:
 | `.\scripts\proxifyre.ps1 license-device` | Prints the current device ID and derived key. |
 | `.\scripts\proxifyre.ps1 license-key <device-id>` | Prints the key for a supplied device ID. |
 | `.\scripts\proxifyre.ps1 module-publish` | Publishes only the production NativeAOT module. |
+| `.\scripts\proxifyre.ps1 patch-uu` | Creates a patched UU `local_proxy.dll` under `artifacts/uu-patch/<version>/`. Add `-Apply` to replace the installed DLL after creating a rollback backup, or `-Restore` to restore that backup. |
 | `.\scripts\build-wfp.ps1 -Configuration Debug|Release` | Builds the WFP callout driver with the installed WDK into `artifacts/native/<Configuration>/`. |
 | `.\scripts\install-wfp.ps1 -Configuration Debug|Release` | Installs or starts the WFP kernel service; development builds require test signing and a trusted signature. |
 | `.\scripts\proxifyre.ps1 clean` | Cleans solution outputs plus repository-local build directories. |
@@ -478,11 +563,14 @@ Output locations:
 | `artifacts/native/<Configuration>/` | `ProxiFyre.Module.dll`, `ProxiFyre.Probe.dll`, and `ProxiFyre.Wfp.sys` when built. |
 | `artifacts/tmp/aot-test-host/` | Temporary renamed test hosts created by relay tests. |
 | `artifacts/obj/` | Intermediate build output. |
+| `release/proxifyre-win-x64.zip` | CI-staged Windows x64 package uploaded as the `proxifyre-win-x64` workflow artifact. The `release/` directory is ignored by Git. |
 | `<app output>/runtime/<Configuration>/` | Timestamped module DLL copies prepared for injection. |
 | `<app output>/dependencies/` | Cached WinpkFilter MSI and installer logs. |
 | `<app output>/app-config.json` | UI runtime configuration. |
+| `<app output>/UuPatchProfiles.json` | UU DLL hash, RVA, and byte-signature catalog copied from `src/Shared`. |
 | `<app output>/proxifyre-ui.log` | UI-side log. |
 | `<app output>/proxifyre-core.log` | CLI or injected-module relay log. |
+| `artifacts/uu-patch/<version>/local_proxy.dll` | Patch output for the matching UU `local_proxy.dll` version. The installer backup is written beside the installed DLL as `local_proxy.dll.uu-original.<hash>.bak`. |
 
 Runtime requirements:
 
@@ -492,6 +580,7 @@ Runtime requirements:
 - WinpkFilter installed or installable.
 - Administrator privileges for driver operations, packet filtering, and
   injection.
+- Matching privileges with the running UU process for runtime memory patching.
 
 ## Focused Diagnostics
 
@@ -528,6 +617,12 @@ integration and regression harness.
   unavailable.
 - Do not commit generated binaries, logs, runtime DLL copies, caches, or local
   `app-config.json`.
+- Keep the Build artifact name `proxifyre-win-x64` and package name
+  `proxifyre-win-x64.zip` stable; the Release workflow downloads them by name.
+- Keep the required ZIP entries and NativeAOT Release outputs intact when
+  changing build or staging behavior.
+- Keep Release promotion manual through the successful `build_id` and
+  `version` inputs. Do not implicitly publish a Release from a push.
 
 ## Known Limitations
 
@@ -552,3 +647,9 @@ integration and regression harness.
 - `ProxiFyre.Probe` is an investigation tool, not a production fallback.
 - The Leigod redirect diagnostic depends on an external WFP/driver environment
   and is not a portable automated test.
+- UU runtime patching requires a matching `local_proxy.dll` SHA256 profile and
+  an already loaded module. The patch is lost when UU restarts and is
+  intentionally not written to the installed DLL.
+- UU process matching, local/private traffic handling, unsupported protocols,
+  proxy-line availability, and region/health fallbacks remain outside the
+  runtime patch.

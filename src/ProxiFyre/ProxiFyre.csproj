@@ -32,6 +32,7 @@
     <Compile Include="..\Shared\ModuleMessageProtocol.cs" Link="Shared\ModuleMessageProtocol.cs" />
     <Compile Include="..\Shared\TrafficTelemetry.cs" Link="Shared\TrafficTelemetry.cs" />
     <Content Include="..\..\manifest.json" Link="manifest.json" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\Shared\UuPatchProfiles.json" Link="UuPatchProfiles.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
   <Target Name="CopyNativeAotModule" AfterTargets="Build">
     <PropertyGroup>

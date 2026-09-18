@@ -36,6 +36,13 @@ internal sealed class UiSingleInstanceCoordinator : IDisposable
 
     public static bool TryAcquirePrimary([System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out UiSingleInstanceCoordinator? coordinator)
     {
+        return TryAcquirePrimary(TimeSpan.Zero, out coordinator);
+    }
+
+    public static bool TryAcquirePrimary(
+        TimeSpan retryTimeout,
+        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out UiSingleInstanceCoordinator? coordinator)
+    {
         coordinator = null;
 
         var activationEvent = new EventWaitHandle(
@@ -47,13 +54,26 @@ internal sealed class UiSingleInstanceCoordinator : IDisposable
 
         try
         {
-            try
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            while (true)
             {
-                ownsMutex = mutex.WaitOne(0);
-            }
-            catch (AbandonedMutexException)
-            {
-                ownsMutex = true;
+                try
+                {
+                    var remaining = retryTimeout - stopwatch.Elapsed;
+                    var waitMilliseconds = retryTimeout <= TimeSpan.Zero
+                        ? 0
+                        : (int)Math.Clamp(remaining.TotalMilliseconds, 0, 250);
+                    ownsMutex = mutex.WaitOne(waitMilliseconds);
+                }
+                catch (AbandonedMutexException)
+                {
+                    ownsMutex = true;
+                }
+
+                if (ownsMutex || retryTimeout <= TimeSpan.Zero || stopwatch.Elapsed >= retryTimeout)
+                {
+                    break;
+                }
             }
 
             if (!ownsMutex)

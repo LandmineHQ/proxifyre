@@ -9,20 +9,26 @@ public partial class MainTabs : UserControl
         InitializeComponent();
         ApplicationRulesTab.SearchChanged += (_, _) => SearchChanged?.Invoke(this, EventArgs.Empty);
         ApplicationRulesTab.EditAppRequested += (_, e) => EditAppRequested?.Invoke(this, e);
+        ApplicationRulesTab.ToggleEnabledRequested += (_, e) => ToggleEnabledRequested?.Invoke(this, e);
         ApplicationRulesTab.RemoveAppRequested += (_, e) => RemoveAppRequested?.Invoke(this, e);
         RuntimeInfoTab.ReloadRequested += (_, _) => ReloadRequested?.Invoke(this, EventArgs.Empty);
         SettingsTab.WinpkFilterActionRequested += (_, _) => WinpkFilterActionRequested?.Invoke(this, EventArgs.Empty);
+        SettingsTab.UuPatchToggleRequested += (_, e) => UuPatchToggleRequested?.Invoke(this, e);
     }
 
     public event EventHandler? SearchChanged;
 
     public event EventHandler<ItemRequestedEventArgs>? EditAppRequested;
 
+    public event EventHandler<ItemRequestedEventArgs>? ToggleEnabledRequested;
+
     public event EventHandler<ItemRequestedEventArgs>? RemoveAppRequested;
 
     public event EventHandler? ReloadRequested;
 
     public event EventHandler? WinpkFilterActionRequested;
+
+    public event EventHandler<UuPatchToggleRequestedEventArgs>? UuPatchToggleRequested;
 
     public ListBox Apps => ApplicationRulesTab.Apps;
 
@@ -43,6 +49,11 @@ public partial class MainTabs : UserControl
     public void SetCoreProcessInfo(string text, string networkOwnerHint)
     {
         RuntimeInfoTab.SetCoreProcessInfo(text, networkOwnerHint);
+    }
+
+    public void SetLicenseKey(string? licenseKey)
+    {
+        RuntimeInfoTab.SetLicenseKey(licenseKey);
     }
 
     public void SetTrafficStatus(string uploadText, string downloadText)

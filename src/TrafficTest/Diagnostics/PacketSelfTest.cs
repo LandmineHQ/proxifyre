@@ -20,9 +20,12 @@ internal static class PacketSelfTest
             TestIpv6FragmentReassembly();
             TestOutboundPassFlowRegistry();
             TestWfpProtocolLayout();
+            TestUuPatchProfileCatalog();
+            TestUuPatchPersistence();
+            TestDisabledApplicationPersistence();
             TestNetworkInterfaceIndexResolution();
             TestRuntimeModuleCopy();
-            Console.WriteLine("PASS: packet parsing, VLAN, TCP fields, fragment reassembly, interface indexes, and runtime module copies.");
+            Console.WriteLine("PASS: packet parsing, VLAN, TCP fields, fragment reassembly, UU patch profiles/config, interface indexes, and runtime module copies.");
             return 0;
         }
         catch (Exception ex)
@@ -237,6 +240,80 @@ internal static class PacketSelfTest
         Assert(
             Marshal.SizeOf<WfpVerdict>() == 16,
             "WFP verdict layout does not match the native protocol.");
+    }
+
+    private static void TestUuPatchProfileCatalog()
+    {
+        var repositoryRoot = RepositoryPaths.FindRepositoryRoot(AppContext.BaseDirectory);
+        var catalogPath = Path.Combine(repositoryRoot, "src", "Shared", "UuPatchProfiles.json");
+        var profiles = UuPatchCatalog.Load(catalogPath);
+        Assert(profiles.Count >= 2, "UU patch profile catalog did not load all known profiles.");
+
+        var current = profiles.Single(profile => profile.Key == "uu-5247");
+        Assert(current.Version == "9.9.9.99", "Current UU patch profile version mismatch.");
+        Assert(current.Targets.Count == 7, "Current UU patch profile target count mismatch.");
+        Assert(
+            current.Targets.All(target =>
+                target.OriginalBytes.Length == target.PatchedBytes.Length
+                && target.OriginalBytes.Length > 0),
+            "UU patch profile contains invalid target bytes.");
+    }
+
+    private static void TestUuPatchPersistence()
+    {
+        var directory = Directory.CreateTempSubdirectory("proxifyre-uu-config-");
+        try
+        {
+            var configPath = Path.Combine(directory.FullName, "app-config.json");
+            AppConfiguration.SaveApps(
+                configPath,
+                ["steamwebhelper.exe"],
+                "steamwebhelper.exe",
+                enableUuWhitelistPatch: true);
+            Assert(
+                AppConfiguration.Load(configPath).EnableUuWhitelistPatch,
+                "UU whitelist patch setting did not persist in app-config.json.");
+
+            AppConfiguration.SaveApps(
+                configPath,
+                ["steamwebhelper.exe"],
+                "steamwebhelper.exe",
+                enableUuWhitelistPatch: false);
+            Assert(
+                !AppConfiguration.Load(configPath).EnableUuWhitelistPatch,
+                "UU whitelist patch setting could not be disabled.");
+            Assert(
+                !new ConfigurationStore(configPath).GetUuWhitelistPatchEnabled(),
+                "Disabled UU whitelist patch setting incorrectly reported as enabled.");
+        }
+        finally
+        {
+            directory.Delete(recursive: true);
+        }
+    }
+
+    private static void TestDisabledApplicationPersistence()
+    {
+        var directory = Directory.CreateTempSubdirectory("proxifyre-disabled-apps-");
+        try
+        {
+            var configPath = Path.Combine(directory.FullName, "app-config.json");
+            AppConfiguration.SaveApps(
+                configPath,
+                ["enabled.exe"],
+                "steamwebhelper.exe",
+                disabledApps: ["disabled.exe"]);
+
+            var loaded = AppConfiguration.Load(configPath);
+            Assert(loaded.Apps.SequenceEqual(["enabled.exe"]), "Enabled application list did not round-trip.");
+            Assert(
+                loaded.DisabledApps.SequenceEqual(["disabled.exe"]),
+                "Disabled application list did not round-trip.");
+        }
+        finally
+        {
+            directory.Delete(recursive: true);
+        }
     }
 
     private static void TestNetworkInterfaceIndexResolution()

@@ -8,7 +8,8 @@ internal sealed record ConfiguredApplication(
     string Value,
     string Detail,
     ApplicationRuleKind Kind,
-    ImageSource? Icon)
+    ImageSource? Icon,
+    bool IsEnabled = true)
 {
     public string FilePath => Kind == ApplicationRuleKind.ExecutablePath ? Value : string.Empty;
 
@@ -22,6 +23,10 @@ internal sealed record ConfiguredApplication(
     };
 
     public string PrimaryActionText => Kind == ApplicationRuleKind.CustomRule ? "编辑" : "重选";
+
+    public string ToggleEnabledActionText => IsEnabled ? "禁用" : "启用";
+
+    public string EnabledStateText => IsEnabled ? "已启用" : "已禁用";
 
     public string IconText => Kind switch
     {

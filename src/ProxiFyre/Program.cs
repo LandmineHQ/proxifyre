@@ -14,12 +14,24 @@ internal static class Program
             return 1;
         }
 
+        if (UuElevation.IsElevatedUiLaunch(args))
+        {
+            return RunUi(TimeSpan.FromSeconds(10));
+        }
+
         if (args.Length > 0)
         {
             return Cli.RunAsync(args).GetAwaiter().GetResult();
         }
 
-        if (!UiSingleInstanceCoordinator.TryAcquirePrimary(out var singleInstance))
+        return RunUi(TimeSpan.Zero);
+    }
+
+    private static int RunUi(TimeSpan singleInstanceRetryTimeout)
+    {
+        if (!UiSingleInstanceCoordinator.TryAcquirePrimary(
+                singleInstanceRetryTimeout,
+                out var singleInstance))
         {
             return 0;
         }

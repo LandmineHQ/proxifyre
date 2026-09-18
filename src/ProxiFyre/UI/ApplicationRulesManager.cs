@@ -44,14 +44,14 @@ internal sealed class ApplicationRulesManager
         return true;
     }
 
-    public bool AddLoadedRule(string value)
+    public bool AddLoadedRule(string value, bool enabled)
     {
         if (!TryCreateApplication(value, out var app) || Contains(app.Value))
         {
             return false;
         }
 
-        Rules.Add(app);
+        Rules.Add(app with { IsEnabled = enabled });
         return true;
     }
 
@@ -107,9 +107,34 @@ internal sealed class ApplicationRulesManager
         return Rules.Remove(selected);
     }
 
-    public IEnumerable<string> BuildApps()
+    public bool ToggleEnabled(ConfiguredApplication selected)
+    {
+        var index = Rules.IndexOf(selected);
+        if (index < 0)
+        {
+            return false;
+        }
+
+        Rules[index] = selected with { IsEnabled = !selected.IsEnabled };
+        View.Refresh();
+        return true;
+    }
+
+    public IEnumerable<string> BuildEnabledApps()
     {
         foreach (var app in Rules
+            .Where(app => app.IsEnabled)
+            .OrderBy(app => app.Kind)
+            .ThenBy(app => app.Name, StringComparer.OrdinalIgnoreCase))
+        {
+            yield return app.Value;
+        }
+    }
+
+    public IEnumerable<string> BuildDisabledApps()
+    {
+        foreach (var app in Rules
+            .Where(app => !app.IsEnabled)
             .OrderBy(app => app.Kind)
             .ThenBy(app => app.Name, StringComparer.OrdinalIgnoreCase))
         {

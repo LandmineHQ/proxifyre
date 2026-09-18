@@ -18,11 +18,19 @@ internal sealed class ConfigurationStore
         return AppConfiguration.Load(Path);
     }
 
-    public AppConfiguration LoadOrCreate(string coreProcessName, IEnumerable<string> apps)
+    public AppConfiguration LoadOrCreate(
+        string coreProcessName,
+        IEnumerable<string> apps,
+        IEnumerable<string>? disabledApps = null)
     {
         if (!File.Exists(Path))
         {
-            Save(coreProcessName, apps, licenseKey: null, force: true);
+            Save(
+                coreProcessName,
+                apps,
+                licenseKey: null,
+                force: true,
+                disabledApps: disabledApps);
         }
 
         return Load();
@@ -40,7 +48,24 @@ internal sealed class ConfigurationStore
         }
     }
 
-    public bool Save(string coreProcessName, IEnumerable<string> apps, string? licenseKey = null, bool force = false)
+    public bool GetUuWhitelistPatchEnabled()
+    {
+        try
+        {
+            return File.Exists(Path) && Load().EnableUuWhitelistPatch;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    public bool Save(
+        string coreProcessName,
+        IEnumerable<string> apps,
+        string? licenseKey = null,
+        bool force = false,
+        IEnumerable<string>? disabledApps = null)
     {
         var normalizedCoreProcessName = AppConfiguration.NormalizeCoreProcessName(coreProcessName);
         var appList = apps
@@ -49,19 +74,34 @@ internal sealed class ConfigurationStore
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .Order(StringComparer.OrdinalIgnoreCase)
             .ToArray();
+        var disabledAppList = (disabledApps ?? (File.Exists(Path) ? Load().DisabledApps : []))
+            .Select(app => app.Trim())
+            .Where(app => app.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Order(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
 
-        var key = BuildKey(normalizedCoreProcessName, appList);
+        var key = BuildKey(normalizedCoreProcessName, appList, disabledAppList);
         if (!force && string.Equals(key, _lastSavedKey, StringComparison.Ordinal))
         {
             return false;
         }
 
-        AppConfiguration.SaveApps(Path, appList, normalizedCoreProcessName, licenseKey ?? GetLicenseKey());
+        AppConfiguration.SaveApps(
+            Path,
+            appList,
+            normalizedCoreProcessName,
+            licenseKey ?? GetLicenseKey(),
+            disabledApps: disabledAppList);
         _lastSavedKey = key;
         return true;
     }
 
-    public void SaveLicenseKey(string coreProcessName, IEnumerable<string> apps, string licenseKey)
+    public void SaveLicenseKey(
+        string coreProcessName,
+        IEnumerable<string> apps,
+        string licenseKey,
+        IEnumerable<string>? disabledApps = null)
     {
         var normalizedCoreProcessName = AppConfiguration.NormalizeCoreProcessName(coreProcessName);
         var appList = apps
@@ -70,20 +110,54 @@ internal sealed class ConfigurationStore
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .Order(StringComparer.OrdinalIgnoreCase)
             .ToArray();
+        var disabledAppList = (disabledApps ?? Load().DisabledApps)
+            .Select(app => app.Trim())
+            .Where(app => app.Length > 0)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .Order(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
 
-        AppConfiguration.SaveApps(Path, appList, normalizedCoreProcessName, licenseKey);
-        _lastSavedKey = BuildKey(normalizedCoreProcessName, appList);
+        AppConfiguration.SaveApps(
+            Path,
+            appList,
+            normalizedCoreProcessName,
+            licenseKey,
+            disabledApps: disabledAppList);
+        _lastSavedKey = BuildKey(normalizedCoreProcessName, appList, disabledAppList);
     }
 
-    public void MarkLoaded(string coreProcessName, IEnumerable<string> apps)
+    public void SaveUuWhitelistPatch(bool enabled)
     {
-        _lastSavedKey = BuildKey(AppConfiguration.NormalizeCoreProcessName(coreProcessName), apps);
+        var configuration = Load();
+        AppConfiguration.SaveApps(
+            Path,
+            configuration.Apps,
+            configuration.CoreProcessName,
+            configuration.LicenseKey,
+            enabled,
+            configuration.DisabledApps);
     }
 
-    private static string BuildKey(string coreProcessName, IEnumerable<string> apps)
+    public void MarkLoaded(
+        string coreProcessName,
+        IEnumerable<string> apps,
+        IEnumerable<string>? disabledApps = null)
+    {
+        _lastSavedKey = BuildKey(
+            AppConfiguration.NormalizeCoreProcessName(coreProcessName),
+            apps,
+            disabledApps ?? []);
+    }
+
+    private static string BuildKey(
+        string coreProcessName,
+        IEnumerable<string> apps,
+        IEnumerable<string> disabledApps)
     {
         return coreProcessName
             + "\n"
-            + string.Join("\n", apps.Order(StringComparer.OrdinalIgnoreCase));
+            + string.Join("\n", apps.Order(StringComparer.OrdinalIgnoreCase))
+            + "\n--disabled--\n"
+            + string.Join("\n", disabledApps.Order(StringComparer.OrdinalIgnoreCase));
     }
 }

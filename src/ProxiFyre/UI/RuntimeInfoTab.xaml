@@ -11,6 +11,33 @@
             <Setter Property="BorderThickness" Value="0" />
             <Setter Property="Cursor" Value="Hand" />
         </Style>
+
+        <Style x:Key="SelectableTextStyle" TargetType="TextBox">
+            <Setter Property="MinHeight" Value="0" />
+            <Setter Property="IsReadOnly" Value="True" />
+            <Setter Property="IsReadOnlyCaretVisible" Value="True" />
+            <Setter Property="IsTabStop" Value="False" />
+            <Setter Property="TextWrapping" Value="Wrap" />
+            <Setter Property="VerticalContentAlignment" Value="Top" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="Padding" Value="0" />
+            <Setter Property="Cursor" Value="IBeam" />
+            <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+        </Style>
+
+        <Style x:Key="SelectableTitleTextStyle"
+               TargetType="TextBox"
+               BasedOn="{StaticResource SelectableTextStyle}">
+            <Setter Property="FontWeight" Value="SemiBold" />
+        </Style>
+
+        <Style x:Key="SelectableValueTextStyle"
+               TargetType="TextBox"
+               BasedOn="{StaticResource SelectableTextStyle}">
+            <Setter Property="Foreground" Value="{StaticResource MutedTextBrush}" />
+            <Setter Property="Margin" Value="0,3,0,10" />
+        </Style>
     </UserControl.Resources>
 
     <Grid Margin="12">
@@ -20,36 +47,38 @@
         </Grid.RowDefinitions>
 
         <StackPanel>
-            <TextBlock Text="模式" FontWeight="SemiBold" />
-            <TextBlock Text="Direct relay"
-                       Foreground="{StaticResource MutedTextBrush}"
-                       Margin="0,3,0,10" />
+            <TextBox Style="{StaticResource SelectableTitleTextStyle}"
+                     Text="模式" />
+            <TextBox Style="{StaticResource SelectableValueTextStyle}"
+                     Text="Direct relay" />
 
-            <TextBlock Text="协议" FontWeight="SemiBold" />
-            <TextBlock Text="IPv4 TCP / IPv4 UDP / IPv6 TCP / IPv6 UDP"
-                       Foreground="{StaticResource MutedTextBrush}"
-                       TextWrapping="Wrap"
-                       Margin="0,3,0,10" />
+            <TextBox Style="{StaticResource SelectableTitleTextStyle}"
+                     Text="协议" />
+            <TextBox Style="{StaticResource SelectableValueTextStyle}"
+                     Text="IPv4 TCP / IPv4 UDP / IPv6 TCP / IPv6 UDP" />
 
-            <TextBlock Text="模组目标进程" FontWeight="SemiBold" />
-            <TextBlock x:Name="CoreProcessText"
-                       Text="未运行"
-                       Foreground="{StaticResource MutedTextBrush}"
-                       TextWrapping="Wrap"
-                       Margin="0,3,0,10" />
+            <TextBox Style="{StaticResource SelectableTitleTextStyle}"
+                     Text="模组目标进程" />
+            <TextBox x:Name="CoreProcessText"
+                     Style="{StaticResource SelectableValueTextStyle}"
+                     Text="未运行" />
 
-            <TextBlock Text="网络占用观察" FontWeight="SemiBold" />
-            <TextBlock x:Name="NetworkOwnerHintText"
-                       Text="载入后查看目标进程，而不是 UI 进程。"
-                       Foreground="{StaticResource MutedTextBrush}"
-                       TextWrapping="Wrap"
-                       Margin="0,3,0,10" />
+            <TextBox Style="{StaticResource SelectableTitleTextStyle}"
+                     Text="网络占用观察" />
+            <TextBox x:Name="NetworkOwnerHintText"
+                     Style="{StaticResource SelectableValueTextStyle}"
+                     Text="载入后查看目标进程，而不是 UI 进程。" />
 
-            <TextBlock Text="配置文件" FontWeight="SemiBold" />
-            <TextBlock x:Name="ConfigPathText"
-                       Foreground="{StaticResource MutedTextBrush}"
-                       TextWrapping="Wrap"
-                       Margin="0,3,0,10" />
+            <TextBox Style="{StaticResource SelectableTitleTextStyle}"
+                     Text="配置文件" />
+            <TextBox x:Name="ConfigPathText"
+                     Style="{StaticResource SelectableValueTextStyle}" />
+
+            <TextBox Style="{StaticResource SelectableTitleTextStyle}"
+                     Text="注册码 / licenseKey" />
+            <TextBox x:Name="LicenseKeyText"
+                     Style="{StaticResource SelectableValueTextStyle}"
+                     FontFamily="Consolas" />
         </StackPanel>
 
         <Button Content="重载模组配置"

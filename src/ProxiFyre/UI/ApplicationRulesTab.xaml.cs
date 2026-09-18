@@ -14,6 +14,8 @@ public partial class ApplicationRulesTab : UserControl
 
     public event EventHandler<ItemRequestedEventArgs>? EditAppRequested;
 
+    public event EventHandler<ItemRequestedEventArgs>? ToggleEnabledRequested;
+
     public event EventHandler<ItemRequestedEventArgs>? RemoveAppRequested;
 
     public ListBox Apps => AppsList;
@@ -28,6 +30,11 @@ public partial class ApplicationRulesTab : UserControl
     private void EditAppButton_Click(object sender, RoutedEventArgs e)
     {
         EditAppRequested?.Invoke(this, new ItemRequestedEventArgs((sender as FrameworkElement)?.DataContext));
+    }
+
+    private void ToggleEnabledButton_Click(object sender, RoutedEventArgs e)
+    {
+        ToggleEnabledRequested?.Invoke(this, new ItemRequestedEventArgs((sender as FrameworkElement)?.DataContext));
     }
 
     private void RemoveAppButton_Click(object sender, RoutedEventArgs e)

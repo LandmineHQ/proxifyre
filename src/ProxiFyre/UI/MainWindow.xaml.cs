@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Interop;
+using System.Windows.Threading;
 using Microsoft.Win32;
 using Forms = System.Windows.Forms;
 
@@ -22,6 +23,12 @@ public partial class MainWindow : Window
     private readonly object _uiLogSync = new();
     private readonly ConfigurationStore _configurationStore = new(Path.Combine(AppContext.BaseDirectory, "app-config.json"));
     private readonly SettingsViewModel _settingsViewModel = new();
+    private readonly Lazy<UuRuntimePatcher> _uuRuntimePatcher = new(() => new UuRuntimePatcher());
+    private readonly DispatcherTimer _uuMonitorTimer = new()
+    {
+        Interval = TimeSpan.FromSeconds(3)
+    };
+    private readonly SemaphoreSlim _uuPatchOperationGate = new(1, 1);
     private readonly WinpkFilterManager _winpkFilterManager;
     private readonly AotModuleController _moduleController;
     private readonly Forms.NotifyIcon _trayIcon;
@@ -31,6 +38,8 @@ public partial class MainWindow : Window
     private bool _hasShownTrayHint;
     private bool _hasCheckedForUpdates;
     private bool _isAnnouncementDismissed;
+    private bool _uuPatchDesired;
+    private bool _uuPatchAppliedByCurrentSession;
     private string _sourceUrl = DefaultSourceUrl;
 
     [DllImport("user32.dll")]
@@ -44,6 +53,7 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+        _uuMonitorTimer.Tick += UuMonitorTimer_Tick;
         _uiLogWriter = CreateUiLogWriter(_uiLogPath);
         _telemetryServer = new TrafficTelemetryServer(
             snapshot => Dispatcher.InvokeAsync(() => UpdateTrafficStatus(snapshot)),
@@ -56,9 +66,11 @@ public partial class MainWindow : Window
         Tabs.SetConfigPath(_configurationStore.Path);
         Tabs.SearchChanged += (_, _) => _rulesManager.SetSearchText(Tabs.SearchText);
         Tabs.EditAppRequested += Tabs_EditAppRequested;
+        Tabs.ToggleEnabledRequested += Tabs_ToggleEnabledRequested;
         Tabs.RemoveAppRequested += Tabs_RemoveAppRequested;
         Tabs.ReloadRequested += (_, _) => ReloadConfigFromUi();
         Tabs.WinpkFilterActionRequested += Tabs_WinpkFilterActionRequested;
+        Tabs.UuPatchToggleRequested += Tabs_UuPatchToggleRequested;
         Header.OpenSourceRequested += (_, _) => OpenSource();
         Header.StartStopRequested += Header_StartStopRequested;
         Announcement.DismissRequested += (_, _) => DismissAnnouncement();
@@ -86,6 +98,12 @@ public partial class MainWindow : Window
 
     private async void MainWindow_Loaded(object sender, RoutedEventArgs e)
     {
+        EnsureUuPatchElevationOnStartup();
+        if (Application.Current.Dispatcher.HasShutdownStarted)
+        {
+            return;
+        }
+
         await DiscoverExistingModuleAsync();
 
         if (_hasCheckedForUpdates)
@@ -300,17 +318,34 @@ public partial class MainWindow : Window
         _rulesManager.Clear();
         try
         {
-            var configuration = _configurationStore.LoadOrCreate(RuleEntry.CoreProcessName, _rulesManager.BuildApps());
+            var configuration = _configurationStore.LoadOrCreate(
+                RuleEntry.CoreProcessName,
+                _rulesManager.BuildEnabledApps(),
+                _rulesManager.BuildDisabledApps());
             RuleEntry.CoreProcessName = configuration.CoreProcessName;
-            _settingsViewModel.SetLicenseKey(configuration.LicenseKey);
+            Tabs.SetLicenseKey(configuration.LicenseKey);
+            _uuPatchDesired = configuration.EnableUuWhitelistPatch;
+            _settingsViewModel.SetUuPatchEnabled(_uuPatchDesired);
+            if (UuElevation.IsElevated || !_uuPatchDesired)
+            {
+                UpdateUuMonitorTimerState();
+            }
 
             foreach (var app in configuration.Apps)
             {
-                _rulesManager.AddLoadedRule(app);
+                _rulesManager.AddLoadedRule(app, enabled: true);
+            }
+
+            foreach (var app in configuration.DisabledApps)
+            {
+                _rulesManager.AddLoadedRule(app, enabled: false);
             }
 
             AppendLog($"Loaded {_rulesManager.Rules.Count} app rule(s).");
-            _configurationStore.MarkLoaded(RuleEntry.CoreProcessName, _rulesManager.BuildApps());
+            _configurationStore.MarkLoaded(
+                RuleEntry.CoreProcessName,
+                _rulesManager.BuildEnabledApps(),
+                _rulesManager.BuildDisabledApps());
         }
         catch (Exception ex)
         {
@@ -331,7 +366,10 @@ public partial class MainWindow : Window
     private bool SaveConfig()
     {
         RuleEntry.NormalizeCoreProcessName();
-        return _configurationStore.Save(RuleEntry.CoreProcessName, _rulesManager.BuildApps());
+        return _configurationStore.Save(
+            RuleEntry.CoreProcessName,
+            _rulesManager.BuildEnabledApps(),
+            disabledApps: _rulesManager.BuildDisabledApps());
     }
 
     private string? GetSavedLicenseKey()
@@ -341,13 +379,550 @@ public partial class MainWindow : Window
 
     private void RefreshSettingsInfo()
     {
-        _settingsViewModel.SetLicenseKey(GetSavedLicenseKey());
+        Tabs.SetLicenseKey(GetSavedLicenseKey());
         _settingsViewModel.ApplyWinpkFilterStatus(_winpkFilterManager.RefreshStatus());
+        RefreshUuPatchStatus();
     }
 
     private void WinpkFilterManager_StatusChanged(object? sender, WinpkFilterStatus status)
     {
         Dispatcher.InvokeAsync(() => _settingsViewModel.ApplyWinpkFilterStatus(status));
+    }
+
+    private void RefreshUuPatchStatus()
+    {
+        try
+        {
+            var inspection = _uuRuntimePatcher.Value.Inspect();
+            ApplyUuPatchInspection(inspection);
+        }
+        catch (Exception ex)
+        {
+            _settingsViewModel.SetUuPatchEnabled(_uuPatchDesired);
+            _settingsViewModel.ApplyUuPatchStatus(
+                "检测失败",
+                ex.Message,
+                UuPatchUiState.Error);
+        }
+    }
+
+    private void ApplyUuPatchInspection(UuPatchInspection inspection)
+    {
+        if (!inspection.UuRunning)
+        {
+            _settingsViewModel.SetUuPatchEnabled(_uuPatchDesired);
+            _settingsViewModel.ApplyUuPatchStatus(
+                "未运行",
+                "未检测到正在运行的 UU 应用。",
+                UuPatchUiState.Neutral);
+            return;
+        }
+
+        if (inspection.Modules.Count == 0)
+        {
+            var detail = inspection.Errors.Count == 0
+                ? "检测到 UU，但 local_proxy.dll 尚未加载。请先在 UU 中开始一次游戏加速。"
+                : string.Join(Environment.NewLine, inspection.Errors);
+            _settingsViewModel.SetUuPatchEnabled(_uuPatchDesired);
+            _settingsViewModel.ApplyUuPatchStatus(
+                "等待加速",
+                detail,
+                inspection.Errors.Count == 0 ? UuPatchUiState.Ready : UuPatchUiState.Error);
+            return;
+        }
+
+        var errors = inspection.Modules
+            .Where(module => module.State is UuModulePatchState.Error or UuModulePatchState.Unsupported)
+            .Select(module => module.Error)
+            .Where(error => !string.IsNullOrWhiteSpace(error))
+            .Concat(inspection.Errors)
+            .ToArray();
+        if (errors.Length > 0)
+        {
+            _settingsViewModel.SetUuPatchEnabled(_uuPatchDesired);
+            _settingsViewModel.ApplyUuPatchStatus(
+                "函数未匹配",
+                string.Join(Environment.NewLine, errors),
+                UuPatchUiState.Error);
+            return;
+        }
+
+        var allPatched = inspection.Modules.All(module =>
+            module.State == UuModulePatchState.AlreadyPatched);
+        if (allPatched)
+        {
+            _settingsViewModel.SetUuPatchEnabled(true);
+            _settingsViewModel.ApplyUuPatchStatus(
+                "已启用",
+                BuildUuPatchModuleSummary(inspection, applied: true),
+                UuPatchUiState.Patched);
+            return;
+        }
+
+        _settingsViewModel.SetUuPatchEnabled(_uuPatchDesired);
+        _settingsViewModel.ApplyUuPatchStatus(
+            "可启用",
+            BuildUuPatchModuleSummary(inspection, applied: false),
+            UuPatchUiState.Ready);
+    }
+
+    private static string BuildUuPatchModuleSummary(UuPatchInspection inspection, bool applied)
+    {
+        var modules = inspection.Modules;
+        var processCount = modules.Select(module => module.ProcessId).Distinct().Count();
+        var targetCount = modules.Sum(module => module.Profile.Targets.Count);
+        var profile = modules
+            .Select(module => module.Profile.Label)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .FirstOrDefault() ?? "未知配置";
+        return applied
+            ? $"已在 {processCount} 个 UU 进程中应用 {targetCount} 个运行时函数补丁。"
+            : $"检测到 {processCount} 个 UU 进程，配置 {profile}，将应用 {targetCount} 个运行时函数补丁。";
+    }
+
+    private async void Tabs_UuPatchToggleRequested(object? sender, UuPatchToggleRequestedEventArgs e)
+    {
+        if (e.Enabled)
+        {
+            await EnableUuRuntimePatchAsync();
+        }
+        else
+        {
+            await DisableUuRuntimePatchAsync();
+        }
+    }
+
+    private bool EnsureUuPatchElevation(bool enabling)
+    {
+        if (UuElevation.IsElevated)
+        {
+            return true;
+        }
+
+        if (!enabling)
+        {
+            _settingsViewModel.SetUuPatchEnabled(_uuPatchDesired);
+            MessageBox.Show(
+                this,
+                "关闭 UU 运行时补丁需要管理员权限。请以管理员身份重新启动 ProxiFyre 后再关闭该开关。",
+                "需要管理员权限",
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
+            return false;
+        }
+
+        var confirmation = MessageBox.Show(
+            this,
+            "UU 当前以管理员权限运行。启用白名单解除需要读取和修改 UU 进程内存，\n\n是否请求 UAC 权限并重新启动 ProxiFyre？",
+            "需要管理员权限",
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Question);
+        if (confirmation != MessageBoxResult.Yes)
+        {
+            _settingsViewModel.SetUuPatchEnabled(_uuPatchDesired);
+            return false;
+        }
+
+        SetUuPatchDesired(enabled: true, persist: true);
+        if (UuElevation.TryRestartElevated())
+        {
+            Application.Current.Shutdown();
+            return false;
+        }
+
+        SetUuPatchDesired(enabled: false, persist: true);
+        MessageBox.Show(
+            this,
+            "请求管理员权限失败，UU 运行时补丁未启用。",
+            "UAC 权限请求失败",
+            MessageBoxButton.OK,
+            MessageBoxImage.Warning);
+        return false;
+    }
+
+    private void EnsureUuPatchElevationOnStartup()
+    {
+        var persistedEnabled = _configurationStore.GetUuWhitelistPatchEnabled();
+        if (!persistedEnabled)
+        {
+            _uuPatchDesired = false;
+            _settingsViewModel.SetUuPatchEnabled(false);
+            UpdateUuMonitorTimerState();
+            return;
+        }
+
+        if (!_uuPatchDesired)
+        {
+            _uuPatchDesired = true;
+            _settingsViewModel.SetUuPatchEnabled(true);
+        }
+
+        if (UuElevation.IsElevated)
+        {
+            UpdateUuMonitorTimerState();
+            return;
+        }
+
+        var confirmation = MessageBox.Show(
+            this,
+            "已保存 UU 白名单解除设置，但该功能需要管理员权限。\n\n是否请求 UAC 权限并重新启动 ProxiFyre？",
+            "UU 运行时补丁需要管理员权限",
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Question);
+        if (confirmation != MessageBoxResult.Yes)
+        {
+            SetUuPatchDesired(enabled: false, persist: true);
+            _settingsViewModel.ApplyUuPatchStatus(
+                "未启用",
+                "管理员权限请求已取消。",
+                UuPatchUiState.Neutral);
+            return;
+        }
+
+        if (UuElevation.TryRestartElevated())
+        {
+            Application.Current.Shutdown();
+            return;
+        }
+
+        SetUuPatchDesired(enabled: false, persist: true);
+        MessageBox.Show(
+            this,
+            "请求管理员权限失败，UU 运行时补丁未启用。",
+            "UAC 权限请求失败",
+            MessageBoxButton.OK,
+            MessageBoxImage.Warning);
+    }
+
+    private async Task EnableUuRuntimePatchAsync()
+    {
+        await _uuPatchOperationGate.WaitAsync();
+        try
+        {
+            if (!EnsureUuPatchElevation(enabling: true))
+            {
+                return;
+            }
+
+            _settingsViewModel.SetUuPatchBusy("正在检测 UU 进程...");
+            var inspection = await Task.Run(() => _uuRuntimePatcher.Value.Inspect());
+            ApplyUuPatchInspection(inspection);
+
+            if (inspection.Modules.Count > 0
+                && inspection.Modules.All(module =>
+                    module.State == UuModulePatchState.AlreadyPatched))
+            {
+                SetUuPatchDesired(enabled: true, persist: true);
+                AppendLog("UU 运行时补丁已经存在，无需重复应用。");
+                return;
+            }
+
+            if (!inspection.HasPatchableModule)
+            {
+                var hasTerminalError = inspection.Errors.Count > 0
+                    || inspection.Modules.Any(module =>
+                        module.State is UuModulePatchState.Error or UuModulePatchState.Unsupported);
+                if (hasTerminalError)
+                {
+                    _settingsViewModel.SetUuPatchEnabled(_uuPatchDesired);
+                    MessageBox.Show(
+                        this,
+                        BuildUuPatchFailureMessage(inspection),
+                        "UU 运行时补丁",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Information);
+                    return;
+                }
+
+                var waitForUu = MessageBox.Show(
+                    this,
+                    "当前未检测到已加载的 local_proxy.dll。是否保存开关，并在 UU 开始加速后每 3 秒自动检测并应用补丁？",
+                    "保存 UU 运行时补丁设置",
+                    MessageBoxButton.YesNo,
+                    MessageBoxImage.Question);
+                if (waitForUu == MessageBoxResult.Yes)
+                {
+                    SetUuPatchDesired(enabled: true, persist: true);
+                    ApplyUuPatchInspection(inspection);
+                }
+                else
+                {
+                    _settingsViewModel.SetUuPatchEnabled(_uuPatchDesired);
+                }
+
+                return;
+            }
+
+            var confirmation = MessageBox.Show(
+                this,
+                BuildUuPatchConfirmation(inspection),
+                "应用 UU 运行时补丁",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Question);
+            if (confirmation != MessageBoxResult.Yes)
+            {
+                _settingsViewModel.SetUuPatchEnabled(_uuPatchDesired);
+                return;
+            }
+
+            _settingsViewModel.SetUuPatchBusy("正在应用运行时补丁...");
+            var result = await Task.Run(() => _uuRuntimePatcher.Value.Apply());
+            if (!result.Success)
+            {
+                MessageBox.Show(
+                    this,
+                    result.Message,
+                    "UU 运行时补丁失败",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+                RefreshUuPatchStatus();
+                return;
+            }
+
+            _uuPatchAppliedByCurrentSession = result.TargetCount > 0;
+            SetUuPatchDesired(enabled: true, persist: true);
+            _settingsViewModel.ApplyUuPatchStatus(
+                "已启用",
+                result.Message,
+                UuPatchUiState.Patched);
+            AppendLog(result.Message);
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"UU runtime patch failed: {ex.Message}");
+            MessageBox.Show(
+                this,
+                ex.Message,
+                "UU 运行时补丁失败",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
+            RefreshUuPatchStatus();
+        }
+        finally
+        {
+            _settingsViewModel.SetUuPatchIdle();
+            _uuPatchOperationGate.Release();
+        }
+    }
+
+    private async Task DisableUuRuntimePatchAsync()
+    {
+        await _uuPatchOperationGate.WaitAsync();
+        try
+        {
+            if (!EnsureUuPatchElevation(enabling: false))
+            {
+                return;
+            }
+
+            _settingsViewModel.SetUuPatchBusy("正在检测 UU 运行时补丁...");
+            var inspection = await Task.Run(() => _uuRuntimePatcher.Value.Inspect());
+            ApplyUuPatchInspection(inspection);
+            if (!inspection.HasPatchedModule)
+            {
+                SetUuPatchDesired(enabled: false, persist: true);
+                return;
+            }
+
+            var confirmation = MessageBox.Show(
+                this,
+                "关闭后会恢复 UU 内存中的原始函数字节，不会修改 local_proxy.dll 文件。是否继续？",
+                "恢复 UU 运行时补丁",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Question);
+            if (confirmation != MessageBoxResult.Yes)
+            {
+                _settingsViewModel.SetUuPatchEnabled(_uuPatchDesired);
+                return;
+            }
+
+            _settingsViewModel.SetUuPatchBusy("正在恢复运行时补丁...");
+            var result = await Task.Run(() => _uuRuntimePatcher.Value.Restore());
+            if (!result.Success)
+            {
+                MessageBox.Show(
+                    this,
+                    result.Message,
+                    "恢复 UU 运行时补丁失败",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+                RefreshUuPatchStatus();
+                return;
+            }
+
+            _uuPatchAppliedByCurrentSession = false;
+            SetUuPatchDesired(enabled: false, persist: true);
+            _settingsViewModel.ApplyUuPatchStatus(
+                "未启用",
+                result.Message,
+                UuPatchUiState.Ready);
+            AppendLog(result.Message);
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"UU runtime patch restore failed: {ex.Message}");
+            MessageBox.Show(
+                this,
+                ex.Message,
+                "恢复 UU 运行时补丁失败",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
+            RefreshUuPatchStatus();
+        }
+        finally
+        {
+            _settingsViewModel.SetUuPatchIdle();
+            _uuPatchOperationGate.Release();
+        }
+    }
+
+    private async void UuMonitorTimer_Tick(object? sender, EventArgs e)
+    {
+        if (!_uuPatchDesired || !await _uuPatchOperationGate.WaitAsync(0))
+        {
+            return;
+        }
+
+        try
+        {
+            if (!_uuPatchDesired)
+            {
+                return;
+            }
+
+            var inspection = await Task.Run(() => _uuRuntimePatcher.Value.Inspect());
+            if (!_uuPatchDesired)
+            {
+                return;
+            }
+
+            ApplyUuPatchInspection(inspection);
+            if (!inspection.UuRunning
+                || (inspection.Modules.Count == 0 && inspection.Errors.Count == 0))
+            {
+                _uuPatchAppliedByCurrentSession = false;
+                return;
+            }
+
+            var hasTerminalError = inspection.Errors.Count > 0
+                || inspection.Modules.Any(module =>
+                    module.State is UuModulePatchState.Error or UuModulePatchState.Unsupported);
+            if (hasTerminalError
+                || inspection.Modules.All(module =>
+                    module.State == UuModulePatchState.AlreadyPatched))
+            {
+                return;
+            }
+
+            if (!inspection.HasPatchableModule)
+            {
+                return;
+            }
+
+            var result = await Task.Run(() => _uuRuntimePatcher.Value.Apply());
+            if (!result.Success)
+            {
+                _settingsViewModel.ApplyUuPatchStatus(
+                    "自动补丁失败",
+                    result.Message,
+                    UuPatchUiState.Error);
+                return;
+            }
+
+            if (result.TargetCount > 0)
+            {
+                _uuPatchAppliedByCurrentSession = true;
+                _settingsViewModel.SetUuPatchEnabled(true);
+                _settingsViewModel.ApplyUuPatchStatus(
+                    "已启用",
+                    result.Message,
+                    UuPatchUiState.Patched);
+                AppendLog(result.Message);
+            }
+        }
+        catch (Exception ex)
+        {
+            _settingsViewModel.ApplyUuPatchStatus(
+                "自动补丁失败",
+                ex.Message,
+                UuPatchUiState.Error);
+        }
+        finally
+        {
+            _uuPatchOperationGate.Release();
+        }
+    }
+
+    private void SetUuPatchDesired(bool enabled, bool persist)
+    {
+        _uuPatchDesired = enabled;
+        _settingsViewModel.SetUuPatchEnabled(enabled);
+        UpdateUuMonitorTimerState();
+        if (!persist)
+        {
+            return;
+        }
+
+        try
+        {
+            _configurationStore.SaveUuWhitelistPatch(enabled);
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"Failed to save UU whitelist patch setting: {ex.Message}");
+        }
+    }
+
+    private void UpdateUuMonitorTimerState()
+    {
+        if (_uuPatchDesired)
+        {
+            _uuMonitorTimer.Start();
+        }
+        else
+        {
+            _uuMonitorTimer.Stop();
+        }
+    }
+
+    private static string BuildUuPatchConfirmation(UuPatchInspection inspection)
+    {
+        var lines = new List<string>
+        {
+            "将对以下 UU 进程的内存代码应用运行时补丁：",
+            string.Empty
+        };
+
+        foreach (var module in inspection.Modules.Where(module => module.CanApply))
+        {
+            lines.Add($"{module.ProcessName} ({module.ProcessId})");
+            lines.Add(module.ModulePath);
+            lines.Add($"配置：{module.Profile.Label}");
+            lines.Add($"函数：{module.Profile.Targets.Count} 个");
+            lines.Add(string.Empty);
+        }
+
+        lines.Add("只修改进程内存，不修改 local_proxy.dll 文件。");
+        return string.Join(Environment.NewLine, lines);
+    }
+
+    private static string BuildUuPatchFailureMessage(UuPatchInspection inspection)
+    {
+        if (!inspection.UuRunning)
+        {
+            return "未检测到正在运行的 UU 应用。";
+        }
+
+        if (inspection.Modules.Count == 0)
+        {
+            return "检测到 UU，但 local_proxy.dll 尚未加载。请先在 UU 中开始一次游戏加速。";
+        }
+
+        var errors = inspection.Modules
+            .Where(module => !string.IsNullOrWhiteSpace(module.Error))
+            .Select(module => $"{module.ProcessName} ({module.ProcessId}): {module.Error}")
+            .Concat(inspection.Errors);
+        return string.Join(Environment.NewLine, errors);
     }
 
     private void BrowseApplication()
@@ -488,14 +1063,14 @@ public partial class MainWindow : Window
             await RefreshExistingModuleAsync(showTargetMissingMessage: false);
             var result = await _moduleController.LoadAndRunAsync(
                 RuleEntry.CoreProcessName,
-                _rulesManager.BuildApps(),
+                _rulesManager.BuildEnabledApps(),
                 (deviceId, currentKey) => RegistrationDialog.Show(this, deviceId, currentKey));
             if (result == ModuleStartResult.Canceled)
             {
                 return;
             }
 
-            _settingsViewModel.SetLicenseKey(_configurationStore.GetLicenseKey());
+            Tabs.SetLicenseKey(_configurationStore.GetLicenseKey());
             UpdateCoreProcessInfo();
         }
         catch (Exception ex)
@@ -839,6 +1414,9 @@ public partial class MainWindow : Window
 
     protected override void OnClosed(EventArgs e)
     {
+        _uuMonitorTimer.Stop();
+        _uuMonitorTimer.Tick -= UuMonitorTimer_Tick;
+        RestoreUuPatchOnClose();
         _trayIcon.Visible = false;
         _trayIcon.Dispose();
         _moduleController.Dispose();
@@ -856,6 +1434,54 @@ public partial class MainWindow : Window
         }
 
         base.OnClosed(e);
+    }
+
+    private void Tabs_ToggleEnabledRequested(object? sender, ItemRequestedEventArgs e)
+    {
+        if (e.Item is ConfiguredApplication selected
+            && _rulesManager.ToggleEnabled(selected))
+        {
+            var saved = SaveConfig();
+            AppendLog($"{(selected.IsEnabled ? "Disabled" : "Enabled")} {selected.Value}");
+            AppendHotReloadHint(saved);
+        }
+    }
+
+    private void RestoreUuPatchOnClose()
+    {
+        if (!_uuPatchAppliedByCurrentSession)
+        {
+            return;
+        }
+
+        if (!_uuPatchOperationGate.Wait(TimeSpan.FromSeconds(1)))
+        {
+            WriteUiLogLine("UU runtime patch operation was still busy during UI shutdown.");
+            return;
+        }
+
+        try
+        {
+            var restoreTask = Task.Run(() => _uuRuntimePatcher.Value.Restore());
+            if (!restoreTask.Wait(TimeSpan.FromSeconds(3)))
+            {
+                WriteUiLogLine("UU runtime patch restore did not finish before UI shutdown.");
+                return;
+            }
+
+            if (!restoreTask.Result.Success)
+            {
+                WriteUiLogLine($"UU runtime patch restore on shutdown failed: {restoreTask.Result.Message}");
+            }
+        }
+        catch (Exception ex)
+        {
+            WriteUiLogLine($"UU runtime patch restore on shutdown failed: {ex.Message}");
+        }
+        finally
+        {
+            _uuPatchOperationGate.Release();
+        }
     }
 
     private Forms.NotifyIcon CreateTrayIcon()

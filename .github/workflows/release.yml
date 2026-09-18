@@ -1,0 +1,128 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: "GitHub Actions run ID that contains the proxifyre-win-x64 artifact"
+        required: true
+        type: string
+      version:
+        description: "Release version or tag, for example v3.0.4"
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Publish Windows x64 release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Validate inputs
+        env:
+          BUILD_ID: ${{ inputs.build_id }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [[ ! "$BUILD_ID" =~ ^[0-9]+$ ]]; then
+            echo "build_id must be a numeric GitHub Actions run ID." >&2
+            exit 1
+          fi
+
+          if [[ ! "$VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "version must be a semantic version, for example v3.0.4 or 3.0.4-rc.1." >&2
+            exit 1
+          fi
+
+      - name: Validate build run
+        id: build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_ID: ${{ inputs.build_id }}
+        run: |
+          STATUS="$(gh run view "$BUILD_ID" --repo "$GITHUB_REPOSITORY" --json status --jq '.status')"
+          CONCLUSION="$(gh run view "$BUILD_ID" --repo "$GITHUB_REPOSITORY" --json conclusion --jq '.conclusion')"
+          HEAD_SHA="$(gh run view "$BUILD_ID" --repo "$GITHUB_REPOSITORY" --json headSha --jq '.headSha')"
+
+          if [[ "$STATUS" != "completed" || "$CONCLUSION" != "success" ]]; then
+            echo "Build run $BUILD_ID is not a successful completed run." >&2
+            echo "status=$STATUS conclusion=$CONCLUSION" >&2
+            exit 1
+          fi
+
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${HEAD_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      - name: Download Windows release
+        uses: actions/download-artifact@v8
+        with:
+          name: proxifyre-win-x64
+          path: release-assets
+          run-id: ${{ inputs.build_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+
+      - name: Prepare release asset
+        id: asset
+        env:
+          BUILD_ID: ${{ inputs.build_id }}
+          VERSION: ${{ inputs.version }}
+          SHORT_SHA: ${{ steps.build.outputs.short_sha }}
+        run: |
+          SOURCE="$(find release-assets -type f -name 'proxifyre-win-x64.zip' -print -quit)"
+          test -n "$SOURCE"
+          test -f "$SOURCE"
+
+          ASSET="release-assets/proxifyre-${VERSION}-build-${BUILD_ID}-${SHORT_SHA}.zip"
+          mv "$SOURCE" "$ASSET"
+
+          echo "path=$ASSET" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(sha256sum "$ASSET" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          ASSET: ${{ steps.asset.outputs.path }}
+          HEAD_SHA: ${{ steps.build.outputs.head_sha }}
+        run: |
+          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $VERSION already exists. Adding build asset."
+            gh release upload "$VERSION" "$ASSET" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          else
+            echo "Release $VERSION does not exist. Creating a draft release."
+            gh release create "$VERSION" "$ASSET" \
+              --repo "$GITHUB_REPOSITORY" \
+              --draft \
+              --title "$VERSION" \
+              --target "$HEAD_SHA" \
+              --generate-notes
+          fi
+
+      - name: Write release information
+        env:
+          VERSION: ${{ inputs.version }}
+          BUILD_ID: ${{ inputs.build_id }}
+          ASSET: ${{ steps.asset.outputs.path }}
+          ASSET_SHA256: ${{ steps.asset.outputs.sha256 }}
+        run: |
+          {
+            echo "## Release"
+            echo
+            echo "- Version: \`$VERSION\`"
+            echo "- Build ID: \`$BUILD_ID\`"
+            echo "- Asset: \`$ASSET\`"
+            echo "- SHA256: \`$ASSET_SHA256\`"
+          } >> "$GITHUB_STEP_SUMMARY"

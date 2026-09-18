@@ -76,6 +76,15 @@ or:
 dotnet build
 ```
 
+GitHub Actions builds the Windows x64 Release package on branch pushes,
+`v*` tags, pull requests targeting `main`, and manual runs. The workflow runs
+the driver-free packet self-test and uploads the `proxifyre-win-x64` artifact.
+
+To publish a release, run the `Release` workflow manually with the numeric
+`build_id` from a successful `Build` run and a semantic version such as
+`v3.0.4`. It creates a draft release when the version is new; otherwise it
+adds or replaces the asset on the existing release.
+
 ## UI
 
 Run without arguments to open the WPF UI:
@@ -120,6 +129,48 @@ Print a license key for a supplied device ID:
 .\scripts\proxifyre.ps1 license-key <device-id>
 ```
 
+## UU whitelist patch
+
+See `docs/UU_ACCELERATOR.md` for the UU/WFP architecture, patch strategy,
+profile format, and limitations.
+
+The Settings tab includes a `UU 白名单解除` toggle. It scans running UU
+processes, validates the loaded `local_proxy.dll` against a SHA256 profile,
+and applies a reversible runtime patch in memory. The installed DLL remains
+unchanged, and restarting UU removes the patch.
+
+The toggle asks for confirmation before changing UU memory. If UU is not
+running, `local_proxy.dll` is not loaded yet, or a target function signature
+does not match, ProxiFyre reports the reason and does not write code.
+
+The enabled state is saved as `enableUuWhitelistPatch` in `app-config.json`.
+While enabled, ProxiFyre checks every 3 seconds and automatically reapplies
+the memory patch after UU restarts or reloads `local_proxy.dll`.
+If UU is elevated, enabling the toggle requests UAC approval and restarts the
+ProxiFyre UI elevated so it can read and modify the UU process.
+
+For offline use, the wrapper can also create an on-disk patched copy:
+
+Create a patched copy of UU's `local_proxy.dll` while keeping the existing process matching:
+
+```powershell
+.\scripts\proxifyre.ps1 patch-uu
+```
+
+The command matches the DLL against known SHA256 profiles, verifies every original byte sequence, and writes the result under `artifacts\uu-patch\<profile>\local_proxy.dll`. The current profile covers UU `6.18.3` build `5247` (`local_proxy.dll` `9.9.9.99`). Applying the patch to the installed UU directory is explicit:
+
+```powershell
+.\scripts\proxifyre.ps1 patch-uu -Apply
+```
+
+`-Apply` requires Administrator privileges and refuses to run while UU is active. It creates `local_proxy.dll.uu-original.<hash>.bak` beside the original DLL. Restore it with:
+
+```powershell
+.\scripts\proxifyre.ps1 patch-uu -Restore
+```
+
+The patch is hash-specific and changes the Authenticode content hash. A UU update can replace the DLL and remove the patch; unsupported builds fail validation instead of guessing offsets.
+
 ## Focused tests
 
 Run a TCP relay diagnostic with curl:
@@ -162,13 +213,20 @@ Minimal shape:
 ```json
 {
   "coreProcessName": "steamwebhelper.exe",
+  "enableUuWhitelistPatch": false,
   "apps": [
     "chrome.exe",
     "C:\\Program Files\\SomeApp\\SomeApp.exe",
     "C:\\Games\\SomeGame\\"
+  ],
+  "disabledApps": [
+    "firefox.exe"
   ]
 }
 ```
+
+`apps` contains enabled rules and `disabledApps` contains disabled rules. The
+Application Rules tab can move an entry between these lists without deleting it.
 
 The `proxifyre-ui` style is also accepted for easier migration:
 

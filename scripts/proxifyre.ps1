@@ -1,6 +1,6 @@
 param(
     [Parameter(Position = 0)]
-    [ValidateSet("build", "run", "ui", "test", "add-app", "init-config", "reset-filter", "license-device", "license-key", "module-publish", "clean", "help")]
+    [ValidateSet("build", "run", "ui", "test", "add-app", "init-config", "reset-filter", "license-device", "license-key", "module-publish", "patch-uu", "clean", "help")]
     [string]$Command = "help",
 
     [Parameter(Position = 1)]
@@ -9,6 +9,12 @@ param(
     [string]$Config = ".\app-config.json",
 
     [switch]$Detailed,
+
+    [switch]$Apply,
+
+    [switch]$Restore,
+
+    [switch]$Force,
 
     [ValidateSet("Debug", "Release")]
     [string]$Configuration = "Debug",
@@ -37,6 +43,7 @@ function Show-Usage {
     Write-Host "  .\scripts\proxifyre.ps1 license-device"
     Write-Host "  .\scripts\proxifyre.ps1 license-key <device-id>"
     Write-Host "  .\scripts\proxifyre.ps1 module-publish [-Configuration Debug|Release]"
+    Write-Host "  .\scripts\proxifyre.ps1 patch-uu [-Apply] [-Restore] [-Force] [local_proxy.dll]"
     Write-Host "  .\scripts\proxifyre.ps1 add-app <exe-or-path> [-Config .\app-config.json]"
     Write-Host "  .\scripts\proxifyre.ps1 init-config [-Config .\app-config.json]"
     Write-Host "  .\scripts\proxifyre.ps1 clean"
@@ -158,6 +165,25 @@ switch ($Command) {
     }
     "module-publish" {
         dotnet publish $ModuleProject --configuration $Configuration --runtime win-x64
+        exit $LASTEXITCODE
+    }
+    "patch-uu" {
+        $patchScript = Join-Path $PSScriptRoot "patch-uu-whitelist.ps1"
+        $patchParameters = @{}
+        if (-not [string]::IsNullOrWhiteSpace($App)) {
+            $patchParameters.InputPath = $App
+        }
+        if ($Apply) {
+            $patchParameters.Apply = $true
+        }
+        if ($Restore) {
+            $patchParameters.Restore = $true
+        }
+        if ($Force) {
+            $patchParameters.Force = $true
+        }
+
+        & $patchScript @patchParameters
         exit $LASTEXITCODE
     }
     "add-app" {

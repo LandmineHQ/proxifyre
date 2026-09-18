@@ -3,50 +3,79 @@
 ## Required Context
 
 - Read `REPO_MAP.md` before changing code. It is the source of truth for
-  project layout, runtime flows, file responsibilities, protocols, commands,
-  and known limitations.
-- Update `REPO_MAP.md` whenever a change adds, moves, or removes files, changes
-  a project boundary, changes the relay data flow, or changes a public command,
-  configuration field, message, or telemetry contract.
-- Do not infer current behavior only from `README.md`; verify it against the
-  implementation and this map.
+  architecture, file ownership, runtime flows, commands, contracts, and known
+  limitations.
+- Read `docs/UU_ACCELERATOR.md` before changing UU patching, patch profiles,
+  UAC behavior, the Settings tab, or UU-related configuration.
+- Keep `REPO_MAP.md`, `README.md`, and the UU document synchronized when a
+  change alters files, project boundaries, public configuration, commands,
+  protocols, or runtime behavior.
+- Verify current behavior against source and tests. Do not treat user-facing
+  documentation as the implementation.
 
-## Project Boundaries
+## Architecture Invariants
 
-- This is a Windows-only .NET 10 / WPF / NativeAOT project. Preserve the
-  current direct-relay architecture unless the user explicitly requests a new
-  mode.
-- `src/ProxiFyre.Module` links source files from `src/ProxiFyre`; changes to
-  those shared relay files affect both the UI-side core and the injected AOT
-  module.
-- Keep production relay behavior out of `src/ProxiFyre.Probe`. The probe is a
-  diagnostic API-hook tool.
-- Do not add local TCP/UDP listening ports for direct relay. Preserve the
-  relay-outbound bypass filters that prevent recursive interception.
-- Keep telemetry optional and non-blocking. Relay operation must continue when
-  the telemetry pipe is unavailable.
+- This is a Windows-only .NET 10 WPF and NativeAOT project. Preserve direct
+  relay behavior unless the user explicitly requests another mode.
+- `src/ProxiFyre.Module` links source files from `src/ProxiFyre`. Whenever a
+  shared relay dependency is added, moved, or removed, update the linked
+  compile items and verify both the UI/core build and the NativeAOT publish.
+- Do not add local TCP or UDP listeners for direct relay. Preserve outbound
+  bypass filters that prevent recursive interception and exclude the configured
+  core process from relay matching.
+- Keep `src/ProxiFyre.Probe` diagnostic-only. Production relay behavior belongs
+  in the shared relay core and `src/ProxiFyre.Module`.
+- Keep telemetry optional and non-blocking. Relay behavior must remain correct
+  when the named pipe is unavailable.
+- Keep packet construction checksum-correct for IPv4 and IPv6, and preserve
+  bounded resource limits for sockets, pass-cache entries, and reassembly.
+
+## UU Integration
+
+- Patch the loaded `local_proxy.dll` image at runtime from the WPF UI. Do not
+  modify the installed DLL or its Authenticode content.
+- Store patch profiles in `src/Shared/UuPatchProfiles.json`. Each profile must
+  include an exact source SHA256, target RVAs, expected original bytes, and
+  replacement bytes.
+- Fail closed. Validate the complete profile before writing anything, report
+  the mismatched function to the UI, and never guess offsets or silently accept
+  unknown DLL hashes.
+- Preserve UU process matching and ACLs. Removing domain or destination
+  restrictions must not make unrelated processes eligible for acceleration.
+- Suspend the target process while changing code bytes, restore page protection
+  afterward, and flush the instruction cache.
+- Persist the UI switch as `enableUuWhitelistPatch`. While enabled, re-check
+  loaded UU modules every three seconds and reapply the runtime patch after UU
+  restarts or reloads `local_proxy.dll`.
+- Determine enabled state by inspecting the live module path, SHA256, and
+  target bytes. Do not rely only on an injected status message.
+- If UU is elevated and ProxiFyre is not, request elevation with `runas` before
+  inspecting or changing UU memory. The elevated UI must wait for the previous
+  single-instance mutex to be released.
+- If this UI session applied the patch, perform a best-effort restore during
+  normal shutdown before disposing the window and log writer.
 
 ## Editing Rules
 
-- Use Windows PowerShell for repository commands. When reading raw files, pass
-  `-Encoding UTF8`, for example:
-  `Get-Content -Encoding UTF8 README.md`.
-- Use four-space C# indentation, PascalCase for types and public members,
-  camelCase for locals and parameters, and the existing `_camelCase` private
-  field style.
-- Keep nullable reference types, implicit usings, latest C#, and analyzer/style
-  checks enabled. Place new files in the matching feature directory and keep
-  namespaces under `ProxiFyre` or `TrafficTest`.
-- Prefer existing helpers and architectural patterns over new abstractions.
-  Keep edits scoped to the requested behavior.
-- Never revert or overwrite unrelated user changes. Work with an existing dirty
-  worktree.
-- Do not commit generated binaries, runtime DLL copies, logs, caches, or local
-  `app-config.json`.
+- Use Windows PowerShell for repository commands. Read text files with
+  `-Encoding utf8`, for example:
+  `Get-Content -Encoding utf8 README.md`.
+- Use four-space C# indentation. Follow the existing four-space XAML style,
+  PascalCase for types and public members, camelCase for locals and parameters,
+  and `_camelCase` for private fields.
+- Keep nullable reference types, implicit usings, latest C#, analyzers, and
+  style enforcement enabled. Place files in the matching feature directory and
+  keep namespaces under `ProxiFyre` or `TrafficTest`.
+- Prefer existing helpers and local patterns over new abstractions. Keep edits
+  scoped to the requested behavior.
+- Never revert or overwrite unrelated user changes. Work with the existing
+  dirty worktree unless the user explicitly requests otherwise.
+- Do not commit generated binaries, build output, runtime DLL copies, logs,
+  caches, local configuration, or credentials.
 
-## Build and Validation
+## Build And Validation
 
-Use the wrapper for normal work:
+Use the repository wrapper for normal work:
 
 ```powershell
 .\scripts\proxifyre.ps1 build
@@ -63,26 +92,57 @@ Use the wrapper for normal work:
 .\scripts\install-wfp.ps1 -Configuration Debug
 ```
 
-- `build` publishes the NativeAOT module/probe/test host and builds the
-  solution.
-- Focused relay tests are implemented by `src/TrafficTest`; there is no
-  xUnit/NUnit test project.
+- `build` publishes the NativeAOT module, probe, and test host, then builds the
+  solution. Quote the exact command and result in the final report.
+- `packet-selftest`, `tcp-selftest`, and `udp-selftest` are driver-free and
+  must not require Administrator privileges. `packet-selftest` also validates
+  the UU patch catalog and UU configuration round-trip.
 - TCP/UDP relay diagnostics and runtime relay operation require Windows,
   WinpkFilter, and Administrator privileges. `traffic-telemetry` does not.
-- `packet-selftest`, `tcp-selftest`, and `udp-selftest` validate packet and
-  relay state logic without WinpkFilter or Administrator privileges.
-- `build-wfp` compiles the optional WFP ALE callout driver with the installed
-  WDK. Loading an unsigned development driver requires test signing or a
-  trusted test signature; `install-wfp` is an explicit elevated deployment
-  step.
-- Prefer adding a focused diagnostic mode to `TrafficTest` when a regression
+- Runtime UU validation requires a running UU process with `local_proxy.dll`
+  loaded and sufficient privileges to inspect or modify that process.
+- Build the WFP driver only when changing the WFP integration or when the task
+  explicitly requires it. Loading an unsigned development driver requires test
+  signing or a trusted test signature.
+- Prefer extending `src/TrafficTest` with a focused diagnostic when a regression
   needs repeatable coverage.
-- Report the exact commands run and whether WinpkFilter or Administrator
-  privileges were required.
+- Report every validation command, its result, and any required WinpkFilter or
+  Administrator privileges.
 
-## Commit and Pull Request Style
+## CI And Releases
+
+- `.github/workflows/build.yml` is the only CI producer for the Windows release
+  artifact. It must run:
+
+  ```powershell
+  .\scripts\proxifyre.ps1 build -Configuration Release
+  .\scripts\proxifyre.ps1 test packet-selftest -Configuration Release
+  ```
+
+- Keep the artifact name `proxifyre-win-x64` and staged package name
+  `proxifyre-win-x64.zip` stable. The Release workflow downloads them by name.
+- Keep the ZIP staging contract aligned with the application layout. Required
+  entries are `ProxiFyre.exe`, `ProxiFyre.dll`, `ProxiFyre.deps.json`,
+  `ProxiFyre.runtimeconfig.json`, `ProxiFyre.Module.dll`,
+  `ProxiFyre.Probe.dll`, `manifest.json`, and `UuPatchProfiles.json`.
+- Do not stage local configuration, logs, PDB files, build caches, or runtime
+  DLL copies. Include the optional WFP `.sys` and `.inf` files when present.
+- Release promotion is manual and requires a successful numeric `build_id`
+  plus a semantic `version`. New releases remain drafts unless the user
+  explicitly requests immediate publication.
+- After changing workflows, run:
+
+  ```powershell
+  actionlint .github/workflows/build.yml .github/workflows/release.yml
+  ```
+
+  Also reproduce the PowerShell staging block against a local Release build.
+
+## Commit And Pull Request Style
 
 - Use short conventional prefixes such as `feat:`, `fix:`, `refactor:`, or
-  `docs:` with concise imperative summaries.
-- Pull requests should describe the changed behavior, validation commands,
-  runtime privileges, and any UI or relay logs relevant to the change.
+  `docs:` with a concise imperative summary.
+- Pull requests should describe changed behavior, validation commands,
+  required privileges, and relevant UI or relay logs.
+- Do not include unrelated worktree changes in a commit without the user's
+  approval.
