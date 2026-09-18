@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Net;
+using System.Net.NetworkInformation;
 using System.Runtime.InteropServices;
 using ProxiFyre;
 
@@ -18,7 +19,8 @@ internal static class PacketSelfTest
             TestIpv6FragmentReassembly();
             TestOutboundPassFlowRegistry();
             TestWfpProtocolLayout();
-            Console.WriteLine("PASS: packet parsing, VLAN, TCP fields, and fragment reassembly.");
+            TestNetworkInterfaceIndexResolution();
+            Console.WriteLine("PASS: packet parsing, VLAN, TCP fields, fragment reassembly, and interface index resolution.");
             return 0;
         }
         catch (Exception ex)
@@ -233,6 +235,23 @@ internal static class PacketSelfTest
         Assert(
             Marshal.SizeOf<WfpVerdict>() == 16,
             "WFP verdict layout does not match the native protocol.");
+    }
+
+    private static void TestNetworkInterfaceIndexResolution()
+    {
+        var resolved = 0;
+        foreach (var networkInterface in NetworkInterface.GetAllNetworkInterfaces())
+        {
+            if (!NetworkInterfaceIndexResolver.TryGetIndex(networkInterface, out var index))
+            {
+                continue;
+            }
+
+            Assert(index > 0, $"Network interface '{networkInterface.Name}' returned an invalid index.");
+            resolved++;
+        }
+
+        Assert(resolved > 0, "No Windows network interface index could be resolved.");
     }
 
     private static byte[] BuildIpv4Packet(

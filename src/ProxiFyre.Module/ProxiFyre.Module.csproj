@@ -26,6 +26,7 @@
     <Compile Include="..\ProxiFyre\Logging\CoreLogger.cs" Link="Logging\CoreLogger.cs" />
     <Compile Include="..\ProxiFyre\Native\NdisApi.cs" Link="Native\NdisApi.cs" />
     <Compile Include="..\ProxiFyre\Network\NetworkEndpointResolver.cs" Link="Network\NetworkEndpointResolver.cs" />
+    <Compile Include="..\ProxiFyre\Network\NetworkInterfaceIndexResolver.cs" Link="Network\NetworkInterfaceIndexResolver.cs" />
     <Compile Include="..\ProxiFyre\Network\NetworkKeys.cs" Link="Network\NetworkKeys.cs" />
     <Compile Include="..\ProxiFyre\Network\TlsSniParser.cs" Link="Network\TlsSniParser.cs" />
     <Compile Include="..\ProxiFyre\Network\WfpFlowClassifier.cs" Link="Network\WfpFlowClassifier.cs" />

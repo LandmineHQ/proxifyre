@@ -1,5 +1,4 @@
 using System.Net;
-using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Buffers.Binary;
 using System.Security.Cryptography;
@@ -221,6 +220,11 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             {
                 _adapterInterfaceIndices[adapter] = interfaceIndex;
             }
+            else if (_useWfpClassifier)
+            {
+                _log(
+                    $"Could not resolve the Windows interface index for WinpkFilter adapter '{adapterList.GetName(i)}'; WFP flows on this adapter will pass through.");
+            }
             var mode = new NdisApi.AdapterMode
             {
                 AdapterHandle = adapter,
@@ -245,28 +249,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
 
     private static int ResolveInterfaceIndex(string adapterName, byte[] macAddress)
     {
-        if (string.IsNullOrWhiteSpace(adapterName))
-        {
-            return 0;
-        }
-
-        foreach (var networkInterface in NetworkInterface.GetAllNetworkInterfaces())
-        {
-            if (!networkInterface.Name.Equals(adapterName, StringComparison.OrdinalIgnoreCase)
-                && !networkInterface.Description.Equals(adapterName, StringComparison.OrdinalIgnoreCase)
-                && !networkInterface.GetPhysicalAddress().GetAddressBytes().SequenceEqual(macAddress))
-            {
-                continue;
-            }
-
-            var properties = networkInterface.GetIPProperties().GetIPv6Properties();
-            if (properties is not null && properties.Index > 0)
-            {
-                return properties.Index;
-            }
-        }
-
-        return 0;
+        return NetworkInterfaceIndexResolver.FindAdapterIndex(adapterName, macAddress);
     }
 
     private void RegisterOutboundBypass(RelayOutboundFlow flow)

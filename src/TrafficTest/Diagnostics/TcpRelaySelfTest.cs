@@ -87,6 +87,16 @@ internal static class TcpRelaySelfTest
                 ReadOnlyMemory<byte>.Empty));
 
             connection.SendClientSegment(new TcpSegment(
+                clientNextSequence,
+                serverInitialSequence + 1000u,
+                PacketView.TcpFlagAck,
+                65535,
+                0,
+                ReadOnlyMemory<byte>.Empty,
+                ReadOnlyMemory<byte>.Empty));
+            Assert(!connection.IsClosed, "TCP relay closed after an ACK for unsent data.");
+
+            connection.SendClientSegment(new TcpSegment(
                 clientInitialSequence,
                 serverInitialSequence + 1u,
                 PacketView.TcpFlagRst | PacketView.TcpFlagAck,

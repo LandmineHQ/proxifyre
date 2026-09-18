@@ -123,10 +123,9 @@ internal static class NetworkEndpointResolver
                     return unicast.Address.ScopeId;
                 }
 
-                var ipv6 = properties.GetIPv6Properties();
-                if (ipv6 is not null && ipv6.Index > 0)
+                if (NetworkInterfaceIndexResolver.TryGetIndex(networkInterface, out var index))
                 {
-                    return ipv6.Index;
+                    return index;
                 }
             }
         }

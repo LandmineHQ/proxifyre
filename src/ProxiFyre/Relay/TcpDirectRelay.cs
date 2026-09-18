@@ -556,9 +556,9 @@ internal sealed class TcpDirectRelay : IDisposable
 
                     if (!ProcessAckLocked(segment))
                     {
-                        FailLocked("DIRECT TCP relay received an invalid acknowledgement.");
-                        closeWithoutReset = false;
-                        sendAck = false;
+                        _detailLog?.Invoke(
+                            $"DIRECT TCP relay ignored an unacceptable acknowledgement seq={segment.SequenceNumber} ack={segment.AcknowledgmentNumber} expected<= {_remoteSendNext}.");
+                        sendAck = true;
                     }
                     else
                     {
