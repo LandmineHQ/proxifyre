@@ -2,6 +2,7 @@ using System.Buffers.Binary;
 using System.Net;
 using System.Net.NetworkInformation;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using ProxiFyre;
 
 namespace TrafficTest;
@@ -20,7 +21,8 @@ internal static class PacketSelfTest
             TestOutboundPassFlowRegistry();
             TestWfpProtocolLayout();
             TestNetworkInterfaceIndexResolution();
-            Console.WriteLine("PASS: packet parsing, VLAN, TCP fields, fragment reassembly, and interface index resolution.");
+            TestRuntimeModuleCopy();
+            Console.WriteLine("PASS: packet parsing, VLAN, TCP fields, fragment reassembly, interface indexes, and runtime module copies.");
             return 0;
         }
         catch (Exception ex)
@@ -252,6 +254,62 @@ internal static class PacketSelfTest
         }
 
         Assert(resolved > 0, "No Windows network interface index could be resolved.");
+    }
+
+    private static void TestRuntimeModuleCopy()
+    {
+        var root = Directory.CreateTempSubdirectory("proxifyre-runtime-copy-");
+        try
+        {
+            var sourceDirectory = Path.Combine(root.FullName, "source");
+            var runtimeDirectory = Path.Combine(root.FullName, "runtime");
+            Directory.CreateDirectory(sourceDirectory);
+
+            var sourceDll = Path.Combine(sourceDirectory, "ProxiFyre.Module.dll");
+            var firstContent = Enumerable.Range(0, 4096).Select(value => (byte)value).ToArray();
+            File.WriteAllBytes(sourceDll, firstContent);
+
+            var firstCopy = AotModuleController.PrepareRuntimeCopy(
+                sourceDll,
+                runtimeDirectory,
+                "ProxiFyre.Module.dll");
+            var firstHash = Convert.ToHexString(SHA256.HashData(firstContent));
+            Assert(
+                Path.GetFileName(firstCopy).Equals(
+                    $"ProxiFyre.Module.{firstHash}.dll",
+                    StringComparison.OrdinalIgnoreCase),
+                "Runtime module copy does not use its SHA-256 content hash.");
+            Assert(File.ReadAllBytes(firstCopy).SequenceEqual(firstContent), "Runtime module copy content mismatch.");
+
+            var repeatedCopy = AotModuleController.PrepareRuntimeCopy(
+                sourceDll,
+                runtimeDirectory,
+                "ProxiFyre.Module.dll");
+            Assert(
+                repeatedCopy.Equals(firstCopy, StringComparison.OrdinalIgnoreCase),
+                "Identical runtime module content produced a different copy.");
+            Assert(
+                Directory.EnumerateFiles(runtimeDirectory, "ProxiFyre.Module*.dll").Count() == 1,
+                "Identical runtime module content left duplicate DLL copies.");
+
+            var secondContent = firstContent.ToArray();
+            secondContent[0] ^= 0xFF;
+            File.WriteAllBytes(sourceDll, secondContent);
+
+            var secondCopy = AotModuleController.PrepareRuntimeCopy(
+                sourceDll,
+                runtimeDirectory,
+                "ProxiFyre.Module.dll");
+            Assert(!secondCopy.Equals(firstCopy, StringComparison.OrdinalIgnoreCase), "Changed runtime module content reused the old copy.");
+            Assert(File.ReadAllBytes(secondCopy).SequenceEqual(secondContent), "Updated runtime module copy content mismatch.");
+            Assert(
+                Directory.EnumerateFiles(runtimeDirectory, "ProxiFyre.Module*.dll").Count() == 1,
+                "Stale runtime module copy was not cleaned up.");
+        }
+        finally
+        {
+            Directory.Delete(root.FullName, recursive: true);
+        }
     }
 
     private static byte[] BuildIpv4Packet(

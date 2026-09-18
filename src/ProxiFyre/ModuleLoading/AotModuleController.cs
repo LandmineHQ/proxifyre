@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 
 namespace ProxiFyre;
@@ -21,7 +22,6 @@ internal sealed class AotModuleController : IDisposable
     private readonly List<nint> _hookHandles = [];
     private nint _moduleWindow;
     private ModuleTargetProcess? _targetProcess;
-    private string? _runtimeDllPath;
     private readonly string? _moduleLogPath;
     private readonly string? _telemetryPipeName;
     private bool _relayRunning;
@@ -130,9 +130,10 @@ internal sealed class AotModuleController : IDisposable
         var moduleWindow = TryFindModuleWindow(target.ProcessId);
         if (moduleWindow == nint.Zero)
         {
-            _runtimeDllPath = PrepareRuntimeModuleDll(configuration.ModuleDllName);
+            var runtimeDllPath = PrepareRuntimeModuleDll(configuration.ModuleDllName);
+            _log($"Prepared runtime AOT module: {runtimeDllPath}");
             ClearHookHandles();
-            moduleWindow = await InstallGetMessageHooksAndWaitAsync(target.ProcessId, _runtimeDllPath).ConfigureAwait(false);
+            moduleWindow = await InstallGetMessageHooksAndWaitAsync(target.ProcessId, runtimeDllPath).ConfigureAwait(false);
         }
         else
         {
@@ -465,11 +466,139 @@ internal sealed class AotModuleController : IDisposable
         var nativeDll = FindNativeModuleDll(dllName);
         var configuration = GetConfigurationName(nativeDll);
         var runtimeDirectory = Path.Combine(AppContext.BaseDirectory, "runtime", configuration);
+        return PrepareRuntimeCopy(nativeDll, runtimeDirectory, dllName);
+    }
+
+    internal static string PrepareRuntimeCopy(string sourceDll, string runtimeDirectory, string dllName)
+    {
         Directory.CreateDirectory(runtimeDirectory);
+
+        var sourceHash = ComputeFileHash(sourceDll);
+        var hashText = Convert.ToHexString(sourceHash);
         var baseName = Path.GetFileNameWithoutExtension(dllName);
-        var runtimeDll = Path.Combine(runtimeDirectory, $"{baseName}_{DateTime.Now:yyyyMMdd_HHmmss_fff}.dll");
-        File.Copy(nativeDll, runtimeDll, overwrite: true);
+        var runtimeDll = Path.Combine(runtimeDirectory, $"{baseName}.{hashText}.dll");
+
+        if (!FileMatchesHash(runtimeDll, sourceHash))
+        {
+            try
+            {
+                File.Delete(runtimeDll);
+            }
+            catch (IOException) when (FileMatchesHash(runtimeDll, sourceHash))
+            {
+                // Another ProxiFyre instance already published and loaded this content.
+            }
+        }
+
+        if (!FileMatchesHash(runtimeDll, sourceHash))
+        {
+            var temporaryDll = Path.Combine(
+                runtimeDirectory,
+                $".{baseName}.{hashText}.{Environment.ProcessId}.{Guid.NewGuid():N}.tmp");
+            try
+            {
+                File.Copy(sourceDll, temporaryDll, overwrite: false);
+                if (!ComputeFileHash(temporaryDll).AsSpan().SequenceEqual(sourceHash))
+                {
+                    throw new IOException($"AOT module changed while copying: {sourceDll}");
+                }
+
+                try
+                {
+                    File.Move(temporaryDll, runtimeDll, overwrite: false);
+                }
+                catch (IOException) when (FileMatchesHash(runtimeDll, sourceHash))
+                {
+                    // Another ProxiFyre instance published the same content first.
+                }
+            }
+            finally
+            {
+                TryDeleteFile(temporaryDll);
+            }
+        }
+
+        CleanupRuntimeCopies(runtimeDirectory, baseName, runtimeDll);
         return runtimeDll;
+    }
+
+    private static byte[] ComputeFileHash(string path)
+    {
+        using var stream = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.Read | FileShare.Delete,
+            bufferSize: 4096,
+            FileOptions.SequentialScan);
+        return SHA256.HashData(stream);
+    }
+
+    private static bool FileMatchesHash(string path, ReadOnlySpan<byte> expectedHash)
+    {
+        if (!File.Exists(path))
+        {
+            return false;
+        }
+
+        try
+        {
+            return ComputeFileHash(path).AsSpan().SequenceEqual(expectedHash);
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    private static void CleanupRuntimeCopies(string runtimeDirectory, string baseName, string currentDll)
+    {
+        foreach (var candidate in Directory.EnumerateFiles(runtimeDirectory, $"{baseName}*.dll"))
+        {
+            if (string.Equals(candidate, currentDll, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            TryDeleteFile(candidate);
+        }
+
+        var staleTemporaryCutoff = DateTime.UtcNow - TimeSpan.FromHours(1);
+        foreach (var candidate in Directory.EnumerateFiles(runtimeDirectory, $".{baseName}.*.tmp"))
+        {
+            try
+            {
+                if (File.GetLastWriteTimeUtc(candidate) < staleTemporaryCutoff)
+                {
+                    TryDeleteFile(candidate);
+                }
+            }
+            catch (IOException)
+            {
+            }
+            catch (UnauthorizedAccessException)
+            {
+            }
+        }
+    }
+
+    private static void TryDeleteFile(string path)
+    {
+        try
+        {
+            File.Delete(path);
+        }
+        catch (IOException)
+        {
+            // Loaded module images remain locked until the target process exits.
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
     }
 
     private static string FindNativeModuleDll(string dllName)
