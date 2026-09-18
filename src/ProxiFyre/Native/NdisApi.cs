@@ -28,6 +28,7 @@ internal static unsafe class NdisApi
     private static readonly uint IoctlSetPacketFilters = CtlCode(FileDeviceNdisrd, NdisrdIoctlIndex + 14, MethodBuffered, FileAnyAccess);
     private static readonly uint IoctlResetPacketFilters = CtlCode(FileDeviceNdisrd, NdisrdIoctlIndex + 15, MethodBuffered, FileAnyAccess);
     private static readonly uint IoctlReadPacketsUnsorted = CtlCode(FileDeviceNdisrd, NdisrdIoctlIndex + 25, MethodBuffered, FileAnyAccess);
+    private static readonly uint IoctlSetFragmentCacheState = CtlCode(FileDeviceNdisrd, NdisrdIoctlIndex + 36, MethodBuffered, FileAnyAccess);
 
     public const int AdapterListSize = 32;
     public const int AdapterNameSize = 256;
@@ -200,6 +201,12 @@ internal static unsafe class NdisApi
     public static bool ResetPacketFilterTable(IntPtr handle)
     {
         return DeviceIoControl(handle, IoctlResetPacketFilters, null, 0, null, 0, out _, IntPtr.Zero);
+    }
+
+    public static bool SetPacketFragmentCacheState(IntPtr handle, bool enabled)
+    {
+        var state = enabled ? 1u : 0u;
+        return DeviceIoControl(handle, IoctlSetFragmentCacheState, &state, sizeof(uint), null, 0, out _, IntPtr.Zero);
     }
 
     public static StaticFilter CreateOutboundPassFilter(

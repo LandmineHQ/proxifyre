@@ -142,13 +142,15 @@ Important behavior:
   pass table, preventing the relay from recursively intercepting itself.
 - Definitively non-target TCP flows are classified from their first user-mode
   packet and then registered in the same kernel pass table with a bounded
-  two-second TTL and a 1024-entry cap. Table changes are coalesced in the packet
-  loop and refreshed at most every 50 ms; a one-second maintenance wake handles
-  TTL expiry even when no other packet reaches user mode.
-- The dynamic pass cache is intentionally disabled for UDP, VLAN-tagged traffic,
-  and reassembled/fragmented packets because the static filter table cannot
-  safely match the Dot1q discriminator or preserve IP fragment ordering without
-  WFP process/fragment metadata.
+  one-second TTL and a 1024-entry cap. Table changes are coalesced in the packet
+  loop and refreshed at most every 50 ms; a 500-ms maintenance wake handles TTL
+  expiry even when no other packet reaches user mode.
+- The dynamic pass cache remains disabled unless WinpkFilter's fragment cache
+  can be enabled. It is also intentionally disabled for UDP, VLAN-tagged traffic,
+  and reassembled packets; UDP and VLAN need WFP process/fragment metadata to
+  provide the same safety guarantees.
+- TCP relay connections are capped at 4096, matching the UDP socket limit, so
+  relay-owned kernel bypass entries cannot grow without bound.
 - TCP interception starts on a SYN-only packet. The first packet passes
   normally when Windows has not yet published an owning process.
 - TCP uses per-connection random initial sequence numbers, an MSS-bearing

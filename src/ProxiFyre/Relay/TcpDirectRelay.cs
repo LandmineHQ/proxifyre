@@ -152,6 +152,8 @@ internal sealed class TcpDirectRelay : IDisposable
             flowKey.RemotePort));
     }
 
+    public int ConnectionCount => _connections.Count;
+
     public void MarkBypassedFlow(TcpRelayKey flowKey)
     {
         _bypassedFlows[flowKey] = _timeProvider.GetUtcNow();

@@ -10,10 +10,12 @@ namespace ProxiFyre;
 internal sealed unsafe class PacketFilterLoop : IDisposable
 {
     private const int MaxTemporaryPassFlows = 1024;
-    private static readonly TimeSpan TemporaryPassFlowTtl = TimeSpan.FromSeconds(2);
+    private const int MaxTcpRelayConnections = 4096;
+    private static readonly TimeSpan TemporaryPassFlowTtl = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan OutboundFilterApplyInterval = TimeSpan.FromMilliseconds(50);
-    private static readonly TimeSpan TemporaryPassCleanupInterval = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan TemporaryPassCleanupInterval = TimeSpan.FromMilliseconds(500);
     private static readonly TimeSpan OutboundFilterRetryInterval = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan PassFlowMaintenanceInterval = TimeSpan.FromMilliseconds(500);
 
     private readonly DynamicAppConfiguration _configuration;
     private readonly TcpDirectRelay _tcpRelay;
@@ -33,10 +35,12 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
     private readonly OutboundPassFlowRegistry _temporaryPassFlows =
         new(MaxTemporaryPassFlows, TemporaryPassFlowTtl);
     private bool _outboundFilterTableDirty;
+    private bool _forceOutboundFilterApply;
     private DateTimeOffset _lastOutboundFilterApply;
     private DateTimeOffset _nextOutboundFilterRetry;
     private DateTimeOffset _nextTemporaryPassCleanup;
     private long _lastConfigurationGeneration;
+    private bool _fragmentCacheEnabled;
     private DateTimeOffset _lastPacketStatsLog;
     private long _packetsRead;
     private long _packetsPassed;
@@ -80,8 +84,8 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         using var passFlowMaintenanceTimer = new Timer(
             static state => ((PacketWakeSignal)state!).Pulse(),
             _wakeSignal,
-            TimeSpan.FromSeconds(1),
-            TimeSpan.FromSeconds(1));
+            PassFlowMaintenanceInterval,
+            PassFlowMaintenanceInterval);
         WaitHandle[] waitHandles = [packetEvent, _wakeSignal.WaitHandle, cancellationToken.WaitHandle];
         try
         {
@@ -152,6 +156,10 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         }
 
         _log($"WinpkFilter driver version: 0x{NdisApi.GetDriverVersion(_driverHandle):X8}");
+        _fragmentCacheEnabled = NdisApi.SetPacketFragmentCacheState(_driverHandle, enabled: true);
+        _log(_fragmentCacheEnabled
+            ? "WinpkFilter fragment cache enabled for transport-aware kernel pass flows."
+            : "WinpkFilter fragment cache is unavailable; dynamic kernel pass flows are disabled.");
     }
 
     private void ConfigureAdapters()
@@ -257,10 +265,11 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             }
             else
             {
-                _outboundBypassFlows[flow] = count - 1;
+            _outboundBypassFlows[flow] = count - 1;
             }
 
             _outboundFilterTableDirty = true;
+            _forceOutboundFilterApply = true;
         }
 
         _wakeSignal.Pulse();
@@ -326,6 +335,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         // PASS rule cannot safely preserve fragment ordering without WFP metadata.
         if (!allowPassFilter
             || !packet.IsTcp
+            || !_fragmentCacheEnabled
             || dot1q != 0
             || packet.IsLinkLayerBroadcastOrMulticast())
         {
@@ -368,6 +378,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 _lastConfigurationGeneration = _configuration.Generation;
                 _temporaryPassFlows.Clear();
                 _outboundFilterTableDirty = true;
+                _forceOutboundFilterApply = true;
             }
 
             if (_nextTemporaryPassCleanup == default || now >= _nextTemporaryPassCleanup)
@@ -380,13 +391,15 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             }
 
             if (!_outboundFilterTableDirty
-                || (_nextOutboundFilterRetry != default && now < _nextOutboundFilterRetry)
-                || (_lastOutboundFilterApply != default
-                    && now - _lastOutboundFilterApply < OutboundFilterApplyInterval))
+                || (!_forceOutboundFilterApply
+                    && ((_nextOutboundFilterRetry != default && now < _nextOutboundFilterRetry)
+                        || (_lastOutboundFilterApply != default
+                            && now - _lastOutboundFilterApply < OutboundFilterApplyInterval))))
             {
                 return;
             }
 
+            _forceOutboundFilterApply = false;
             ApplyOutboundBypassFilters();
         }
     }
@@ -632,6 +645,16 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         if (!_configuration.Current.TryGetMatchingPattern(process, out var matchedPattern, out _))
         {
             RegisterTemporaryPassFlow(packet, adapterHandle, dot1q, allowPassFilter);
+            return false;
+        }
+
+        if (_tcpRelay.ConnectionCount >= MaxTcpRelayConnections)
+        {
+            _tcpRelay.MarkBypassedFlow(relayKey);
+            LogThrottled(
+                $"TCP relay connection limit reached ({MaxTcpRelayConnections}); passing new target flow directly.",
+                "tcp-relay-limit",
+                TimeSpan.FromSeconds(5));
             return false;
         }
 
