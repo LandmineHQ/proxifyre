@@ -124,38 +124,65 @@ internal sealed class UdpDirectRelay : IDisposable
 
     public void Remove(UdpRelayKey key)
     {
-        Remove(key, expectedSocket: null);
+        _ = Remove(key, expectedSocket: null);
     }
 
-    private void Remove(UdpRelayKey key, UdpRelaySocket? expectedSocket)
+    private bool Remove(UdpRelayKey key, UdpRelaySocket? expectedSocket)
     {
         UdpRelaySocket? socket;
+        var removed = false;
         lock (_socketCreationSync)
         {
             _sockets.TryGetValue(key, out socket);
             if (expectedSocket is not null
                 && !ReferenceEquals(socket, expectedSocket))
             {
-                return;
+                return false;
             }
 
             if (socket is not null)
             {
                 _sockets.TryRemove(key, out _);
+                removed = true;
             }
 
-            _targets.TryRemove(key, out _);
+            if (_targets.TryRemove(key, out _))
+            {
+                removed = true;
+            }
         }
 
         socket?.Dispose();
-        _targetRedirectUnregister?.Invoke(new RelayOutboundFlow(
-            key.AdapterHandle,
-            PacketView.ProtocolUdp,
-            key.ClientAddress,
-            key.RemoteAddress,
-            key.ClientPort,
-            key.RemotePort,
-            key.Dot1q));
+        if (removed)
+        {
+            _targetRedirectUnregister?.Invoke(ToRelayFlow(key));
+        }
+
+        return removed;
+    }
+
+    private void RemoveIfNoSocket(UdpRelayKey key, DirectRelayTarget target)
+    {
+        var removed = false;
+        lock (_socketCreationSync)
+        {
+            if (_sockets.ContainsKey(key))
+            {
+                return;
+            }
+
+            if (_targets.TryGetValue(key, out var current)
+                && TargetMatches(current, target)
+                && _targets.TryRemove(key, out _))
+            {
+                removed = true;
+            }
+        }
+
+        if (removed)
+        {
+            _targetRedirectUnregister?.Invoke(ToRelayFlow(key));
+        }
     }
 
     public async Task SendToRemoteAsync(
@@ -192,20 +219,13 @@ internal sealed class UdpDirectRelay : IDisposable
             }
             catch
             {
-                Remove(key, relaySocket);
+                _ = Remove(key, relaySocket);
                 throw;
             }
         }
         catch (Exception)
         {
-            _targetRedirectUnregister?.Invoke(new RelayOutboundFlow(
-                key.AdapterHandle,
-                PacketView.ProtocolUdp,
-                key.ClientAddress,
-                key.RemoteAddress,
-                key.ClientPort,
-                key.RemotePort,
-                key.Dot1q));
+            RemoveIfNoSocket(key, target);
             throw;
         }
     }
@@ -699,5 +719,17 @@ internal sealed class UdpDirectRelay : IDisposable
             && left.ClientPort == right.ClientPort
             && Equals(left.RemoteAddress, right.RemoteAddress)
             && left.RemotePort == right.RemotePort;
+    }
+
+    private static RelayOutboundFlow ToRelayFlow(UdpRelayKey key)
+    {
+        return new RelayOutboundFlow(
+            key.AdapterHandle,
+            PacketView.ProtocolUdp,
+            key.ClientAddress,
+            key.RemoteAddress,
+            key.ClientPort,
+            key.RemotePort,
+            key.Dot1q);
     }
 }

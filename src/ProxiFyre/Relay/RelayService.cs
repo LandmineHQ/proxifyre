@@ -19,6 +19,7 @@ internal sealed class RelayService : IDisposable, IAsyncDisposable
     private Task? _filterTask;
     private WfpFlowClassifier? _wfpClassifier;
     private Task? _wfpClassifierTask;
+    private bool _wfpClassifierFallback;
     private Task? _trafficStatsTask;
     private Task? _configurationWatchTask;
 
@@ -83,6 +84,7 @@ internal sealed class RelayService : IDisposable, IAsyncDisposable
                 await filter.Started.WaitAsync(_cts.Token).ConfigureAwait(false);
                 if (!filter.WfpModeActive)
                 {
+                    _wfpClassifierFallback = true;
                     classifier.Dispose();
                     _wfpClassifier = null;
                     return;
@@ -109,6 +111,11 @@ internal sealed class RelayService : IDisposable, IAsyncDisposable
             await classifierTask.ConfigureAwait(false);
             if (!cts.IsCancellationRequested)
             {
+                if (_wfpClassifierFallback)
+                {
+                    return;
+                }
+
                 _log("WFP classifier stopped unexpectedly.");
                 cts.Cancel();
             }
