@@ -289,7 +289,14 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             {
                 _outboundFilterTableDirty = false;
                 _forceOutboundFilterApply = false;
+                _lastOutboundFilterApply = _timeProvider.GetUtcNow();
                 _nextOutboundFilterRetry = default;
+            }
+            else
+            {
+                _forceOutboundFilterApply = false;
+                _lastOutboundFilterApply = _timeProvider.GetUtcNow();
+                _nextOutboundFilterRetry = _lastOutboundFilterApply + OutboundFilterRetryInterval;
             }
 
             return;
