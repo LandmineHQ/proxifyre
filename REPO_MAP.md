@@ -105,8 +105,8 @@ The Windows job:
 1. Installs the .NET 10 SDK and restores through the NuGet cache.
 2. Runs `.\scripts\proxifyre.ps1 build -Configuration Release`.
 3. Runs `.\scripts\proxifyre.ps1 test packet-selftest -Configuration Release`.
-4. Stages the WPF application, NativeAOT module/probe, `manifest.json`,
-   `UuPatchProfiles.json`, `README.md`, and `docs/UU_ACCELERATOR.md`.
+4. Stages the WPF application, NativeAOT module/probe, `manifest.json`, and
+   `UuPatchProfiles.json`.
 5. Excludes local configuration, logs, and PDB files.
 6. Includes `ProxiFyre.Wfp.sys` and `ProxiFyre.Wfp.inf` when the optional WFP
    build output exists.
@@ -117,7 +117,8 @@ The Windows job:
 The required ZIP entries are `ProxiFyre.exe`, `ProxiFyre.dll`,
 `ProxiFyre.deps.json`, `ProxiFyre.runtimeconfig.json`,
 `ProxiFyre.Module.dll`, `ProxiFyre.Probe.dll`, `manifest.json`, and
-`UuPatchProfiles.json`.
+`UuPatchProfiles.json`. `README.md` and `UU_ACCELERATOR.md` are explicitly
+excluded from the release package because they are not runtime dependencies.
 
 ### Release
 

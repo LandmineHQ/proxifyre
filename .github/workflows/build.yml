@@ -80,9 +80,6 @@ jobs:
             Copy-Item -LiteralPath "$native/ProxiFyre.Wfp.inf" -Destination $stage -Force
           }
 
-          Copy-Item -LiteralPath "README.md" -Destination $stage -Force
-          Copy-Item -LiteralPath "docs/UU_ACCELERATOR.md" -Destination $stage -Force
-
           $required = @(
             "ProxiFyre.exe",
             "ProxiFyre.dll",
@@ -98,6 +95,17 @@ jobs:
           })
           if ($missing.Count -gt 0) {
             throw "Release staging is missing: $($missing -join ', ')"
+          }
+
+          $forbidden = @(
+            "README.md",
+            "UU_ACCELERATOR.md"
+          )
+          $unexpected = @($forbidden | Where-Object {
+            Test-Path -LiteralPath (Join-Path $stage $_)
+          })
+          if ($unexpected.Count -gt 0) {
+            throw "Release staging contains excluded files: $($unexpected -join ', ')"
           }
 
           Compress-Archive -Path "$stage/*" -DestinationPath "release/proxifyre-win-x64.zip" -Force

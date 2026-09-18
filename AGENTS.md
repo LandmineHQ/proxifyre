@@ -125,6 +125,8 @@ Use the repository wrapper for normal work:
   entries are `ProxiFyre.exe`, `ProxiFyre.dll`, `ProxiFyre.deps.json`,
   `ProxiFyre.runtimeconfig.json`, `ProxiFyre.Module.dll`,
   `ProxiFyre.Probe.dll`, `manifest.json`, and `UuPatchProfiles.json`.
+- Keep `README.md` and `UU_ACCELERATOR.md` out of the release ZIP because they
+  are not runtime dependencies.
 - Do not stage local configuration, logs, PDB files, build caches, or runtime
   DLL copies. Include the optional WFP `.sys` and `.inf` files when present.
 - Release promotion is manual and requires a successful numeric `build_id`
