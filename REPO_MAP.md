@@ -77,7 +77,7 @@ items by `ProxiFyre`, `ProxiFyre.Module`, and in some cases other projects.
 | --- | --- |
 | `AGENTS.md` | Instructions for coding agents. Points to this map for repository structure and behavior. |
 | `REPO_MAP.md` | Architecture, runtime flow, file ownership, protocol, command, and testing reference. |
-| `README.md` | User-facing overview, requirements, build/run examples, configuration shape, and known limitations. |
+| `README.md` | Concise project description, build requirements, and build commands. |
 | `ProxiFyre.sln` | Visual Studio solution for the four main projects. |
 | `Directory.Build.props` | Enables centralized artifacts output under `artifacts/`. |
 | `Directory.Build.targets` | Removes temporary `_wpftmp` output directories after WPF builds. |
