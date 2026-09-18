@@ -833,6 +833,10 @@ PfWfpUnload(_In_ PDRIVER_OBJECT driverObject)
         ObDereferenceObject(gReaperThreadObject);
         gReaperThreadObject = NULL;
     }
+    else if (gReaperThreadHandle != NULL)
+    {
+        ZwWaitForSingleObject(gReaperThreadHandle, FALSE, NULL);
+    }
     if (gReaperThreadHandle != NULL)
     {
         ZwClose(gReaperThreadHandle);
@@ -981,16 +985,10 @@ DriverEntry(
         NULL);
     if (!NT_SUCCESS(status))
     {
+        NTSTATUS referenceStatus = status;
         KeSetEvent(&gReaperStopEvent, IO_NO_INCREMENT, FALSE);
-        status = ZwWaitForSingleObject(gReaperThreadHandle, FALSE, NULL);
-        if (!NT_SUCCESS(status))
-        {
-            return status;
-        }
-        ZwClose(gReaperThreadHandle);
-        gReaperThreadHandle = NULL;
         PfWfpUnload(driverObject);
-        return status;
+        return referenceStatus;
     }
 
     return STATUS_SUCCESS;
