@@ -283,6 +283,18 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             return;
         }
 
+        if (!_fragmentCacheEnabled)
+        {
+            if (NdisApi.ResetPacketFilterTable(_driverHandle))
+            {
+                _outboundFilterTableDirty = false;
+                _forceOutboundFilterApply = false;
+                _nextOutboundFilterRetry = default;
+            }
+
+            return;
+        }
+
         var passFlows = new HashSet<RelayOutboundFlow>(_outboundBypassFlows.Keys);
         passFlows.UnionWith(_temporaryPassFlows.Snapshot());
         var filters = new List<NdisApi.StaticFilter>(passFlows.Count * Math.Max(_adapters.Count, 1));
@@ -314,6 +326,19 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 $"SetPacketFilterTable failed for relay outbound pass flows count={filters.Count} win32={NdisApi.LastWin32Error}",
                 "set-static-filter-failed",
                 TimeSpan.FromSeconds(2));
+            if (NdisApi.ResetPacketFilterTable(_driverHandle))
+            {
+                LogThrottled(
+                    "Kernel pass table reset after update failure; dynamic pass filtering is disabled.",
+                    "kernel-pass-disabled",
+                    TimeSpan.FromSeconds(5));
+                _fragmentCacheEnabled = false;
+                _outboundFilterTableDirty = false;
+                _forceOutboundFilterApply = false;
+                _nextOutboundFilterRetry = default;
+                return;
+            }
+
             _outboundFilterTableDirty = true;
             _lastOutboundFilterApply = _timeProvider.GetUtcNow();
             _nextOutboundFilterRetry = _lastOutboundFilterApply + OutboundFilterRetryInterval;
@@ -353,7 +378,11 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         var now = _timeProvider.GetUtcNow();
         lock (_outboundBypassSync)
         {
-            _temporaryPassFlows.Register(flow, now);
+            if (_temporaryPassFlows.Register(flow, now))
+            {
+                _forceOutboundFilterApply = true;
+            }
+
             _outboundFilterTableDirty = true;
         }
 
@@ -387,6 +416,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 if (_temporaryPassFlows.RemoveExpired(now))
                 {
                     _outboundFilterTableDirty = true;
+                    _forceOutboundFilterApply = true;
                 }
             }
 

@@ -6,15 +6,18 @@ internal sealed class OutboundPassFlowRegistry(int maxFlows, TimeSpan ttl)
 
     public int Count => _flows.Count;
 
-    public void Register(RelayOutboundFlow flow, DateTimeOffset now)
+    public bool Register(RelayOutboundFlow flow, DateTimeOffset now)
     {
+        var evicted = false;
         if (!_flows.ContainsKey(flow) && _flows.Count >= maxFlows)
         {
             var oldest = _flows.MinBy(static pair => pair.Value);
             _flows.Remove(oldest.Key);
+            evicted = true;
         }
 
         _flows[flow] = now;
+        return evicted;
     }
 
     public bool RemoveExpired(DateTimeOffset now)
