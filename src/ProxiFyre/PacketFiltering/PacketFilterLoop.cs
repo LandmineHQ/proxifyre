@@ -339,8 +339,12 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             }
 
             _ = _targetRedirectFlows.TryAdd(flow, _timeProvider.GetUtcNow());
-            _wfpPendingRedirects.TryRemove(flow, out _);
         }
+    }
+
+    internal void MarkTargetRedirectActive(RelayOutboundFlow flow)
+    {
+        _wfpPendingRedirects.TryRemove(flow, out _);
     }
 
     internal bool HandleWfpFlow(WfpFlowEvent flowEvent)
@@ -963,6 +967,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             else
             {
                 existingConnection.SendClientSegment(CreateTcpSegment(packet));
+                MarkTargetRedirectActive(outboundFlow);
                 return true;
             }
         }
@@ -988,11 +993,19 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         if (packet.TcpPayloadLength > 0)
         {
             _tcpRelay.MarkBypassedFlow(relayKey);
+            if (_useWfpClassifier)
+            {
+                UnregisterTargetRedirect(outboundFlow);
+            }
             return false;
         }
 
         if (_tcpRelay.IsBypassedFlow(relayKey))
         {
+            if (_useWfpClassifier)
+            {
+                UnregisterTargetRedirect(outboundFlow);
+            }
             return false;
         }
 
@@ -1026,6 +1039,10 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 $"TCP relay connection limit reached ({MaxTcpRelayConnections}); passing new target flow directly.",
                 "tcp-relay-limit",
                 TimeSpan.FromSeconds(5));
+            if (_useWfpClassifier)
+            {
+                UnregisterTargetRedirect(outboundFlow);
+            }
             return false;
         }
 
@@ -1047,6 +1064,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             packet.TcpWindow,
             _cancellationToken,
             clientMss);
+        MarkTargetRedirectActive(outboundFlow);
         _packetsRedirected++;
         LogPacketStats();
         return true;
@@ -1194,6 +1212,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             {
                 _udpRelay.Refresh(relayKey);
                 SendUdpClientToRemote(packet, relayKey, existingTarget);
+                MarkTargetRedirectActive(outboundFlow);
                 return true;
             }
         }
@@ -1246,6 +1265,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             TimeSpan.FromSeconds(2));
         var target = CreateTarget(adapterHandle, dot1q, packet, process, matchedPattern);
         SendUdpClientToRemote(packet, relayKey, target);
+        MarkTargetRedirectActive(outboundFlow);
         return true;
     }
 

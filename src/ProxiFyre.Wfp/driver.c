@@ -500,7 +500,7 @@ PfWfpClassify(
     status = FwpsPendOperation0(inMetaValues->completionHandle, &pending->CompletionContext);
     if (!NT_SUCCESS(status))
     {
-        ExFreePoolWithTag(pending, PF_WFP_POOL_TAG);
+        PfWfpFreePending(pending);
         classifyOut->actionType = FWP_ACTION_PERMIT;
         classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
         return;
@@ -981,10 +981,12 @@ DriverEntry(
         NULL);
     if (!NT_SUCCESS(status))
     {
-        LARGE_INTEGER waitTimeout;
-        waitTimeout.QuadPart = -10000000LL;
         KeSetEvent(&gReaperStopEvent, IO_NO_INCREMENT, FALSE);
-        ZwWaitForSingleObject(gReaperThreadHandle, FALSE, &waitTimeout);
+        status = ZwWaitForSingleObject(gReaperThreadHandle, FALSE, NULL);
+        if (!NT_SUCCESS(status))
+        {
+            return status;
+        }
         ZwClose(gReaperThreadHandle);
         gReaperThreadHandle = NULL;
         PfWfpUnload(driverObject);

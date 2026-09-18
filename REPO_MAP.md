@@ -146,6 +146,10 @@ Important behavior:
   emitted and WinpkFilter installs `FILTER_PACKET_REDIRECT` rules only for
   confirmed target five-tuples. Without WFP, the legacy send-tunnel plus
   classified PASS-cache mode remains active.
+- Pended UDP authorization captures and reinjects the first datagram through
+  `FwpsInjectTransportSendAsync` after the user-mode verdict. Pending events
+  are reaped after five seconds and the user-mode classifier fault stops the
+  relay instead of leaving connections blocked.
 - Relay-created outbound socket flows are registered in a WinpkFilter static
   pass table, preventing the relay from recursively intercepting itself.
 - Definitively non-target TCP flows are classified from their first user-mode
@@ -272,7 +276,7 @@ one packet per call.
 
 | Path | Responsibility |
 | --- | --- |
-| `driver.c` | Native WFP callout driver. Registers ALE_AUTH_CONNECT callouts for IPv4/IPv6, pends connect authorization, publishes PID/five-tuple/interface events through a control device, and permits after a user-mode verdict or on timeout/unload. |
+| `driver.c` | Native WFP callout driver. Registers ALE_AUTH_CONNECT callouts for IPv4/IPv6, pends connect authorization, publishes PID/five-tuple/interface events through a control device, reinjects pended UDP first datagrams, and permits after a user-mode verdict or on timeout/unload. |
 | `ProxiFyre.Wfp.inf` | Kernel service installation metadata for `ProxiFyre.Wfp.sys`. |
 | `ProxiFyre.Wfp.vcxproj` | Visual Studio/WDK project metadata. The repository build script is authoritative when the installed Visual Studio build tools lack WDK platform-toolset integration. |
 
