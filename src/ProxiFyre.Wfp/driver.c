@@ -890,12 +890,13 @@ PfWfpUnload(_In_ PDRIVER_OBJECT driverObject)
 
     if (gCalloutIdV4 != 0)
     {
-        for (UINT32 attempt = 0; attempt < 10; ++attempt)
+        for (;;)
         {
             NTSTATUS unregisterStatus = FwpsCalloutUnregisterById0(gCalloutIdV4);
             if (NT_SUCCESS(unregisterStatus)
                 || unregisterStatus == STATUS_FWP_CALLOUT_NOT_FOUND)
             {
+                gCalloutIdV4 = 0;
                 break;
             }
 
@@ -903,16 +904,16 @@ PfWfpUnload(_In_ PDRIVER_OBJECT driverObject)
             delay.QuadPart = -100000LL;
             KeDelayExecutionThread(KernelMode, FALSE, &delay);
         }
-        gCalloutIdV4 = 0;
     }
     if (gCalloutIdV6 != 0)
     {
-        for (UINT32 attempt = 0; attempt < 10; ++attempt)
+        for (;;)
         {
             NTSTATUS unregisterStatus = FwpsCalloutUnregisterById0(gCalloutIdV6);
             if (NT_SUCCESS(unregisterStatus)
                 || unregisterStatus == STATUS_FWP_CALLOUT_NOT_FOUND)
             {
+                gCalloutIdV6 = 0;
                 break;
             }
 
@@ -920,18 +921,43 @@ PfWfpUnload(_In_ PDRIVER_OBJECT driverObject)
             delay.QuadPart = -100000LL;
             KeDelayExecutionThread(KernelMode, FALSE, &delay);
         }
-        gCalloutIdV6 = 0;
     }
 
     if (gInjectionHandleV4 != NULL)
     {
-        FwpsInjectionHandleDestroy0(gInjectionHandleV4);
-        gInjectionHandleV4 = NULL;
+        for (;;)
+        {
+            NTSTATUS destroyStatus = FwpsInjectionHandleDestroy0(gInjectionHandleV4);
+            if (NT_SUCCESS(destroyStatus))
+            {
+                gInjectionHandleV4 = NULL;
+                break;
+            }
+
+            {
+                LARGE_INTEGER delay;
+                delay.QuadPart = -100000LL;
+                KeDelayExecutionThread(KernelMode, FALSE, &delay);
+            }
+        }
     }
     if (gInjectionHandleV6 != NULL)
     {
-        FwpsInjectionHandleDestroy0(gInjectionHandleV6);
-        gInjectionHandleV6 = NULL;
+        for (;;)
+        {
+            NTSTATUS destroyStatus = FwpsInjectionHandleDestroy0(gInjectionHandleV6);
+            if (NT_SUCCESS(destroyStatus))
+            {
+                gInjectionHandleV6 = NULL;
+                break;
+            }
+
+            {
+                LARGE_INTEGER delay;
+                delay.QuadPart = -100000LL;
+                KeDelayExecutionThread(KernelMode, FALSE, &delay);
+            }
+        }
     }
 
     if (gEngineHandle != NULL)
