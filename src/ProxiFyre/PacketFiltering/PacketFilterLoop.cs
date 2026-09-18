@@ -9,9 +9,11 @@ namespace ProxiFyre;
 
 internal sealed unsafe class PacketFilterLoop : IDisposable
 {
-    private const int MaxTemporaryPassFlows = 4096;
-    private static readonly TimeSpan TemporaryPassFlowTtl = TimeSpan.FromSeconds(5);
+    private const int MaxTemporaryPassFlows = 1024;
+    private static readonly TimeSpan TemporaryPassFlowTtl = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan OutboundFilterApplyInterval = TimeSpan.FromMilliseconds(50);
+    private static readonly TimeSpan TemporaryPassCleanupInterval = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan OutboundFilterRetryInterval = TimeSpan.FromSeconds(1);
 
     private readonly DynamicAppConfiguration _configuration;
     private readonly TcpDirectRelay _tcpRelay;
@@ -32,6 +34,9 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         new(MaxTemporaryPassFlows, TemporaryPassFlowTtl);
     private bool _outboundFilterTableDirty;
     private DateTimeOffset _lastOutboundFilterApply;
+    private DateTimeOffset _nextOutboundFilterRetry;
+    private DateTimeOffset _nextTemporaryPassCleanup;
+    private long _lastConfigurationGeneration;
     private DateTimeOffset _lastPacketStatsLog;
     private long _packetsRead;
     private long _packetsPassed;
@@ -51,6 +56,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         _timeProvider = timeProvider ?? TimeProvider.System;
         _processLookup = new ProcessLookup(timeProvider: _timeProvider);
         _fragmentReassembler = new IpFragmentReassembler(_timeProvider);
+        _lastConfigurationGeneration = _configuration.Generation;
         _tcpRelay.SetPacketInjector(InjectTcpSegmentToClient);
         _udpRelay.SetResponseInjector(InjectUdpResponseToClient);
         _udpRelay.SetResponseValidator(IsUdpTargetCurrent);
@@ -229,9 +235,10 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         {
             _outboundBypassFlows.TryGetValue(flow, out var count);
             _outboundBypassFlows[flow] = count + 1;
-            ApplyOutboundBypassFilters();
+            _outboundFilterTableDirty = true;
         }
 
+        _wakeSignal.Pulse();
         LogDetail($"Registered relay outbound kernel pass flow: {flow}", $"relay-pass-register:{flow}", TimeSpan.FromSeconds(2));
     }
 
@@ -253,9 +260,10 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 _outboundBypassFlows[flow] = count - 1;
             }
 
-            ApplyOutboundBypassFilters();
+            _outboundFilterTableDirty = true;
         }
 
+        _wakeSignal.Pulse();
         LogDetail($"Unregistered relay outbound kernel pass flow: {flow}", $"relay-pass-unregister:{flow}", TimeSpan.FromSeconds(2));
     }
 
@@ -297,15 +305,29 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 $"SetPacketFilterTable failed for relay outbound pass flows count={filters.Count} win32={NdisApi.LastWin32Error}",
                 "set-static-filter-failed",
                 TimeSpan.FromSeconds(2));
+            _outboundFilterTableDirty = true;
+            _lastOutboundFilterApply = _timeProvider.GetUtcNow();
+            _nextOutboundFilterRetry = _lastOutboundFilterApply + OutboundFilterRetryInterval;
+            return;
         }
 
         _outboundFilterTableDirty = false;
         _lastOutboundFilterApply = _timeProvider.GetUtcNow();
+        _nextOutboundFilterRetry = default;
     }
 
-    private void RegisterTemporaryPassFlow(PacketView packet, IntPtr adapterHandle, uint dot1q)
+    private void RegisterTemporaryPassFlow(
+        PacketView packet,
+        IntPtr adapterHandle,
+        uint dot1q,
+        bool allowPassFilter = true)
     {
-        if (dot1q != 0 || packet.IsLinkLayerBroadcastOrMulticast())
+        // UDP can begin fragmenting after any datagram, so a transport-only kernel
+        // PASS rule cannot safely preserve fragment ordering without WFP metadata.
+        if (!allowPassFilter
+            || !packet.IsTcp
+            || dot1q != 0
+            || packet.IsLinkLayerBroadcastOrMulticast())
         {
             return;
         }
@@ -341,12 +363,24 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         lock (_outboundBypassSync)
         {
             var now = _timeProvider.GetUtcNow();
-            if (_temporaryPassFlows.RemoveExpired(now))
+            if (_lastConfigurationGeneration != _configuration.Generation)
             {
+                _lastConfigurationGeneration = _configuration.Generation;
+                _temporaryPassFlows.Clear();
                 _outboundFilterTableDirty = true;
             }
 
+            if (_nextTemporaryPassCleanup == default || now >= _nextTemporaryPassCleanup)
+            {
+                _nextTemporaryPassCleanup = now + TemporaryPassCleanupInterval;
+                if (_temporaryPassFlows.RemoveExpired(now))
+                {
+                    _outboundFilterTableDirty = true;
+                }
+            }
+
             if (!_outboundFilterTableDirty
+                || (_nextOutboundFilterRetry != default && now < _nextOutboundFilterRetry)
                 || (_lastOutboundFilterApply != default
                     && now - _lastOutboundFilterApply < OutboundFilterApplyInterval))
             {
@@ -465,7 +499,11 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
     {
         var frame = reassembled.Frame.AsSpan();
         if (!PacketView.TryParse(frame, reassembled.Length, out var packet)
-            || !ProcessOutgoing(packet, reassembled.AdapterHandle, reassembled.Dot1q))
+            || !ProcessOutgoing(
+                packet,
+                reassembled.AdapterHandle,
+                reassembled.Dot1q,
+                allowPassFilter: false))
         {
             foreach (var fragment in reassembled.Fragments)
             {
@@ -485,16 +523,20 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         SendToAdapter(&buffer);
     }
 
-    private bool ProcessOutgoing(PacketView packet, IntPtr adapterHandle, uint dot1q)
+    private bool ProcessOutgoing(
+        PacketView packet,
+        IntPtr adapterHandle,
+        uint dot1q,
+        bool allowPassFilter = true)
     {
         if (packet.IsTcp)
         {
-            return ProcessOutgoingTcp(packet, adapterHandle, dot1q);
+            return ProcessOutgoingTcp(packet, adapterHandle, dot1q, allowPassFilter);
         }
 
         if (packet.IsUdp)
         {
-            return ProcessOutgoingUdp(packet, adapterHandle, dot1q);
+            return ProcessOutgoingUdp(packet, adapterHandle, dot1q, allowPassFilter);
         }
 
         return false;
@@ -516,7 +558,11 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         }
     }
 
-    private bool ProcessOutgoingTcp(PacketView packet, IntPtr adapterHandle, uint dot1q)
+    private bool ProcessOutgoingTcp(
+        PacketView packet,
+        IntPtr adapterHandle,
+        uint dot1q,
+        bool allowPassFilter)
     {
         var relayKey = new TcpRelayKey(
             adapterHandle,
@@ -555,20 +601,24 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
 
         if (!packet.IsInitialSyn)
         {
-            RegisterTemporaryPassFlow(packet, adapterHandle, dot1q);
+            var nonSynProcess = LookupTcpOwner(packet);
+            if (nonSynProcess is not null
+                && !_configuration.Current.TryGetMatchingPattern(nonSynProcess, out _, out _))
+            {
+                RegisterTemporaryPassFlow(packet, adapterHandle, dot1q, allowPassFilter);
+            }
+
             return false;
         }
 
         if (packet.TcpPayloadLength > 0)
         {
             _tcpRelay.MarkBypassedFlow(relayKey);
-            RegisterTemporaryPassFlow(packet, adapterHandle, dot1q);
             return false;
         }
 
         if (_tcpRelay.IsBypassedFlow(relayKey))
         {
-            RegisterTemporaryPassFlow(packet, adapterHandle, dot1q);
             return false;
         }
 
@@ -576,13 +626,12 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         if (process is null)
         {
             _tcpRelay.MarkBypassedFlow(relayKey);
-            RegisterTemporaryPassFlow(packet, adapterHandle, dot1q);
             return false;
         }
 
         if (!_configuration.Current.TryGetMatchingPattern(process, out var matchedPattern, out _))
         {
-            RegisterTemporaryPassFlow(packet, adapterHandle, dot1q);
+            RegisterTemporaryPassFlow(packet, adapterHandle, dot1q, allowPassFilter);
             return false;
         }
 
@@ -681,7 +730,11 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         return false;
     }
 
-    private bool ProcessOutgoingUdp(PacketView packet, IntPtr adapterHandle, uint dot1q)
+    private bool ProcessOutgoingUdp(
+        PacketView packet,
+        IntPtr adapterHandle,
+        uint dot1q,
+        bool allowPassFilter)
     {
         var processInfo = _processLookup.LookupUdpOwner(
             CreateUdpEndpointKey(packet.SourceAddress, packet.SourcePort, adapterHandle));
@@ -758,7 +811,6 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                     TimeSpan.FromSeconds(5));
             }
 
-            RegisterTemporaryPassFlow(packet, adapterHandle, dot1q);
             return false;
         }
 
@@ -772,7 +824,6 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                     TimeSpan.FromSeconds(5));
             }
 
-            RegisterTemporaryPassFlow(packet, adapterHandle, dot1q);
             return false;
         }
 

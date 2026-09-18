@@ -38,4 +38,9 @@ internal sealed class OutboundPassFlowRegistry(int maxFlows, TimeSpan ttl)
     {
         return _flows.Keys.ToArray();
     }
+
+    public void Clear()
+    {
+        _flows.Clear();
+    }
 }
