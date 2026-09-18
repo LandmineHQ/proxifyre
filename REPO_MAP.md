@@ -380,7 +380,7 @@ user-mode side; `Shared/WfpProtocol.h` is the shared wire layout.
 
 | Path | Responsibility |
 | --- | --- |
-| `TrafficTelemetryServer.cs` | UI-side named-pipe server. Accepts one same-user module client through a Medium-integrity pipe DACL so an elevated UI can receive telemetry from non-elevated injected processes, reads newline-delimited snapshots, and invokes the UI callback. |
+| `TrafficTelemetryServer.cs` | UI-side named-pipe server. Accepts one module client through an explicit current-user DACL and a Medium mandatory label so an elevated UI can receive telemetry from non-elevated injected processes, reads newline-delimited snapshots, and invokes the UI callback. |
 
 Wire format is defined in `src/Shared/TrafficTelemetry.cs`. Telemetry is
 best-effort and intentionally separate from logs and the control channel.

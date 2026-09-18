@@ -1,6 +1,8 @@
 using System.IO;
 using System.IO.Pipes;
 using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text;
 using Microsoft.Win32.SafeHandles;
 
@@ -13,6 +15,11 @@ namespace ProxiFyre;
 /// </summary>
 internal sealed class TrafficTelemetryServer : IDisposable
 {
+    private const uint DaclSecurityInformation = 0x00000004;
+    private const uint LabelSecurityInformation = 0x00000010;
+    private const uint KernelObject = 6;
+    private const uint SddlRevision1 = 1;
+
     private readonly Action<TrafficSnapshot> _onSnapshot;
     private readonly Action<string>? _log;
     private readonly string _pipeName;
@@ -76,35 +83,58 @@ internal sealed class TrafficTelemetryServer : IDisposable
 
     internal NamedPipeServerStream CreateServer()
     {
-        var server = new NamedPipeServerStream(
-            _pipeName,
-            PipeDirection.In,
-            maxNumberOfServerInstances: 1,
-            PipeTransmissionMode.Byte,
-            PipeOptions.Asynchronous);
         try
         {
+            using var identity = WindowsIdentity.GetCurrent();
+            var user = identity.User
+                ?? throw new InvalidOperationException("The current Windows identity has no user SID.");
+            var security = new PipeSecurity();
+            security.SetSecurityDescriptorSddlForm(
+                $"O:{user.Value}G:{user.Value}D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{user.Value})");
+            NamedPipeServerStream server;
+            try
+            {
+                server = NamedPipeServerStreamAcl.Create(
+                    _pipeName,
+                    PipeDirection.In,
+                    maxNumberOfServerInstances: 1,
+                    PipeTransmissionMode.Byte,
+                    PipeOptions.Asynchronous,
+                    inBufferSize: 4096,
+                    outBufferSize: 4096,
+                    security,
+                    HandleInheritability.None,
+                    PipeAccessRights.ChangePermissions | PipeAccessRights.TakeOwnership);
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException("Creating the secured telemetry pipe failed.", ex);
+            }
+
             SetMediumIntegrityLabel(server.SafePipeHandle);
+            return server;
         }
         catch (Exception ex)
         {
+            var baseMessage = ex.GetBaseException().Message;
             _log?.Invoke(
-                $"Traffic telemetry could not set the medium integrity label: {ex.Message}");
+                $"Traffic telemetry could not configure cross-integrity access: {baseMessage}");
+            return new NamedPipeServerStream(
+                _pipeName,
+                PipeDirection.In,
+                maxNumberOfServerInstances: 1,
+                PipeTransmissionMode.Byte,
+                PipeOptions.Asynchronous);
         }
-
-        return server;
     }
 
     private static void SetMediumIntegrityLabel(SafePipeHandle pipeHandle)
     {
         // Keep the UI elevated while allowing same-user, non-elevated relay
         // processes to write telemetry through the pipe.
-        const uint labelSecurityInformation = 0x00000010;
-        const uint kernelObject = 6;
-        const uint sddlRevision1 = 1;
         if (!ConvertStringSecurityDescriptorToSecurityDescriptor(
                 "S:(ML;;NW;;;ME)",
-                sddlRevision1,
+                SddlRevision1,
                 out var descriptor,
                 out _))
         {
@@ -128,8 +158,8 @@ internal sealed class TrafficTelemetryServer : IDisposable
 
             var result = SetSecurityInfo(
                 pipeHandle.DangerousGetHandle(),
-                kernelObject,
-                labelSecurityInformation,
+                KernelObject,
+                LabelSecurityInformation,
                 IntPtr.Zero,
                 IntPtr.Zero,
                 IntPtr.Zero,
@@ -149,13 +179,10 @@ internal sealed class TrafficTelemetryServer : IDisposable
 
     internal static bool HasMediumIntegrityLabel(SafePipeHandle pipeHandle)
     {
-        const uint labelSecurityInformation = 0x00000010;
-        const uint kernelObject = 6;
-        const uint sddlRevision1 = 1;
         var result = GetSecurityInfo(
             pipeHandle.DangerousGetHandle(),
-            kernelObject,
-            labelSecurityInformation,
+            KernelObject,
+            LabelSecurityInformation,
             out _,
             out _,
             out _,
@@ -170,8 +197,8 @@ internal sealed class TrafficTelemetryServer : IDisposable
         {
             if (!ConvertSecurityDescriptorToStringSecurityDescriptor(
                     descriptor,
-                    sddlRevision1,
-                    labelSecurityInformation,
+                    SddlRevision1,
+                    LabelSecurityInformation,
                     out var sddl,
                     out _))
             {
@@ -182,6 +209,54 @@ internal sealed class TrafficTelemetryServer : IDisposable
             {
                 return Marshal.PtrToStringUni(sddl)?.Contains(
                     "ML;;NW;;;ME",
+                    StringComparison.OrdinalIgnoreCase) == true;
+            }
+            finally
+            {
+                _ = LocalFree(sddl);
+            }
+        }
+        finally
+        {
+            _ = LocalFree(descriptor);
+        }
+    }
+
+    internal static bool HasCurrentUserFullControl(SafePipeHandle pipeHandle)
+    {
+        using var identity = WindowsIdentity.GetCurrent();
+        var user = identity.User
+            ?? throw new InvalidOperationException("The current Windows identity has no user SID.");
+        var result = GetSecurityInfo(
+            pipeHandle.DangerousGetHandle(),
+            KernelObject,
+            DaclSecurityInformation,
+            out _,
+            out _,
+            out _,
+            out _,
+            out var descriptor);
+        if (result != 0 || descriptor == IntPtr.Zero)
+        {
+            return false;
+        }
+
+        try
+        {
+            if (!ConvertSecurityDescriptorToStringSecurityDescriptor(
+                    descriptor,
+                    SddlRevision1,
+                    DaclSecurityInformation,
+                    out var sddl,
+                    out _))
+            {
+                return false;
+            }
+
+            try
+            {
+                return Marshal.PtrToStringUni(sddl)?.Contains(
+                    $"FA;;;{user.Value}",
                     StringComparison.OrdinalIgnoreCase) == true;
             }
             finally

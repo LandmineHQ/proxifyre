@@ -35,6 +35,13 @@ internal static class TrafficTelemetryDiagnostic
                     "FAIL: telemetry pipe security descriptor is missing the medium integrity label.");
                 return 1;
             }
+
+            if (!TrafficTelemetryServer.HasCurrentUserFullControl(securityProbe.SafePipeHandle))
+            {
+                Console.Error.WriteLine(
+                    "FAIL: telemetry pipe DACL does not grant the current user full control.");
+                return 1;
+            }
         }
 
         server.Start();
