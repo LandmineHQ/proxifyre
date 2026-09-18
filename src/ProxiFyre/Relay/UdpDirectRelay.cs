@@ -13,6 +13,7 @@ internal sealed class UdpDirectRelay : IDisposable
 
     private readonly ConcurrentDictionary<UdpRelayKey, DirectRelayTarget> _targets = new();
     private readonly ConcurrentDictionary<UdpRelayKey, UdpRelaySocket> _sockets = new();
+    private readonly ConcurrentDictionary<UdpRelayKey, long> _targetGenerations = new();
     private readonly ConcurrentDictionary<UdpRelayKey, byte> _relayOutboundFlows = new();
     private readonly object _socketCreationSync = new();
     private readonly Action<string> _log;
@@ -28,6 +29,7 @@ internal sealed class UdpDirectRelay : IDisposable
     private Action<RelayOutboundFlow>? _targetRedirectUnregister;
     private CancellationToken _cancellationToken;
     private bool _disposed;
+    private long _nextGeneration;
 
     public UdpDirectRelay(
         Action<string>? log = null,
@@ -80,9 +82,23 @@ internal sealed class UdpDirectRelay : IDisposable
         LogDetail("Local direct UDP relay uses packet injection; no local UDP listener is opened.");
     }
 
-    public void Register(UdpRelayKey key, DirectRelayTarget target)
+    public long Register(UdpRelayKey key, DirectRelayTarget target)
     {
-        _targets[key] = target;
+        lock (_socketCreationSync)
+        {
+            if (!_targets.TryGetValue(key, out var current)
+                || !TargetMatches(current, target))
+            {
+                var generation = Interlocked.Increment(ref _nextGeneration);
+                _targetGenerations[key] = generation;
+                _targets[key] = target;
+                return generation;
+            }
+
+            return _targetGenerations.TryGetValue(key, out var existingGeneration)
+                ? existingGeneration
+                : 0;
+        }
     }
 
     public bool Refresh(UdpRelayKey key)
@@ -148,6 +164,7 @@ internal sealed class UdpDirectRelay : IDisposable
 
             if (_targets.TryRemove(key, out _))
             {
+                _targetGenerations.TryRemove(key, out _);
                 removed = true;
             }
         }
@@ -161,7 +178,7 @@ internal sealed class UdpDirectRelay : IDisposable
         return removed;
     }
 
-    private void RemoveIfNoSocket(UdpRelayKey key, DirectRelayTarget target)
+    private void RemoveIfNoSocket(UdpRelayKey key, DirectRelayTarget target, long generation)
     {
         var removed = false;
         lock (_socketCreationSync)
@@ -173,8 +190,11 @@ internal sealed class UdpDirectRelay : IDisposable
 
             if (_targets.TryGetValue(key, out var current)
                 && TargetMatches(current, target)
+                && _targetGenerations.TryGetValue(key, out var currentGeneration)
+                && currentGeneration == generation
                 && _targets.TryRemove(key, out _))
             {
+                _targetGenerations.TryRemove(key, out _);
                 removed = true;
             }
         }
@@ -195,7 +215,7 @@ internal sealed class UdpDirectRelay : IDisposable
         try
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            Register(key, target);
+            var generation = Register(key, target);
             if (!_sockets.ContainsKey(key) && _sockets.Count >= MaxFlows)
             {
                 throw new InvalidOperationException("UDP relay flow limit reached.");
@@ -225,7 +245,7 @@ internal sealed class UdpDirectRelay : IDisposable
         }
         catch (Exception)
         {
-            RemoveIfNoSocket(key, target);
+            RemoveIfNoSocket(key, target, generation);
             throw;
         }
     }
@@ -426,6 +446,7 @@ internal sealed class UdpDirectRelay : IDisposable
         }
 
         _targets.Clear();
+        _targetGenerations.Clear();
         _relayOutboundFlows.Clear();
     }
 

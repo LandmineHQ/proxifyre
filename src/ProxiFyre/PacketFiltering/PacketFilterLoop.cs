@@ -39,6 +39,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         new(MaxTargetRedirectFlows, TimeSpan.FromMinutes(10));
     private readonly ConcurrentDictionary<RelayOutboundFlow, ProcessInfo> _wfpProcessByFlow = new();
     private readonly ConcurrentDictionary<RelayOutboundFlow, DateTimeOffset> _wfpPendingRedirects = new();
+    private readonly HashSet<RelayOutboundFlow> _wfpActiveRedirects = [];
     private readonly OutboundPassFlowRegistry _temporaryPassFlows =
         new(MaxTemporaryPassFlows, TemporaryPassFlowTtl);
     private bool _outboundFilterTableDirty;
@@ -304,7 +305,10 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             }
 
             _wfpProcessByFlow[flow] = process;
-            _wfpPendingRedirects[flow] = pendingDeadline;
+            if (!_wfpActiveRedirects.Contains(flow))
+            {
+                _wfpPendingRedirects[flow] = pendingDeadline;
+            }
             if (existed)
             {
                 return true;
@@ -353,7 +357,11 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
 
     internal void MarkTargetRedirectActive(RelayOutboundFlow flow)
     {
-        _wfpPendingRedirects.TryRemove(flow, out _);
+        lock (_outboundBypassSync)
+        {
+            _wfpPendingRedirects.TryRemove(flow, out _);
+            _wfpActiveRedirects.Add(flow);
+        }
     }
 
     internal bool HandleWfpFlow(WfpFlowEvent flowEvent)
@@ -739,6 +747,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
 
         _wfpProcessByFlow.TryRemove(flow, out _);
         _wfpPendingRedirects.TryRemove(flow, out _);
+        _wfpActiveRedirects.Remove(flow);
         return true;
     }
 

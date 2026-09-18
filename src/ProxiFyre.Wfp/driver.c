@@ -399,7 +399,7 @@ PfWfpFillEvent(
 }
 
 static VOID NTAPI
-PfWfpClassify(
+PfWfpClassifyInternal(
     _In_ const FWPS_INCOMING_VALUES0* inFixedValues,
     _In_ const FWPS_INCOMING_METADATA_VALUES0* inMetaValues,
     _Inout_opt_ void* layerData,
@@ -528,6 +528,31 @@ PfWfpClassify(
     classifyOut->actionType = FWP_ACTION_BLOCK;
     classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
     classifyOut->flags |= FWPS_CLASSIFY_OUT_FLAG_ABSORB;
+}
+
+static VOID NTAPI
+PfWfpClassify(
+    _In_ const FWPS_INCOMING_VALUES0* inFixedValues,
+    _In_ const FWPS_INCOMING_METADATA_VALUES0* inMetaValues,
+    _Inout_opt_ void* layerData,
+    _In_ const FWPS_FILTER0* filter,
+    _In_ UINT64 flowContext,
+    _Inout_ FWPS_CLASSIFY_OUT0* classifyOut)
+{
+    if (!ExAcquireRundownProtection(&gRundownRef))
+    {
+        classifyOut->actionType = FWP_ACTION_PERMIT;
+        return;
+    }
+
+    PfWfpClassifyInternal(
+        inFixedValues,
+        inMetaValues,
+        layerData,
+        filter,
+        flowContext,
+        classifyOut);
+    ExReleaseRundownProtection(&gRundownRef);
 }
 
 static NTSTATUS NTAPI
@@ -659,12 +684,21 @@ PfWfpDispatchCleanup(_In_ PDEVICE_OBJECT deviceObject, _Inout_ PIRP irp)
 {
     UNREFERENCED_PARAMETER(deviceObject);
 
+    if (!ExAcquireRundownProtection(&gRundownRef))
+    {
+        irp->IoStatus.Status = STATUS_DELETE_PENDING;
+        irp->IoStatus.Information = 0;
+        IoCompleteRequest(irp, IO_NO_INCREMENT);
+        return STATUS_SUCCESS;
+    }
+
     if (InterlockedDecrement(&gConnectedClients) <= 0)
     {
         InterlockedExchange(&gConnectedClients, 0);
         PfWfpPermitAllPending();
     }
 
+    ExReleaseRundownProtection(&gRundownRef);
     irp->IoStatus.Status = STATUS_SUCCESS;
     irp->IoStatus.Information = 0;
     IoCompleteRequest(irp, IO_NO_INCREMENT);
