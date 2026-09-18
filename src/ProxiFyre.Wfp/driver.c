@@ -1,5 +1,6 @@
 #define POOL_ZERO_DOWN_LEVEL_SUPPORT
 #include <ntifs.h>
+#include <ntstrsafe.h>
 
 #pragma warning(push)
 #pragma warning(disable:4201)
@@ -948,6 +949,97 @@ PfWfpUnload(_In_ PDRIVER_OBJECT driverObject)
     }
 }
 
+static VOID
+PfWfpBuildDeviceSddl(
+    _In_ PUNICODE_STRING registryPath,
+    _Out_ PUNICODE_STRING deviceSddl,
+    _Out_writes_(bufferCount) PWCHAR buffer,
+    _In_ size_t bufferCount)
+{
+    HANDLE key = NULL;
+    OBJECT_ATTRIBUTES attributes;
+    UNICODE_STRING valueName = RTL_CONSTANT_STRING(L"ClientSid");
+    BYTE valueBuffer[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + 256];
+    ULONG resultLength = 0;
+    NTSTATUS status;
+
+    RtlStringCchCopyW(
+        buffer,
+        bufferCount,
+        L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
+
+    if (registryPath == NULL || registryPath->Buffer == NULL)
+    {
+        RtlInitUnicodeString(deviceSddl, buffer);
+        return;
+    }
+
+    InitializeObjectAttributes(
+        &attributes,
+        registryPath,
+        OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+        NULL,
+        NULL);
+    status = ZwOpenKey(&key, KEY_READ, &attributes);
+    if (!NT_SUCCESS(status))
+    {
+        RtlInitUnicodeString(deviceSddl, buffer);
+        return;
+    }
+
+    status = ZwQueryValueKey(
+        key,
+        &valueName,
+        KeyValuePartialInformation,
+        valueBuffer,
+        sizeof(valueBuffer),
+        &resultLength);
+    ZwClose(key);
+    if (!NT_SUCCESS(status))
+    {
+        RtlInitUnicodeString(deviceSddl, buffer);
+        return;
+    }
+
+    {
+        KEY_VALUE_PARTIAL_INFORMATION* value =
+            (KEY_VALUE_PARTIAL_INFORMATION*)valueBuffer;
+        if (value->Type == REG_SZ && value->DataLength >= sizeof(WCHAR))
+        {
+            UNICODE_STRING clientSid;
+            clientSid.Buffer = (PWCHAR)value->Data;
+            clientSid.Length = (USHORT)min(
+                value->DataLength,
+                (ULONG)(0xFFFF - sizeof(WCHAR)));
+            clientSid.MaximumLength = clientSid.Length + sizeof(WCHAR);
+            clientSid.Buffer[clientSid.Length / sizeof(WCHAR)] = UNICODE_NULL;
+
+            if (NT_SUCCESS(RtlStringCchCopyW(
+                    buffer,
+                    bufferCount,
+                    L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;"))
+                && NT_SUCCESS(RtlStringCchCatW(
+                    buffer,
+                    bufferCount,
+                    clientSid.Buffer))
+                && NT_SUCCESS(RtlStringCchCatW(
+                    buffer,
+                    bufferCount,
+                    L")")))
+            {
+                RtlInitUnicodeString(deviceSddl, buffer);
+                return;
+            }
+        }
+    }
+
+    RtlStringCchCopyW(
+        buffer,
+        bufferCount,
+        L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
+    RtlInitUnicodeString(deviceSddl, buffer);
+}
+
 NTSTATUS
 DriverEntry(
     _In_ PDRIVER_OBJECT driverObject,
@@ -955,7 +1047,8 @@ DriverEntry(
 {
     NTSTATUS status;
     UNICODE_STRING deviceName;
-    DECLARE_CONST_UNICODE_STRING(deviceSddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)");
+    UNICODE_STRING deviceSddl;
+    WCHAR deviceSddlBuffer[256];
 
     UNREFERENCED_PARAMETER(registryPath);
 
@@ -971,6 +1064,11 @@ DriverEntry(
     gNextEventId = 1;
 
     RtlInitUnicodeString(&deviceName, PF_WFP_DEVICE_NAME);
+    PfWfpBuildDeviceSddl(
+        registryPath,
+        &deviceSddl,
+        deviceSddlBuffer,
+        ARRAYSIZE(deviceSddlBuffer));
     status = IoCreateDeviceSecure(
         driverObject,
         0,

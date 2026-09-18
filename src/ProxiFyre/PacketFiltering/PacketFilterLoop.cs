@@ -360,7 +360,14 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         lock (_outboundBypassSync)
         {
             _wfpPendingRedirects.TryRemove(flow, out _);
-            _wfpActiveRedirects.Add(flow);
+            if (_targetRedirectFlows.Contains(flow))
+            {
+                _wfpActiveRedirects.Add(flow);
+            }
+            else
+            {
+                _wfpActiveRedirects.Remove(flow);
+            }
         }
     }
 

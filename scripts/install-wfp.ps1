@@ -26,6 +26,9 @@ if (!(Test-Path -LiteralPath $sysPath)) {
     throw "Driver was not found: $sysPath. Run .\scripts\build-wfp.ps1 -Configuration $Configuration first."
 }
 
+$serviceRegistryPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$serviceName"
+$userSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+
 & sc.exe query $serviceName | Out-Null
 if ($LASTEXITCODE -ne 0) {
     & sc.exe create $serviceName type= kernel start= demand binPath= "$sysPath" DisplayName= "ProxiFyre WFP Classifier"
@@ -33,6 +36,9 @@ if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE
     }
 }
+
+Set-ItemProperty -Path $serviceRegistryPath -Name ImagePath -Value $sysPath -Force
+New-ItemProperty -Path $serviceRegistryPath -Name ClientSid -PropertyType String -Value $userSid -Force | Out-Null
 
 & sc.exe start $serviceName
 if ($LASTEXITCODE -ne 0) {

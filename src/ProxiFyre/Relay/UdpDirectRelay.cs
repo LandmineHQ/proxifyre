@@ -212,10 +212,13 @@ internal sealed class UdpDirectRelay : IDisposable
         IPAddress remoteAddress,
         ushort remotePort)
     {
+        long generation = 0;
+        var registered = false;
         try
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            var generation = Register(key, target);
+            generation = Register(key, target);
+            registered = true;
             if (!_sockets.ContainsKey(key) && _sockets.Count >= MaxFlows)
             {
                 throw new InvalidOperationException("UDP relay flow limit reached.");
@@ -245,7 +248,10 @@ internal sealed class UdpDirectRelay : IDisposable
         }
         catch (Exception)
         {
-            RemoveIfNoSocket(key, target, generation);
+            if (registered)
+            {
+                RemoveIfNoSocket(key, target, generation);
+            }
             throw;
         }
     }
