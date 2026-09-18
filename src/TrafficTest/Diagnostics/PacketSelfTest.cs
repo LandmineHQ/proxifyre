@@ -15,6 +15,7 @@ internal static class PacketSelfTest
             TestTcpOptionsAndUrgentPointer();
             TestIpv4FragmentReassembly();
             TestIpv6FragmentReassembly();
+            TestOutboundPassFlowRegistry();
             Console.WriteLine("PASS: packet parsing, VLAN, TCP fields, and fragment reassembly.");
             return 0;
         }
@@ -173,6 +174,53 @@ internal static class PacketSelfTest
         Assert(result is not null, "IPv6 fragments were not reassembled.");
         Assert(PacketView.TryParse(result!.Frame, result.Length, out var view), "Reassembled IPv6 packet did not parse.");
         Assert(view.UdpPayload.SequenceEqual(payload), "Reassembled IPv6 UDP payload mismatch.");
+    }
+
+    private static void TestOutboundPassFlowRegistry()
+    {
+        var registry = new OutboundPassFlowRegistry(maxFlows: 2, ttl: TimeSpan.FromSeconds(10));
+        var first = new RelayOutboundFlow(
+            IntPtr.Zero,
+            PacketView.ProtocolUdp,
+            IPAddress.Loopback,
+            IPAddress.Parse("198.51.100.30"),
+            1000,
+            2000);
+        var second = new RelayOutboundFlow(
+            IntPtr.Zero,
+            PacketView.ProtocolUdp,
+            IPAddress.Loopback,
+            IPAddress.Parse("198.51.100.31"),
+            1001,
+            2001);
+        var third = new RelayOutboundFlow(
+            IntPtr.Zero,
+            PacketView.ProtocolTcp,
+            IPAddress.Loopback,
+            IPAddress.Parse("198.51.100.32"),
+            1002,
+            2002);
+
+        var now = DateTimeOffset.UnixEpoch;
+        registry.Register(first, now);
+        registry.Register(second, now.AddSeconds(1));
+        registry.Register(third, now.AddSeconds(2));
+        registry.Register(second, now.AddSeconds(6));
+        Assert(registry.Count == 2, "Outbound pass flow registry exceeded its capacity.");
+        Assert(
+            registry.Snapshot().All(flow => !flow.Equals(first)),
+            "Outbound pass flow registry did not evict the oldest flow.");
+        Assert(
+            registry.RemoveExpired(now.AddSeconds(13)),
+            "Outbound pass flow registry did not expire stale flows.");
+        Assert(registry.Count == 1, "Outbound pass flow registry removed a refreshed flow.");
+        Assert(
+            registry.Snapshot().Single().Equals(second),
+            "Outbound pass flow registry retained the wrong flow after expiry.");
+        Assert(
+            registry.RemoveExpired(now.AddSeconds(17)),
+            "Outbound pass flow registry did not expire the refreshed flow.");
+        Assert(registry.Count == 0, "Outbound pass flow registry retained expired flows.");
     }
 
     private static byte[] BuildIpv4Packet(

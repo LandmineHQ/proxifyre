@@ -140,6 +140,11 @@ Important behavior:
   the Windows stack so process attribution remains available.
 - Relay-created outbound socket flows are registered in a WinpkFilter static
   pass table, preventing the relay from recursively intercepting itself.
+- Non-target TCP/UDP flows are classified from their first user-mode packet and
+  then registered in the same kernel pass table with a bounded five-second TTL.
+  Subsequent packets for those flows stay in the kernel; target flows remain
+  tunneled and use the direct relay. A one-second maintenance wake handles TTL
+  expiry even when no other packet reaches user mode.
 - TCP interception starts on a SYN-only packet. The first packet passes
   normally when Windows has not yet published an owning process.
 - TCP uses per-connection random initial sequence numbers, an MSS-bearing
@@ -237,7 +242,8 @@ one packet per call.
 
 | Path | Responsibility |
 | --- | --- |
-| `PacketFilterLoop.cs` | Central packet-processing loop. Configures adapters, watches WinpkFilter events, parses or reassembles packets, classifies outgoing TCP/UDP, performs process matching, redirects flows, injects synthetic TCP/UDP/ICMP responses, fragments oversized UDP output, manages bypass filters, handles the fake-IP DNS path, computes checksums, and logs throttled diagnostics. |
+| `PacketFilterLoop.cs` | Central packet-processing loop. Configures adapters, watches WinpkFilter events, parses or reassembles packets, classifies outgoing TCP/UDP, performs process matching, redirects target flows, registers expiring kernel pass flows for classified non-target traffic, injects synthetic TCP/UDP/ICMP responses, fragments oversized UDP output, manages bypass filters, handles the fake-IP DNS path, computes checksums, and logs throttled diagnostics. |
+| `OutboundPassFlowRegistry.cs` | Stores dynamically classified non-target flow keys with a bounded capacity and TTL, evicting the oldest key when full and returning expired entries for kernel filter-table removal. |
 | `IpFragmentReassembler.cs` | Reassembles IPv4/IPv6 outgoing fragments with VLAN metadata, per-assembly limits, duplicate detection, overlap validation, and original-fragment preservation for transparent pass-through. |
 | `PacketView.cs` | Zero-copy-ish `ref struct` over an Ethernet or VLAN-tagged frame. Parses IPv4/IPv6, skips supported IPv6 extension headers, exposes addresses, ports, TCP options/urgent pointer, UDP declared length, and payload spans. |
 | `PacketWakeSignal.cs` | Auto-reset event used by relay sockets to wake the packet loop after traffic counters or injected packets change. |
@@ -340,7 +346,7 @@ loop.
 | `Curl/CurlTest.cs` | Runs system `curl.exe` without proxy environment variables and considers a 2xx response successful. |
 | `Diagnostics/ProcessNetworkDiagnostic.cs` | Samples process TCP listeners, UDP endpoints, and TCP connections; supports text and JSON output. |
 | `Diagnostics/TrafficTelemetryDiagnostic.cs` | Starts a telemetry server and client, sends three snapshots, and verifies delivery without WinpkFilter or Administrator rights. |
-| `Diagnostics/PacketSelfTest.cs` | Driver-free parser, VLAN, TCP option/URG, UDP declared-length, and IPv4/IPv6 fragment reassembly checks. |
+| `Diagnostics/PacketSelfTest.cs` | Driver-free parser, VLAN, TCP option/URG, UDP declared-length, IPv4/IPv6 fragment reassembly, and outbound pass-flow registry capacity/TTL checks. |
 | `Diagnostics/TcpRelaySelfTest.cs` | Driver-free loopback validation for TCP handshake, zero-window flow control, retransmission, bidirectional data, and the client FIN transition. |
 | `Diagnostics/UdpRelaySelfTest.cs` | Driver-free loopback validation for UDP forwarding and alternate response endpoint preservation. |
 | `Diagnostics/WindowsNetworkTable.cs` | Reads IPv4/IPv6 TCP and UDP owner tables from `iphlpapi.dll` for diagnostics. |

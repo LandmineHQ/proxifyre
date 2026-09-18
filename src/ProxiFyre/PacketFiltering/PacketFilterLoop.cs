@@ -9,6 +9,10 @@ namespace ProxiFyre;
 
 internal sealed unsafe class PacketFilterLoop : IDisposable
 {
+    private const int MaxTemporaryPassFlows = 4096;
+    private static readonly TimeSpan TemporaryPassFlowTtl = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan OutboundFilterApplyInterval = TimeSpan.FromMilliseconds(50);
+
     private readonly DynamicAppConfiguration _configuration;
     private readonly TcpDirectRelay _tcpRelay;
     private readonly UdpDirectRelay _udpRelay;
@@ -24,6 +28,10 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
     private readonly ConcurrentDictionary<string, DateTimeOffset> _detailLogTimes = new();
     private readonly object _outboundBypassSync = new();
     private readonly Dictionary<RelayOutboundFlow, int> _outboundBypassFlows = [];
+    private readonly OutboundPassFlowRegistry _temporaryPassFlows =
+        new(MaxTemporaryPassFlows, TemporaryPassFlowTtl);
+    private bool _outboundFilterTableDirty;
+    private DateTimeOffset _lastOutboundFilterApply;
     private DateTimeOffset _lastPacketStatsLog;
     private long _packetsRead;
     private long _packetsPassed;
@@ -63,6 +71,11 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         ConfigureAdapters();
 
         using var packetEvent = new ManualResetEvent(false);
+        using var passFlowMaintenanceTimer = new Timer(
+            static state => ((PacketWakeSignal)state!).Pulse(),
+            _wakeSignal,
+            TimeSpan.FromSeconds(1),
+            TimeSpan.FromSeconds(1));
         WaitHandle[] waitHandles = [packetEvent, _wakeSignal.WaitHandle, cancellationToken.WaitHandle];
         try
         {
@@ -253,8 +266,10 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             return;
         }
 
-        var filters = new List<NdisApi.StaticFilter>(_outboundBypassFlows.Count * Math.Max(_adapters.Count, 1));
-        foreach (var flow in _outboundBypassFlows.Keys)
+        var passFlows = new HashSet<RelayOutboundFlow>(_outboundBypassFlows.Keys);
+        passFlows.UnionWith(_temporaryPassFlows.Snapshot());
+        var filters = new List<NdisApi.StaticFilter>(passFlows.Count * Math.Max(_adapters.Count, 1));
+        foreach (var flow in passFlows)
         {
             if (flow.Dot1q != 0)
             {
@@ -283,11 +298,69 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 "set-static-filter-failed",
                 TimeSpan.FromSeconds(2));
         }
+
+        _outboundFilterTableDirty = false;
+        _lastOutboundFilterApply = _timeProvider.GetUtcNow();
+    }
+
+    private void RegisterTemporaryPassFlow(PacketView packet, IntPtr adapterHandle, uint dot1q)
+    {
+        if (dot1q != 0 || packet.IsLinkLayerBroadcastOrMulticast())
+        {
+            return;
+        }
+
+        var flow = new RelayOutboundFlow(
+            adapterHandle,
+            packet.IsTcp ? PacketView.ProtocolTcp : PacketView.ProtocolUdp,
+            packet.SourceAddress,
+            packet.DestinationAddress,
+            packet.SourcePort,
+            packet.DestinationPort,
+            dot1q);
+        var now = _timeProvider.GetUtcNow();
+        lock (_outboundBypassSync)
+        {
+            _temporaryPassFlows.Register(flow, now);
+            _outboundFilterTableDirty = true;
+        }
+
+        LogDetail(
+            $"Temporary kernel pass flow registered: {flow}",
+            $"temporary-pass-register:{flow}",
+            TimeSpan.FromSeconds(5));
+    }
+
+    private void FlushOutboundFilterTable()
+    {
+        if (_driverHandle == IntPtr.Zero)
+        {
+            return;
+        }
+
+        lock (_outboundBypassSync)
+        {
+            var now = _timeProvider.GetUtcNow();
+            if (_temporaryPassFlows.RemoveExpired(now))
+            {
+                _outboundFilterTableDirty = true;
+            }
+
+            if (!_outboundFilterTableDirty
+                || (_lastOutboundFilterApply != default
+                    && now - _lastOutboundFilterApply < OutboundFilterApplyInterval))
+            {
+                return;
+            }
+
+            ApplyOutboundBypassFilters();
+        }
     }
 
     private bool TryReadAndProcessPacket()
     {
         _fragmentReassembler.FlushExpired(SendCapturedFragmentToAdapter);
+        FlushOutboundFilterTable();
 
         foreach (var adapter in _adapters)
         {
@@ -482,17 +555,20 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
 
         if (!packet.IsInitialSyn)
         {
+            RegisterTemporaryPassFlow(packet, adapterHandle, dot1q);
             return false;
         }
 
         if (packet.TcpPayloadLength > 0)
         {
             _tcpRelay.MarkBypassedFlow(relayKey);
+            RegisterTemporaryPassFlow(packet, adapterHandle, dot1q);
             return false;
         }
 
         if (_tcpRelay.IsBypassedFlow(relayKey))
         {
+            RegisterTemporaryPassFlow(packet, adapterHandle, dot1q);
             return false;
         }
 
@@ -500,11 +576,13 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         if (process is null)
         {
             _tcpRelay.MarkBypassedFlow(relayKey);
+            RegisterTemporaryPassFlow(packet, adapterHandle, dot1q);
             return false;
         }
 
         if (!_configuration.Current.TryGetMatchingPattern(process, out var matchedPattern, out _))
         {
+            RegisterTemporaryPassFlow(packet, adapterHandle, dot1q);
             return false;
         }
 
@@ -680,6 +758,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                     TimeSpan.FromSeconds(5));
             }
 
+            RegisterTemporaryPassFlow(packet, adapterHandle, dot1q);
             return false;
         }
 
@@ -693,6 +772,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                     TimeSpan.FromSeconds(5));
             }
 
+            RegisterTemporaryPassFlow(packet, adapterHandle, dot1q);
             return false;
         }
 
@@ -1677,7 +1757,13 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         }
 
         _lastPacketStatsLog = now;
-        _log($"Packet stats: read={_packetsRead}, passed={_packetsPassed}, redirected={_packetsRedirected}");
+        int kernelPassFlows;
+        lock (_outboundBypassSync)
+        {
+            kernelPassFlows = _outboundBypassFlows.Count + _temporaryPassFlows.Count;
+        }
+
+        _log($"Packet stats: read={_packetsRead}, passed={_packetsPassed}, redirected={_packetsRedirected}, kernelPassFlows={kernelPassFlows}");
     }
 
     private void LogDetail(string message, string key, TimeSpan interval)

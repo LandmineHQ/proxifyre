@@ -32,6 +32,7 @@
     <Compile Include="..\ProxiFyre\PacketFiltering\PacketView.cs" Link="PacketFiltering\PacketView.cs" />
     <Compile Include="..\ProxiFyre\PacketFiltering\PacketWakeSignal.cs" Link="PacketFiltering\PacketWakeSignal.cs" />
     <Compile Include="..\ProxiFyre\PacketFiltering\IpFragmentReassembler.cs" Link="PacketFiltering\IpFragmentReassembler.cs" />
+    <Compile Include="..\ProxiFyre\PacketFiltering\OutboundPassFlowRegistry.cs" Link="PacketFiltering\OutboundPassFlowRegistry.cs" />
     <Compile Include="..\ProxiFyre\Process\ProcessLookup.cs" Link="Process\ProcessLookup.cs" />
     <Compile Include="..\ProxiFyre\Process\ProcessMatcher.cs" Link="Process\ProcessMatcher.cs" />
     <Compile Include="..\ProxiFyre\Relay\RelayService.cs" Link="Relay\RelayService.cs" />
