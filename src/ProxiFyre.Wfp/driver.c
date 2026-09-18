@@ -855,12 +855,36 @@ PfWfpUnload(_In_ PDRIVER_OBJECT driverObject)
 
     if (gCalloutIdV4 != 0)
     {
-        FwpsCalloutUnregisterById0(gCalloutIdV4);
+        for (UINT32 attempt = 0; attempt < 10; ++attempt)
+        {
+            NTSTATUS unregisterStatus = FwpsCalloutUnregisterById0(gCalloutIdV4);
+            if (NT_SUCCESS(unregisterStatus)
+                || unregisterStatus == STATUS_FWP_CALLOUT_NOT_FOUND)
+            {
+                break;
+            }
+
+            LARGE_INTEGER delay;
+            delay.QuadPart = -100000LL;
+            KeDelayExecutionThread(KernelMode, FALSE, &delay);
+        }
         gCalloutIdV4 = 0;
     }
     if (gCalloutIdV6 != 0)
     {
-        FwpsCalloutUnregisterById0(gCalloutIdV6);
+        for (UINT32 attempt = 0; attempt < 10; ++attempt)
+        {
+            NTSTATUS unregisterStatus = FwpsCalloutUnregisterById0(gCalloutIdV6);
+            if (NT_SUCCESS(unregisterStatus)
+                || unregisterStatus == STATUS_FWP_CALLOUT_NOT_FOUND)
+            {
+                break;
+            }
+
+            LARGE_INTEGER delay;
+            delay.QuadPart = -100000LL;
+            KeDelayExecutionThread(KernelMode, FALSE, &delay);
+        }
         gCalloutIdV6 = 0;
     }
 
