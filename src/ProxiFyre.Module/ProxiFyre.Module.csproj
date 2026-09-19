@@ -31,6 +31,11 @@
     <Compile Include="..\ProxiFyre\Network\TlsSniParser.cs" Link="Network\TlsSniParser.cs" />
     <Compile Include="..\ProxiFyre\Network\WfpFlowClassifier.cs" Link="Network\WfpFlowClassifier.cs" />
     <Compile Include="..\ProxiFyre\Network\WfpProtocol.cs" Link="Network\WfpProtocol.cs" />
+    <Compile Include="..\ProxiFyre\PacketFiltering\AdapterPipeline.cs" Link="PacketFiltering\AdapterPipeline.cs" />
+    <Compile Include="..\ProxiFyre\PacketFiltering\AdapterPipelineSet.cs" Link="PacketFiltering\AdapterPipelineSet.cs" />
+    <Compile Include="..\ProxiFyre\PacketFiltering\DnsSpoofHandler.cs" Link="PacketFiltering\DnsSpoofHandler.cs" />
+    <Compile Include="..\ProxiFyre\PacketFiltering\OutboundFilterController.cs" Link="PacketFiltering\OutboundFilterController.cs" />
+    <Compile Include="..\ProxiFyre\PacketFiltering\PacketInjector.cs" Link="PacketFiltering\PacketInjector.cs" />
     <Compile Include="..\ProxiFyre\PacketFiltering\PacketFilterLoop.cs" Link="PacketFiltering\PacketFilterLoop.cs" />
     <Compile Include="..\ProxiFyre\PacketFiltering\PacketView.cs" Link="PacketFiltering\PacketView.cs" />
     <Compile Include="..\ProxiFyre\PacketFiltering\PacketWakeSignal.cs" Link="PacketFiltering\PacketWakeSignal.cs" />

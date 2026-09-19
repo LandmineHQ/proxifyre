@@ -119,17 +119,6 @@ internal sealed class AppConfiguration
             }
         }
 
-        if (root.TryGetProperty("proxies", out var proxiesElement) && proxiesElement.ValueKind == JsonValueKind.Array)
-        {
-            foreach (var proxy in proxiesElement.EnumerateArray())
-            {
-                if (proxy.TryGetProperty("appNames", out var appNamesElement) && appNamesElement.ValueKind == JsonValueKind.Array)
-                {
-                    AddStrings(apps, appNamesElement);
-                }
-            }
-        }
-
         var enabledApps = apps
             .Select(app => app.Trim())
             .Where(app => app.Length > 0)
@@ -165,16 +154,7 @@ internal sealed class AppConfiguration
             Apps = ["chrome.exe", @"C:\Program Files\SomeApp\SomeApp.exe", @"C:\Games\SomeGame\"],
             DisabledApps = [],
             EnableUuWhitelistPatch = false,
-            ModuleDllName = "ProxiFyre.Module.dll",
-            Proxies =
-            [
-                new SampleProxy
-                {
-                    AppNames = ["firefox.exe"],
-                    SupportedProtocols = ["TCP"],
-                    Mode = "direct"
-                }
-            ]
+            ModuleDllName = "ProxiFyre.Module.dll"
         };
 
         File.WriteAllText(path, JsonSerializer.Serialize(sample, AppConfigurationJsonContext.Default.SampleConfiguration));
@@ -289,20 +269,6 @@ internal sealed class AppConfiguration
         [JsonPropertyName("moduleDllName")]
         public string? ModuleDllName { get; init; }
 
-        [JsonPropertyName("proxies")]
-        public required List<SampleProxy> Proxies { get; init; }
-    }
-
-    internal sealed class SampleProxy
-    {
-        [JsonPropertyName("appNames")]
-        public required List<string> AppNames { get; init; }
-
-        [JsonPropertyName("mode")]
-        public required string Mode { get; init; }
-
-        [JsonPropertyName("supportedProtocols")]
-        public required List<string> SupportedProtocols { get; init; }
     }
 
     internal sealed class SimpleConfiguration

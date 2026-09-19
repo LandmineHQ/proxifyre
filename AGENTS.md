@@ -23,12 +23,23 @@
 - Do not add local TCP or UDP listeners for direct relay. Preserve outbound
   bypass filters that prevent recursive interception and exclude the configured
   core process from relay matching.
-- Do not enable WinpkFilter fragment cache or static PASS-table churn in legacy
-  send-tunnel mode. Kernel static filters are reserved for the WFP target-only
-  path, which has explicit target flow ownership.
+- Do not enable WinpkFilter fragment cache or static PASS-table churn in the
+  userspace send-tunnel fallback. Kernel static filters are reserved for the WFP
+  target-only path, which has explicit target flow ownership.
 - Keep UDP relay sockets pinned to the captured adapter interface index. A UDP
   flow must not rely on the OS default route when multiple physical, tunnel, or
   virtual adapters are present.
+- Keep packet draining bounded so sustained traffic cannot starve health,
+  cancellation, or adapter revalidation. Bound batches by both packet count and
+  elapsed time, service adapters round-robin, and run the packet loop on a
+  dedicated long-running thread. Re-enumerate and rebind adapters if the
+  WinpkFilter adapter set changes during a relay session. Preserve the
+  independent packet-loop watchdog so a stalled stage is visible in logs.
+- Keep `PacketFilterLoop` as the lifecycle and relay-decision coordinator.
+  Per-adapter reads belong in `AdapterPipelineSet`/`AdapterPipeline`, outbound
+  filter state belongs in `OutboundFilterController`, packet construction
+  belongs in `PacketInjector`, and fake-IP DNS handling belongs in
+  `DnsSpoofHandler`.
 - Keep `src/ProxiFyre.Probe` diagnostic-only. Production relay behavior belongs
   in the shared relay core and `src/ProxiFyre.Module`.
 - Keep telemetry optional and non-blocking. Relay behavior must remain correct

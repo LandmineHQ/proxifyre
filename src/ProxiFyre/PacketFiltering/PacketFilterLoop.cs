@@ -2,20 +2,18 @@ using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Buffers.Binary;
-using System.Security.Cryptography;
 using System.Collections.Concurrent;
 
 namespace ProxiFyre;
 
-internal sealed unsafe class PacketFilterLoop : IDisposable
+internal sealed unsafe class PacketFilterLoop : IDisposable, IAdapterPacketProcessor
 {
-    private const int MaxTemporaryPassFlows = 1024;
-    private const int MaxTargetRedirectFlows = 12288;
     private const int MaxTcpRelayConnections = 4096;
-    private static readonly TimeSpan TemporaryPassFlowTtl = TimeSpan.FromSeconds(1);
-    private static readonly TimeSpan OutboundFilterApplyInterval = TimeSpan.FromMilliseconds(50);
-    private static readonly TimeSpan TemporaryPassCleanupInterval = TimeSpan.FromMilliseconds(500);
-    private static readonly TimeSpan OutboundFilterRetryInterval = TimeSpan.FromSeconds(1);
+    private const int MaxPacketsPerDrainBatch = 4096;
+    private const int WatchdogIntervalMs = 5000;
+    private const int WatchdogStallThresholdMs = 30000;
+    private static readonly TimeSpan MaxDrainBatchDuration = TimeSpan.FromMilliseconds(10);
+    private static readonly TimeSpan AdapterValidationInterval = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan PassFlowMaintenanceInterval = TimeSpan.FromMilliseconds(500);
     private static readonly TimeSpan PendingRedirectTtl = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan HealthLogInterval = TimeSpan.FromSeconds(30);
@@ -26,42 +24,34 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
     private readonly PacketWakeSignal _wakeSignal;
     private readonly ProcessLookup _processLookup;
     private readonly IpFragmentReassembler _fragmentReassembler;
-    private readonly HashSet<IntPtr> _adapters = [];
-    private readonly Dictionary<IntPtr, string> _adapterNames = [];
-    private readonly Dictionary<IntPtr, int> _adapterMtus = [];
-    private readonly Dictionary<IntPtr, int> _adapterInterfaceIndices = [];
+    private readonly OutboundFilterController _outboundFilters;
+    private readonly PacketInjector _packetInjector;
+    private readonly DnsSpoofHandler _dnsSpoofHandler;
+    private AdapterPipelineSet? _adapterPipelines;
     private readonly Action<string> _log;
     private readonly bool _detailedLogging;
-    private bool _useWfpClassifier;
+    private readonly bool _requestWfpClassifier;
     private readonly TimeProvider _timeProvider;
     private readonly ConcurrentDictionary<string, DateTimeOffset> _detailLogTimes = new();
-    private readonly object _outboundBypassSync = new();
-    private readonly Dictionary<RelayOutboundFlow, int> _outboundBypassFlows = [];
-    private readonly OutboundPassFlowRegistry _targetRedirectFlows =
-        new(MaxTargetRedirectFlows, TimeSpan.FromMinutes(10));
-    private readonly ConcurrentDictionary<RelayOutboundFlow, ProcessInfo> _wfpProcessByFlow = new();
-    private readonly ConcurrentDictionary<RelayOutboundFlow, DateTimeOffset> _wfpPendingRedirects = new();
-    private readonly HashSet<RelayOutboundFlow> _wfpActiveRedirects = [];
-    private readonly OutboundPassFlowRegistry _temporaryPassFlows =
-        new(MaxTemporaryPassFlows, TemporaryPassFlowTtl);
-    private bool _outboundFilterTableDirty;
-    private bool _forceOutboundFilterApply;
-    private DateTimeOffset _lastOutboundFilterApply;
-    private DateTimeOffset _nextOutboundFilterRetry;
-    private DateTimeOffset _nextTemporaryPassCleanup;
-    private long _lastConfigurationGeneration;
-    private bool _fragmentCacheEnabled;
     private DateTimeOffset _lastPacketStatsLog;
     private DateTimeOffset _nextHealthLog;
     private long _packetsRead;
     private long _packetsPassed;
     private long _packetsRedirected;
+    private long _lastHealthQueueTotal;
+    private uint _lastHealthQueueMax;
+    private string? _lastHealthQueueMaxName;
     private long _adapterSendSucceeded;
     private long _adapterSendFailed;
-    private long _mstcpSendSucceeded;
-    private long _mstcpSendFailed;
-    private long _filterApplyFailures;
+    private long _mstcpPassSucceeded;
+    private long _mstcpPassFailed;
     private IntPtr _driverHandle;
+    private ManualResetEvent? _packetEvent;
+    private DateTimeOffset _nextAdapterValidation;
+    private long _lastProgressTimestamp;
+    private long _stallReported;
+    private long _stallDetectedTimestamp;
+    private string _currentStage = "initializing";
     private CancellationToken _cancellationToken;
     private bool _disposed;
     private readonly TaskCompletionSource<bool> _started =
@@ -69,7 +59,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
 
     public Task Started => _started.Task;
 
-    public bool WfpModeActive => _useWfpClassifier;
+    public bool WfpModeActive => _outboundFilters.UseWfpClassifier;
 
     public PacketFilterLoop(
         DynamicAppConfiguration configuration,
@@ -87,58 +77,91 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         _wakeSignal = wakeSignal;
         _log = log ?? Console.WriteLine;
         _detailedLogging = detailedLogging;
-        _useWfpClassifier = useWfpClassifier;
+        _requestWfpClassifier = useWfpClassifier;
         _timeProvider = timeProvider ?? TimeProvider.System;
         _processLookup = new ProcessLookup(timeProvider: _timeProvider);
         _fragmentReassembler = new IpFragmentReassembler(_timeProvider);
-        _lastConfigurationGeneration = _configuration.Generation;
-        _tcpRelay.SetPacketInjector(InjectTcpSegmentToClient);
-        _udpRelay.SetResponseInjector(InjectUdpResponseToClient);
+        _outboundFilters = new OutboundFilterController(
+            () => _driverHandle,
+            () => _adapterPipelines,
+            () => _configuration.Generation,
+            wakeSignal,
+            LogDetail,
+            LogThrottled,
+            _timeProvider);
+        _packetInjector = new PacketInjector(
+            () => _driverHandle,
+            () => _adapterPipelines,
+            LogDetail);
+        _dnsSpoofHandler = new DnsSpoofHandler(
+            _configuration,
+            _processLookup,
+            _packetInjector,
+            () => _adapterPipelines,
+            _log,
+            _timeProvider);
+        _tcpRelay.SetPacketInjector(_packetInjector.InjectTcpSegmentToClient);
+        _udpRelay.SetResponseInjector(_packetInjector.InjectUdpResponseToClient);
         _udpRelay.SetResponseValidator(IsUdpTargetCurrent);
-        _udpRelay.SetErrorInjector(InjectUdpErrorToClient);
-        _tcpRelay.SetOutboundBypass(RegisterOutboundBypass, UnregisterOutboundBypass);
-        _udpRelay.SetOutboundBypass(RegisterOutboundBypass, UnregisterOutboundBypass);
-        _tcpRelay.SetTargetRedirectUnregister(UnregisterTargetRedirect);
-        _udpRelay.SetTargetRedirectUnregister(UnregisterTargetRedirect);
+        _udpRelay.SetErrorInjector(_packetInjector.InjectUdpErrorToClient);
+        _tcpRelay.SetOutboundBypass(
+            _outboundFilters.RegisterOutboundBypass,
+            _outboundFilters.UnregisterOutboundBypass);
+        _udpRelay.SetOutboundBypass(
+            _outboundFilters.RegisterOutboundBypass,
+            _outboundFilters.UnregisterOutboundBypass);
+        _tcpRelay.SetTargetRedirectUnregister(_outboundFilters.UnregisterTargetRedirect);
+        _udpRelay.SetTargetRedirectUnregister(_outboundFilters.UnregisterTargetRedirect);
     }
 
     public Task RunAsync(CancellationToken cancellationToken)
     {
-        return Task.Run(() => Run(cancellationToken), cancellationToken);
+        return Task.Factory.StartNew(
+            () => Run(cancellationToken),
+            cancellationToken,
+            TaskCreationOptions.LongRunning,
+            TaskScheduler.Default);
     }
 
     private void Run(CancellationToken cancellationToken)
     {
         _cancellationToken = cancellationToken;
         OpenDriver();
+        _adapterPipelines = new AdapterPipelineSet(_driverHandle, _log);
         ConfigureAdapters();
         _started.TrySetResult(true);
 
         using var packetEvent = new ManualResetEvent(false);
+        _packetEvent = packetEvent;
         using var passFlowMaintenanceTimer = new Timer(
             static state => ((PacketWakeSignal)state!).Pulse(),
             _wakeSignal,
             PassFlowMaintenanceInterval,
             PassFlowMaintenanceInterval);
+        using var watchdogTimer = new Timer(
+            static state => ((PacketFilterLoop)state!).WatchdogTick(),
+            this,
+            WatchdogIntervalMs,
+            WatchdogIntervalMs);
         WaitHandle[] waitHandles = [packetEvent, _wakeSignal.WaitHandle, cancellationToken.WaitHandle];
         try
         {
-            foreach (var adapter in _adapters)
-            {
-                NdisApi.SetPacketEvent(_driverHandle, adapter, packetEvent.SafeWaitHandle);
-            }
+            _adapterPipelines.BindPacketEvent(packetEvent.SafeWaitHandle);
 
             _log("Packet filter started.");
             LogHealth(force: true);
+            MarkProgress();
 
             while (!cancellationToken.IsCancellationRequested)
             {
+                SetStage("waiting-for-event");
                 var signaledIndex = WaitHandle.WaitAny(waitHandles);
                 if (signaledIndex == 2)
                 {
                     break;
                 }
 
+                MarkProgress();
                 var driverSignaled = signaledIndex == 0;
                 if (driverSignaled)
                 {
@@ -147,18 +170,31 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
 
                 bool drainedAny;
                 var drainedCount = 0;
+                var batchStartedAt = _timeProvider.GetTimestamp();
                 do
                 {
                     cancellationToken.ThrowIfCancellationRequested();
+                    SetStage("reading-adapters");
                     drainedAny = TryReadAndProcessPacket();
                     if (drainedAny)
                     {
                         drainedCount++;
                     }
+
+                    if (drainedCount >= MaxPacketsPerDrainBatch
+                        || _timeProvider.GetElapsedTime(batchStartedAt) >= MaxDrainBatchDuration)
+                    {
+                        packetEvent.Set();
+                        break;
+                    }
                 }
                 while (drainedAny);
 
+                SetStage("validating-adapters");
+                ValidateAdapters();
+                SetStage("logging-health");
                 LogHealth();
+                MarkProgress();
 
                 if (driverSignaled && drainedCount == 0)
                 {
@@ -171,50 +207,46 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         }
         finally
         {
-            RestoreAdapterState();
+            _packetEvent = null;
+            _adapterPipelines?.Restore();
         }
     }
 
-    private void RestoreAdapterState()
+    private void SetStage(string stage)
     {
-        if (_driverHandle == IntPtr.Zero)
+        Volatile.Write(ref _currentStage, stage);
+    }
+
+    private void MarkProgress()
+    {
+        Interlocked.Exchange(ref _lastProgressTimestamp, Environment.TickCount64);
+        var wasStalled = Interlocked.Exchange(ref _stallReported, 0);
+        if (wasStalled != 0)
+        {
+            var detectedAt = Interlocked.Read(ref _stallDetectedTimestamp);
+            var elapsed = Math.Max(0, Environment.TickCount64 - detectedAt);
+            _log($"Packet loop watchdog: progress resumed after {elapsed} ms; stage={Volatile.Read(ref _currentStage)}.");
+        }
+    }
+
+    private void WatchdogTick()
+    {
+        var lastProgress = Interlocked.Read(ref _lastProgressTimestamp);
+        if (lastProgress == 0)
         {
             return;
         }
 
-        var adapters = new HashSet<IntPtr>(_adapters);
-        var adapterList = new NdisApi.TcpAdapterList();
-        if (NdisApi.GetTcpipBoundAdaptersInfo(_driverHandle, ref adapterList))
+        var elapsed = Environment.TickCount64 - lastProgress;
+        if (elapsed < WatchdogStallThresholdMs
+            || Interlocked.Exchange(ref _stallReported, 1) != 0)
         {
-            for (var i = 0; i < adapterList.Count; i++)
-            {
-                var adapter = adapterList.GetHandle(i);
-                if (adapter != IntPtr.Zero)
-                {
-                    adapters.Add(adapter);
-                }
-            }
+            return;
         }
 
-        NdisApi.ResetPacketFilterTable(_driverHandle);
-        foreach (var adapter in adapters)
-        {
-            if (!NdisApi.SetPacketEvent(_driverHandle, adapter, IntPtr.Zero))
-            {
-                _log($"Failed to clear packet event for adapter handle 0x{adapter.ToInt64():X}.");
-            }
-
-            var mode = new NdisApi.AdapterMode { AdapterHandle = adapter, Flags = 0 };
-            if (!NdisApi.SetAdapterMode(_driverHandle, ref mode))
-            {
-                _log($"Failed to restore normal mode for adapter handle 0x{adapter.ToInt64():X}.");
-            }
-
-            if (!NdisApi.FlushAdapterPacketQueue(_driverHandle, adapter))
-            {
-                _log($"Failed to flush adapter queue for adapter handle 0x{adapter.ToInt64():X}.");
-            }
-        }
+        Interlocked.Exchange(ref _stallDetectedTimestamp, Environment.TickCount64);
+        _log(
+            $"Packet loop watchdog: no progress for {elapsed} ms; stage={Volatile.Read(ref _currentStage)} read={_packetsRead} passed={_packetsPassed} redirected={_packetsRedirected} adapterQueueLast={_lastHealthQueueTotal} adapterQueueMaxLast={_lastHealthQueueMax} adapterQueueMaxNameLast={_lastHealthQueueMaxName ?? "none"}.");
     }
 
     private void OpenDriver()
@@ -233,198 +265,34 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
 
         _log($"WinpkFilter driver version: 0x{NdisApi.GetDriverVersion(_driverHandle):X8}");
         NdisApi.ResetPacketFilterTable(_driverHandle);
-        if (_useWfpClassifier)
+        if (_requestWfpClassifier)
         {
-            _fragmentCacheEnabled = NdisApi.SetPacketFragmentCacheState(_driverHandle, enabled: true);
-            _log(_fragmentCacheEnabled
+            var fragmentCacheEnabled = _outboundFilters.Initialize(requestWfpClassifier: true);
+            _log(fragmentCacheEnabled
                 ? "WinpkFilter fragment cache enabled for WFP target redirect flows."
                 : "WinpkFilter fragment cache is unavailable; WFP target-only mode cannot use kernel redirects.");
         }
         else
         {
-            _fragmentCacheEnabled = false;
-            NdisApi.SetPacketFragmentCacheState(_driverHandle, enabled: false);
-            _log("WinpkFilter fragment and kernel pass cache disabled in legacy send-tunnel mode.");
+            _ = _outboundFilters.Initialize(requestWfpClassifier: false);
+            _log("WinpkFilter fragment and kernel pass cache disabled in userspace send-tunnel mode.");
         }
     }
 
     private void ConfigureAdapters()
     {
-        if (_useWfpClassifier && !_fragmentCacheEnabled)
+        if (_outboundFilters.UseWfpClassifier && !_outboundFilters.FragmentCacheEnabled)
         {
-            _useWfpClassifier = false;
-            _fragmentCacheEnabled = false;
-            NdisApi.SetPacketFragmentCacheState(_driverHandle, enabled: false);
-            _log("WFP target-only mode disabled because WinpkFilter fragment cache is unavailable; using legacy send tunnel.");
+            _outboundFilters.DisableWfpFallback();
+            _log("WFP target-only mode disabled because WinpkFilter fragment cache is unavailable; using userspace send tunnel.");
         }
 
-        var adapterList = new NdisApi.TcpAdapterList();
-        if (!NdisApi.GetTcpipBoundAdaptersInfo(_driverHandle, ref adapterList))
-        {
-            throw new InvalidOperationException("Failed to enumerate TCP/IP bound adapters.");
-        }
-
-        for (var i = 0; i < adapterList.Count; i++)
-        {
-            var adapter = adapterList.GetHandle(i);
-            if (adapter == IntPtr.Zero)
-            {
-                continue;
-            }
-
-            _adapters.Add(adapter);
-            _adapterNames[adapter] = adapterList.GetName(i);
-            _adapterMtus[adapter] = adapterList.GetMtu(i) is > 0 and <= ushort.MaxValue
-                ? (int)adapterList.GetMtu(i)
-                : 1500;
-            var interfaceIndex = ResolveInterfaceIndex(
-                adapterList.GetName(i),
-                adapterList.GetMacAddress(i));
-            if (interfaceIndex > 0)
-            {
-                _adapterInterfaceIndices[adapter] = interfaceIndex;
-            }
-            else if (_useWfpClassifier)
-            {
-                _log(
-                    $"Could not resolve the Windows interface index for WinpkFilter adapter '{adapterList.GetName(i)}'; WFP flows on this adapter will pass through.");
-            }
-            var mode = new NdisApi.AdapterMode
-            {
-                AdapterHandle = adapter,
-                // Direct relay only needs to inspect app-originated packets. Keeping
-                // receive traffic on the normal stack preserves Windows traffic attribution.
-                Flags = _useWfpClassifier ? 0 : NdisApi.MstcpFlagSentTunnel
-            };
-
-            if (!NdisApi.SetAdapterMode(_driverHandle, ref mode))
-            {
-                _log($"Failed to set send tunnel mode for adapter handle 0x{adapter.ToInt64():X}.");
-            }
-        }
-
-        if (_adapters.Count == 0)
-        {
-            throw new InvalidOperationException("No TCP/IP adapters were returned by WinpkFilter.");
-        }
-
-        _log(
-            $"Filtering {_adapters.Count} adapter(s) on send path using {(_useWfpClassifier ? "WFP target-only mode" : "legacy send-tunnel mode without kernel pass cache")}: {string.Join(", ", _adapterNames.Values)}");
-    }
-
-    private static int ResolveInterfaceIndex(string adapterName, byte[] macAddress)
-    {
-        return NetworkInterfaceIndexResolver.FindAdapterIndex(adapterName, macAddress);
-    }
-
-    private void RegisterOutboundBypass(RelayOutboundFlow flow)
-    {
-        lock (_outboundBypassSync)
-        {
-            _outboundBypassFlows.TryGetValue(flow, out var count);
-            _outboundBypassFlows[flow] = count + 1;
-            if (_useWfpClassifier || _fragmentCacheEnabled)
-            {
-                _outboundFilterTableDirty = true;
-            }
-        }
-
-        _wakeSignal.Pulse();
-        LogDetail($"Registered relay outbound kernel pass flow: {flow}", $"relay-pass-register:{flow}", TimeSpan.FromSeconds(2));
-    }
-
-    internal bool RegisterTargetRedirect(
-        RelayOutboundFlow flow,
-        ProcessInfo process,
-        DateTimeOffset pendingDeadline)
-    {
-        if (!_useWfpClassifier || flow.AdapterHandle == IntPtr.Zero || flow.Dot1q != 0)
-        {
-            return false;
-        }
-
-        lock (_outboundBypassSync)
-        {
-            var existed = _targetRedirectFlows.Contains(flow);
-            if (!_targetRedirectFlows.TryAdd(flow, _timeProvider.GetUtcNow()))
-            {
-                LogThrottled(
-                    $"WFP target redirect flow limit reached ({MaxTargetRedirectFlows}); passing new target flow directly.",
-                    "wfp-target-limit",
-                    TimeSpan.FromSeconds(5));
-                return false;
-            }
-
-            _wfpProcessByFlow[flow] = process;
-            if (!_wfpActiveRedirects.Contains(flow))
-            {
-                _wfpPendingRedirects[flow] = pendingDeadline;
-            }
-            if (existed)
-            {
-                return true;
-            }
-
-            if (!ApplyTargetRedirectFilters())
-            {
-                RemoveTargetRedirectLocked(flow);
-                return false;
-            }
-        }
-
-        LogDetail(
-            $"Registered WFP target redirect flow: {flow}",
-            $"wfp-target-register:{flow}",
-            TimeSpan.FromSeconds(2));
-        return true;
-    }
-
-    internal void UnregisterTargetRedirect(RelayOutboundFlow flow)
-    {
-        var removed = false;
-        lock (_outboundBypassSync)
-        {
-            removed = RemoveTargetRedirectLocked(flow);
-        }
-
-        if (removed)
-        {
-            _wakeSignal.Pulse();
-        }
-    }
-
-    internal void RefreshTargetRedirect(RelayOutboundFlow flow)
-    {
-        lock (_outboundBypassSync)
-        {
-            if (_targetRedirectFlows.Count == 0)
-            {
-                return;
-            }
-
-            _ = _targetRedirectFlows.TryAdd(flow, _timeProvider.GetUtcNow());
-        }
-    }
-
-    internal void MarkTargetRedirectActive(RelayOutboundFlow flow)
-    {
-        lock (_outboundBypassSync)
-        {
-            _wfpPendingRedirects.TryRemove(flow, out _);
-            if (_targetRedirectFlows.Contains(flow))
-            {
-                _wfpActiveRedirects.Add(flow);
-            }
-            else
-            {
-                _wfpActiveRedirects.Remove(flow);
-            }
-        }
+        _adapterPipelines!.Configure(_outboundFilters.UseWfpClassifier);
     }
 
     internal bool HandleWfpFlow(WfpFlowEvent flowEvent)
     {
-        if (!_useWfpClassifier
+        if (!_outboundFilters.UseWfpClassifier
             || flowEvent.Protocol is not (PacketView.ProtocolTcp or PacketView.ProtocolUdp)
             || !TryResolveAdapterHandle(flowEvent.InterfaceIndex, out var adapterHandle)
             || CreateAddress(flowEvent.AddressFamily, flowEvent.LocalAddress) is not { } localAddress
@@ -447,7 +315,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             remoteAddress,
             flowEvent.LocalPort,
             flowEvent.RemotePort);
-        if (!RegisterTargetRedirect(
+        if (!_outboundFilters.RegisterTargetRedirect(
                 flow,
                 process,
                 _timeProvider.GetUtcNow() + PendingRedirectTtl))
@@ -464,20 +332,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
 
     private bool TryResolveAdapterHandle(uint interfaceIndex, out IntPtr adapterHandle)
     {
-        if (interfaceIndex > 0)
-        {
-            foreach (var pair in _adapterInterfaceIndices)
-            {
-                if (pair.Value == (int)interfaceIndex)
-                {
-                    adapterHandle = pair.Key;
-                    return true;
-                }
-            }
-        }
-
-        adapterHandle = IntPtr.Zero;
-        return false;
+        return _adapterPipelines!.TryResolveHandle((int)interfaceIndex, out adapterHandle);
     }
 
     private static IPAddress? CreateAddress(ushort addressFamily, byte[]? bytes)
@@ -515,371 +370,17 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             dot1q);
     }
 
-    private void UnregisterOutboundBypass(RelayOutboundFlow flow)
-    {
-        lock (_outboundBypassSync)
-        {
-            if (!_outboundBypassFlows.TryGetValue(flow, out var count))
-            {
-                return;
-            }
-
-            if (count <= 1)
-            {
-                _outboundBypassFlows.Remove(flow);
-            }
-            else
-            {
-                _outboundBypassFlows[flow] = count - 1;
-            }
-
-            if (_useWfpClassifier || _fragmentCacheEnabled)
-            {
-                _outboundFilterTableDirty = true;
-                _forceOutboundFilterApply = true;
-            }
-        }
-
-        _wakeSignal.Pulse();
-        LogDetail($"Unregistered relay outbound kernel pass flow: {flow}", $"relay-pass-unregister:{flow}", TimeSpan.FromSeconds(2));
-    }
-
-    private bool ApplyOutboundFilters()
-    {
-        if (_driverHandle == IntPtr.Zero)
-        {
-            return false;
-        }
-
-        return _useWfpClassifier
-            ? ApplyTargetRedirectFilters()
-            : ApplyLegacyPassFilters();
-    }
-
-    private bool ApplyTargetRedirectFilters()
-    {
-        if (!_fragmentCacheEnabled)
-        {
-            return false;
-        }
-
-        var filters = new List<NdisApi.StaticFilter>(_targetRedirectFlows.Count);
-        foreach (var flow in _targetRedirectFlows.Snapshot())
-        {
-            if (flow.AdapterHandle == IntPtr.Zero || flow.Dot1q != 0)
-            {
-                continue;
-            }
-
-            filters.Add(NdisApi.CreateOutboundRedirectFilter(
-                flow.AdapterHandle,
-                flow.Protocol,
-                flow.LocalAddress,
-                flow.RemoteAddress,
-                flow.LocalPort,
-                flow.RemotePort));
-        }
-
-        if (!NdisApi.SetPacketFilterTable(_driverHandle, filters))
-        {
-            _filterApplyFailures++;
-            LogThrottled(
-                $"SetPacketFilterTable failed for target redirect flows count={filters.Count} win32={NdisApi.LastWin32Error}",
-                "set-target-filter-failed",
-                TimeSpan.FromSeconds(2));
-            return false;
-        }
-
-        _outboundFilterTableDirty = false;
-        _forceOutboundFilterApply = false;
-        _lastOutboundFilterApply = _timeProvider.GetUtcNow();
-        _nextOutboundFilterRetry = default;
-        return true;
-    }
-
-    private bool ApplyLegacyPassFilters()
-    {
-        if (_driverHandle == IntPtr.Zero)
-        {
-            return false;
-        }
-
-        if (!_fragmentCacheEnabled)
-        {
-            if (NdisApi.ResetPacketFilterTable(_driverHandle))
-            {
-                _outboundFilterTableDirty = false;
-                _forceOutboundFilterApply = false;
-                _lastOutboundFilterApply = _timeProvider.GetUtcNow();
-                _nextOutboundFilterRetry = default;
-            }
-            else
-            {
-                _forceOutboundFilterApply = false;
-                _lastOutboundFilterApply = _timeProvider.GetUtcNow();
-                _nextOutboundFilterRetry = _lastOutboundFilterApply + OutboundFilterRetryInterval;
-            }
-
-            return false;
-        }
-
-        var passFlows = new HashSet<RelayOutboundFlow>(_outboundBypassFlows.Keys);
-        passFlows.UnionWith(_temporaryPassFlows.Snapshot());
-        var filters = new List<NdisApi.StaticFilter>(passFlows.Count * Math.Max(_adapters.Count, 1));
-        foreach (var flow in passFlows)
-        {
-            if (flow.Dot1q != 0)
-            {
-                continue;
-            }
-
-            var adapters = flow.AdapterHandle != IntPtr.Zero
-                ? [flow.AdapterHandle]
-                : _adapters;
-            foreach (var adapter in adapters)
-            {
-                filters.Add(NdisApi.CreateOutboundPassFilter(
-                    adapter,
-                    flow.Protocol,
-                    flow.LocalAddress,
-                    flow.RemoteAddress,
-                    flow.LocalPort,
-                    flow.RemotePort));
-            }
-        }
-
-        if (!NdisApi.SetPacketFilterTable(_driverHandle, filters))
-        {
-            _filterApplyFailures++;
-            LogThrottled(
-                $"SetPacketFilterTable failed for relay outbound pass flows count={filters.Count} win32={NdisApi.LastWin32Error}",
-                "set-static-filter-failed",
-                TimeSpan.FromSeconds(2));
-            if (NdisApi.ResetPacketFilterTable(_driverHandle))
-            {
-                LogThrottled(
-                    "Kernel pass table reset after update failure; dynamic pass filtering is disabled.",
-                    "kernel-pass-disabled",
-                    TimeSpan.FromSeconds(5));
-                _fragmentCacheEnabled = false;
-                _outboundFilterTableDirty = false;
-                _forceOutboundFilterApply = false;
-                _nextOutboundFilterRetry = default;
-                return false;
-            }
-
-            _outboundFilterTableDirty = true;
-            _lastOutboundFilterApply = _timeProvider.GetUtcNow();
-            _nextOutboundFilterRetry = _lastOutboundFilterApply + OutboundFilterRetryInterval;
-            return false;
-        }
-
-        _outboundFilterTableDirty = false;
-        _lastOutboundFilterApply = _timeProvider.GetUtcNow();
-        _nextOutboundFilterRetry = default;
-        return true;
-    }
-
-    private void RegisterTemporaryPassFlow(
-        PacketView packet,
-        IntPtr adapterHandle,
-        uint dot1q,
-        bool allowPassFilter = true)
-    {
-        // UDP can begin fragmenting after any datagram, so a transport-only kernel
-        // PASS rule cannot safely preserve fragment ordering without WFP metadata.
-        if (!allowPassFilter
-            || _useWfpClassifier
-            || !packet.IsTcp
-            || !_fragmentCacheEnabled
-            || dot1q != 0
-            || packet.IsLinkLayerBroadcastOrMulticast())
-        {
-            return;
-        }
-
-        var flow = new RelayOutboundFlow(
-            adapterHandle,
-            packet.IsTcp ? PacketView.ProtocolTcp : PacketView.ProtocolUdp,
-            packet.SourceAddress,
-            packet.DestinationAddress,
-            packet.SourcePort,
-            packet.DestinationPort,
-            dot1q);
-        var now = _timeProvider.GetUtcNow();
-        lock (_outboundBypassSync)
-        {
-            if (_temporaryPassFlows.Register(flow, now))
-            {
-                _forceOutboundFilterApply = true;
-            }
-
-            _outboundFilterTableDirty = true;
-        }
-
-        LogDetail(
-            $"Temporary kernel pass flow registered: {flow}",
-            $"temporary-pass-register:{flow}",
-            TimeSpan.FromSeconds(5));
-    }
-
-    private void RemoveTemporaryPassFlow(PacketView packet, IntPtr adapterHandle, uint dot1q)
-    {
-        var flow = new RelayOutboundFlow(
-            adapterHandle,
-            PacketView.ProtocolTcp,
-            packet.SourceAddress,
-            packet.DestinationAddress,
-            packet.SourcePort,
-            packet.DestinationPort,
-            dot1q);
-        var removed = false;
-        lock (_outboundBypassSync)
-        {
-            if (_temporaryPassFlows.Remove(flow))
-            {
-                _outboundFilterTableDirty = true;
-                _forceOutboundFilterApply = true;
-                removed = true;
-            }
-        }
-
-        if (removed)
-        {
-            LogDetail(
-                $"Temporary kernel pass flow revoked: {flow}",
-                $"temporary-pass-revoke:{flow}",
-                TimeSpan.FromSeconds(5));
-        }
-    }
-
-    private void FlushOutboundFilterTable()
-    {
-        if (_driverHandle == IntPtr.Zero)
-        {
-            return;
-        }
-
-        if (!_useWfpClassifier && !_fragmentCacheEnabled)
-        {
-            lock (_outboundBypassSync)
-            {
-                if (_lastConfigurationGeneration != _configuration.Generation)
-                {
-                    _lastConfigurationGeneration = _configuration.Generation;
-                    _temporaryPassFlows.Clear();
-                }
-            }
-
-            return;
-        }
-
-        lock (_outboundBypassSync)
-        {
-            var now = _timeProvider.GetUtcNow();
-            if (_lastConfigurationGeneration != _configuration.Generation)
-            {
-                _lastConfigurationGeneration = _configuration.Generation;
-                _temporaryPassFlows.Clear();
-                _outboundFilterTableDirty = true;
-                _forceOutboundFilterApply = true;
-            }
-
-            if (_nextTemporaryPassCleanup == default || now >= _nextTemporaryPassCleanup)
-            {
-                _nextTemporaryPassCleanup = now + TemporaryPassCleanupInterval;
-                if (_temporaryPassFlows.RemoveExpired(now))
-                {
-                    _outboundFilterTableDirty = true;
-                    _forceOutboundFilterApply = true;
-                }
-            }
-
-            if (ExpirePendingWfpRedirects(now))
-            {
-                _outboundFilterTableDirty = true;
-                _forceOutboundFilterApply = true;
-            }
-
-            if (!_outboundFilterTableDirty
-                || (!_forceOutboundFilterApply
-                    && ((_nextOutboundFilterRetry != default && now < _nextOutboundFilterRetry)
-                        || (_lastOutboundFilterApply != default
-                            && now - _lastOutboundFilterApply < OutboundFilterApplyInterval))))
-            {
-                return;
-            }
-
-            _forceOutboundFilterApply = false;
-            _ = ApplyOutboundFilters();
-        }
-    }
-
-    private bool RemoveTargetRedirectLocked(RelayOutboundFlow flow)
-    {
-        if (!_targetRedirectFlows.Remove(flow))
-        {
-            return false;
-        }
-
-        _wfpProcessByFlow.TryRemove(flow, out _);
-        _wfpPendingRedirects.TryRemove(flow, out _);
-        _wfpActiveRedirects.Remove(flow);
-        return true;
-    }
-
-    private bool ExpirePendingWfpRedirects(DateTimeOffset now)
-    {
-        var changed = false;
-        foreach (var pair in _wfpPendingRedirects)
-        {
-            if (now < pair.Value)
-            {
-                continue;
-            }
-
-            if (RemoveTargetRedirectLocked(pair.Key))
-            {
-                changed = true;
-                LogDetail(
-                    $"WFP target redirect expired before first packet: {pair.Key}",
-                    $"wfp-target-orphan:{pair.Key}",
-                    TimeSpan.FromSeconds(5));
-            }
-        }
-
-        return changed;
-    }
-
     private bool TryReadAndProcessPacket()
     {
         _fragmentReassembler.FlushExpired(SendCapturedFragmentToAdapter);
-        FlushOutboundFilterTable();
-
-        foreach (var adapter in _adapters)
-        {
-            var buffer = default(NdisApi.IntermediateBuffer);
-            var request = new NdisApi.EthRequest
-            {
-                AdapterHandle = adapter,
-                Buffer = (IntPtr)(&buffer)
-            };
-
-            if (!NdisApi.ReadPacket(_driverHandle, ref request))
-            {
-                continue;
-            }
-
-            buffer.AdapterOrListFlink = adapter;
-            ProcessPacket(&buffer);
-            return true;
-        }
-
-        return false;
+        SetStage("maintaining-outbound-filters");
+        _outboundFilters.Maintain();
+        return _adapterPipelines!.TryReadAndProcess(this);
     }
 
-    private void ProcessPacket(NdisApi.IntermediateBuffer* buffer)
+    public void ProcessPacket(NdisApi.IntermediateBuffer* buffer)
     {
+        SetStage("processing-packet");
         _packetsRead++;
 
         if (buffer->Length > NdisApi.MaxEtherFrame)
@@ -1041,12 +542,12 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         }
 
         var outboundFlow = CreateOutboundFlow(packet, adapterHandle, dot1q);
-        if (_useWfpClassifier)
+        if (_outboundFilters.UseWfpClassifier)
         {
-            RefreshTargetRedirect(outboundFlow);
+            _outboundFilters.RefreshTargetRedirect(outboundFlow);
         }
 
-        RemoveTemporaryPassFlow(packet, adapterHandle, dot1q);
+        _outboundFilters.RemoveTemporaryPassFlow(packet, adapterHandle, dot1q);
 
         if (_tcpRelay.TryGetConnection(relayKey, out var existingConnection))
         {
@@ -1063,24 +564,24 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             else
             {
                 existingConnection.SendClientSegment(CreateTcpSegment(packet));
-                MarkTargetRedirectActive(outboundFlow);
+                _outboundFilters.MarkTargetRedirectActive(outboundFlow);
                 return true;
             }
         }
 
         if (!packet.IsInitialSyn)
         {
-            var nonSynProcess = _wfpProcessByFlow.TryGetValue(outboundFlow, out var wfpProcess)
+            var nonSynProcess = _outboundFilters.TryGetWfpProcess(outboundFlow, out var wfpProcess)
                 ? wfpProcess
                 : LookupTcpOwner(packet);
             if (nonSynProcess is not null
                 && !_configuration.Current.TryGetMatchingPattern(nonSynProcess, out _, out _))
             {
-                RegisterTemporaryPassFlow(packet, adapterHandle, dot1q, allowPassFilter);
+                _outboundFilters.RegisterTemporaryPassFlow(packet, adapterHandle, dot1q, allowPassFilter);
             }
-            else if (_useWfpClassifier)
+            else if (_outboundFilters.UseWfpClassifier)
             {
-                UnregisterTargetRedirect(outboundFlow);
+                _outboundFilters.UnregisterTargetRedirect(outboundFlow);
             }
 
             return false;
@@ -1089,41 +590,41 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         if (packet.TcpPayloadLength > 0)
         {
             _tcpRelay.MarkBypassedFlow(relayKey);
-            if (_useWfpClassifier)
+            if (_outboundFilters.UseWfpClassifier)
             {
-                UnregisterTargetRedirect(outboundFlow);
+                _outboundFilters.UnregisterTargetRedirect(outboundFlow);
             }
             return false;
         }
 
         if (_tcpRelay.IsBypassedFlow(relayKey))
         {
-            if (_useWfpClassifier)
+            if (_outboundFilters.UseWfpClassifier)
             {
-                UnregisterTargetRedirect(outboundFlow);
+                _outboundFilters.UnregisterTargetRedirect(outboundFlow);
             }
             return false;
         }
 
-        var process = _wfpProcessByFlow.TryGetValue(outboundFlow, out var wfpTargetProcess)
+        var process = _outboundFilters.TryGetWfpProcess(outboundFlow, out var wfpTargetProcess)
             ? wfpTargetProcess
             : LookupTcpOwner(packet);
         if (process is null)
         {
             _tcpRelay.MarkBypassedFlow(relayKey);
-            if (_useWfpClassifier)
+            if (_outboundFilters.UseWfpClassifier)
             {
-                UnregisterTargetRedirect(outboundFlow);
+                _outboundFilters.UnregisterTargetRedirect(outboundFlow);
             }
             return false;
         }
 
         if (!_configuration.Current.TryGetMatchingPattern(process, out var matchedPattern, out _))
         {
-            RegisterTemporaryPassFlow(packet, adapterHandle, dot1q, allowPassFilter);
-            if (_useWfpClassifier)
+            _outboundFilters.RegisterTemporaryPassFlow(packet, adapterHandle, dot1q, allowPassFilter);
+            if (_outboundFilters.UseWfpClassifier)
             {
-                UnregisterTargetRedirect(outboundFlow);
+                _outboundFilters.UnregisterTargetRedirect(outboundFlow);
             }
             return false;
         }
@@ -1135,9 +636,9 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                 $"TCP relay connection limit reached ({MaxTcpRelayConnections}); passing new target flow directly.",
                 "tcp-relay-limit",
                 TimeSpan.FromSeconds(5));
-            if (_useWfpClassifier)
+            if (_outboundFilters.UseWfpClassifier)
             {
-                UnregisterTargetRedirect(outboundFlow);
+                _outboundFilters.UnregisterTargetRedirect(outboundFlow);
             }
             return false;
         }
@@ -1160,7 +661,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             packet.TcpWindow,
             _cancellationToken,
             clientMss);
-        MarkTargetRedirectActive(outboundFlow);
+        _outboundFilters.MarkTargetRedirectActive(outboundFlow);
         _packetsRedirected++;
         LogPacketStats();
         return true;
@@ -1257,7 +758,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
 
         // 2. Log any DNS queries (dest port 53 or parses as DNS query)
         bool isPort53 = packet.SourcePort == 53 || packet.DestinationPort == 53;
-        bool isDnsQuery = TryGetDnsQueryDomain(packet.UdpPayload, out var domain);
+        bool isDnsQuery = DnsSpoofHandler.TryGetQueryDomain(packet.UdpPayload, out var domain);
         if (isPort53 || isDnsQuery)
         {
             _log($"[UDP DNS OUT] {packet.SourceAddress}:{packet.SourcePort} -> {packet.DestinationAddress}:{packet.DestinationPort} (Process={processName} PID={processId} DnsQuery={isDnsQuery} Domain={domain})");
@@ -1269,7 +770,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             return false;
         }
 
-        if (TryHandleDnsSpoof(adapterHandle, dot1q, packet))
+        if (_dnsSpoofHandler.TryHandle(adapterHandle, dot1q, packet))
         {
             return true;
         }
@@ -1287,10 +788,10 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         }
 
         var outboundFlow = CreateOutboundFlow(packet, adapterHandle, dot1q);
-        if (_useWfpClassifier)
+        if (_outboundFilters.UseWfpClassifier)
         {
-            RefreshTargetRedirect(outboundFlow);
-            if (_wfpProcessByFlow.TryGetValue(outboundFlow, out var wfpProcess))
+            _outboundFilters.RefreshTargetRedirect(outboundFlow);
+            if (_outboundFilters.TryGetWfpProcess(outboundFlow, out var wfpProcess))
             {
                 processInfo = wfpProcess;
             }
@@ -1309,7 +810,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             {
                 _udpRelay.Refresh(relayKey);
                 SendUdpClientToRemote(packet, relayKey, existingTarget);
-                MarkTargetRedirectActive(outboundFlow);
+                _outboundFilters.MarkTargetRedirectActive(outboundFlow);
                 return true;
             }
         }
@@ -1331,9 +832,9 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                     TimeSpan.FromSeconds(5));
             }
 
-            if (_useWfpClassifier)
+            if (_outboundFilters.UseWfpClassifier)
             {
-                UnregisterTargetRedirect(outboundFlow);
+                _outboundFilters.UnregisterTargetRedirect(outboundFlow);
             }
             return false;
         }
@@ -1348,9 +849,9 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
                     TimeSpan.FromSeconds(5));
             }
 
-            if (_useWfpClassifier)
+            if (_outboundFilters.UseWfpClassifier)
             {
-                UnregisterTargetRedirect(outboundFlow);
+                _outboundFilters.UnregisterTargetRedirect(outboundFlow);
             }
             return false;
         }
@@ -1362,7 +863,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             TimeSpan.FromSeconds(2));
         var target = CreateTarget(adapterHandle, dot1q, packet, process, matchedPattern);
         SendUdpClientToRemote(packet, relayKey, target);
-        MarkTargetRedirectActive(outboundFlow);
+        _outboundFilters.MarkTargetRedirectActive(outboundFlow);
         return true;
     }
 
@@ -1457,7 +958,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
     {
         if (interfaceIndex <= 0)
         {
-            _adapterInterfaceIndices.TryGetValue(adapterHandle, out interfaceIndex);
+            _ = _adapterPipelines!.TryGetInterfaceIndex(adapterHandle, out interfaceIndex);
         }
 
         if (address.AddressFamily == AddressFamily.InterNetworkV6
@@ -1471,810 +972,6 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         return new UdpEndpointKey(address, port);
     }
 
-    private bool InjectTcpSegmentToClient(DirectRelayTarget target, TcpSegment segment)
-    {
-        if (target.ClientAddress is null || target.ClientPort == 0)
-        {
-            LogDetail(
-                $"TCP inject skipped because client endpoint is unknown app={target.AppLabel}",
-                $"tcp-inject-no-client:{target.ProcessId}:{target.RemoteEndpoint}",
-                TimeSpan.FromSeconds(2));
-            return false;
-        }
-
-        if (target.AdapterHandle == IntPtr.Zero)
-        {
-            LogDetail(
-                $"TCP inject skipped because adapter is unknown app={target.AppLabel} appLocal={target.ClientEndpoint}",
-                $"tcp-inject-no-adapter:{target.ProcessId}:{target.ClientEndpoint}",
-                TimeSpan.FromSeconds(2));
-            return false;
-        }
-
-        var clientAddress = NetworkAddress.Normalize(target.ClientAddress);
-        var remoteAddress = NetworkAddress.Normalize(target.RemoteAddress);
-        if (clientAddress.AddressFamily != remoteAddress.AddressFamily)
-        {
-            LogDetail(
-                $"TCP inject skipped because address families differ app={target.AppLabel} client={clientAddress} remote={remoteAddress}",
-                $"tcp-inject-family-mismatch:{target.ProcessId}:{target.ClientEndpoint}:{target.RemoteEndpoint}",
-                TimeSpan.FromSeconds(2));
-            return false;
-        }
-
-        if (target.LinkHeader is not { Length: >= PacketView.EthernetHeaderLength }
-            && (target.InboundEthernetSource is not { Length: 6 }
-                || target.InboundEthernetDestination is not { Length: 6 }))
-        {
-            LogDetail(
-                $"TCP inject skipped because ethernet addresses are unknown app={target.AppLabel} appLocal={target.ClientEndpoint}",
-                $"tcp-inject-no-ethernet:{target.ProcessId}:{target.ClientEndpoint}",
-                TimeSpan.FromSeconds(2));
-            return false;
-        }
-
-        var payloadSpan = segment.Payload.Span;
-        var optionSpan = segment.Options.Span;
-        if (optionSpan.Length % 4 != 0 || optionSpan.Length > 40)
-        {
-            LogDetail(
-                $"TCP inject skipped because options are invalid app={target.AppLabel} appLocal={target.ClientEndpoint} options={optionSpan.Length}",
-                $"tcp-inject-invalid-options:{target.ProcessId}:{target.ClientEndpoint}",
-                TimeSpan.FromSeconds(2));
-            return false;
-        }
-
-        var linkHeaderLength = target.LinkHeader is { Length: >= PacketView.EthernetHeaderLength } linkHeader
-            ? linkHeader.Length
-            : PacketView.EthernetHeaderLength;
-        var ipHeaderLength = clientAddress.AddressFamily == AddressFamily.InterNetwork ? 20 : 40;
-        var tcpHeaderLength = 20 + optionSpan.Length;
-        var packetLength = linkHeaderLength + ipHeaderLength + tcpHeaderLength + payloadSpan.Length;
-        if (packetLength > NdisApi.MaxEtherFrame)
-        {
-            LogDetail(
-                $"TCP inject skipped because packet is too large length={packetLength} app={target.AppLabel} appLocal={target.ClientEndpoint}",
-                $"tcp-inject-too-large:{target.ProcessId}:{target.ClientEndpoint}:{target.RemoteEndpoint}",
-                TimeSpan.FromSeconds(2));
-            return false;
-        }
-
-        var buffer = default(NdisApi.IntermediateBuffer);
-        buffer.AdapterOrListFlink = target.AdapterHandle;
-        buffer.DeviceFlags = NdisApi.PacketFlagOnReceive;
-        buffer.Dot1q = target.Dot1q;
-        buffer.Length = (uint)packetLength;
-        var frame = new Span<byte>(buffer.Data, NdisApi.MaxEtherFrame);
-        frame[..packetLength].Clear();
-        WriteInboundLinkHeader(frame, target, linkHeaderLength);
-
-        if (clientAddress.AddressFamily == AddressFamily.InterNetwork)
-        {
-            BinaryPrimitives.WriteUInt16BigEndian(
-                frame.Slice(linkHeaderLength - 2, 2),
-                PacketView.EtherTypeIpv4);
-            BuildIpv4TcpPacket(
-                frame.Slice(linkHeaderLength),
-                remoteAddress,
-                clientAddress,
-                target.RemotePort,
-                target.ClientPort,
-                segment.SequenceNumber,
-                segment.AcknowledgmentNumber,
-                segment.Flags,
-                segment.Window,
-                segment.UrgentPointer,
-                optionSpan,
-                payloadSpan);
-        }
-        else
-        {
-            BinaryPrimitives.WriteUInt16BigEndian(
-                frame.Slice(linkHeaderLength - 2, 2),
-                PacketView.EtherTypeIpv6);
-            BuildIpv6TcpPacket(
-                frame.Slice(linkHeaderLength),
-                remoteAddress,
-                clientAddress,
-                target.RemotePort,
-                target.ClientPort,
-                segment.SequenceNumber,
-                segment.AcknowledgmentNumber,
-                segment.Flags,
-                segment.Window,
-                segment.UrgentPointer,
-                optionSpan,
-                payloadSpan);
-        }
-
-        if (!SendInjectedPacketToMstcp(&buffer))
-        {
-            LogDetail(
-                $"TCP inject SendPacketToMstcp failed app={target.AppLabel} appLocal={target.ClientEndpoint} length={packetLength} win32={NdisApi.LastWin32Error}",
-                $"tcp-inject-send-failed:{target.ProcessId}:{target.ClientEndpoint}:{target.RemoteEndpoint}",
-                TimeSpan.FromSeconds(2));
-            return false;
-        }
-
-        LogDetail(
-            $"RESTORE TCP RECV flags={FormatTcpFlags(segment.Flags)} app={target.AppLabel} appLocal={target.ClientEndpoint} from={target.RemoteEndpoint} injectedBytes={payloadSpan.Length}",
-            $"tcp-inject:{target.ProcessId}:{target.ClientEndpoint}:{target.RemoteEndpoint}:{segment.Flags}:{payloadSpan.Length > 0}",
-            payloadSpan.Length > 0 ? TimeSpan.Zero : TimeSpan.FromSeconds(2));
-        return true;
-    }
-
-    private static void WriteInboundLinkHeader(
-        Span<byte> frame,
-        DirectRelayTarget target,
-        int linkHeaderLength)
-    {
-        if (target.LinkHeader is { Length: >= PacketView.EthernetHeaderLength } linkHeader)
-        {
-            linkHeader.AsSpan(6, 6).CopyTo(frame[..6]);
-            linkHeader.AsSpan(0, 6).CopyTo(frame.Slice(6, 6));
-            if (linkHeader.Length > 12)
-            {
-                linkHeader.AsSpan(12).CopyTo(frame.Slice(12));
-            }
-
-            return;
-        }
-
-        target.InboundEthernetDestination!.CopyTo(frame[..6]);
-        target.InboundEthernetSource!.CopyTo(frame.Slice(6, 6));
-    }
-
-    private bool InjectUdpResponseToClient(
-        DirectRelayTarget target,
-        IPEndPoint remoteEndPoint,
-        ReadOnlyMemory<byte> payload)
-    {
-        if (target.ClientAddress is null || target.ClientPort == 0)
-        {
-            LogDetail(
-                $"UDP inject skipped because client endpoint is unknown app={target.AppLabel} from={remoteEndPoint}",
-                $"udp-inject-no-client:{target.ProcessId}:{remoteEndPoint}",
-                TimeSpan.FromSeconds(2));
-            return false;
-        }
-
-        if (target.AdapterHandle == IntPtr.Zero)
-        {
-            LogDetail(
-                $"UDP inject skipped because adapter is unknown app={target.AppLabel} appLocal={target.ClientEndpoint} from={remoteEndPoint}",
-                $"udp-inject-no-adapter:{target.ProcessId}:{target.ClientEndpoint}:{remoteEndPoint}",
-                TimeSpan.FromSeconds(2));
-            return false;
-        }
-
-        var clientAddress = NetworkAddress.Normalize(target.ClientAddress);
-        var remoteAddress = NetworkAddress.Normalize(remoteEndPoint.Address);
-        if (clientAddress.AddressFamily != remoteAddress.AddressFamily)
-        {
-            LogDetail(
-                $"UDP inject skipped because address families differ app={target.AppLabel} client={clientAddress} remote={remoteAddress}",
-                $"udp-inject-family-mismatch:{target.ProcessId}:{target.ClientEndpoint}:{remoteEndPoint}",
-                TimeSpan.FromSeconds(2));
-            return false;
-        }
-
-        if (target.LinkHeader is not { Length: >= PacketView.EthernetHeaderLength }
-            && (target.InboundEthernetSource is not { Length: 6 }
-                || target.InboundEthernetDestination is not { Length: 6 }))
-        {
-            LogDetail(
-                $"UDP inject skipped because ethernet addresses are unknown app={target.AppLabel} appLocal={target.ClientEndpoint} from={remoteEndPoint}",
-                $"udp-inject-no-ethernet:{target.ProcessId}:{target.ClientEndpoint}:{remoteEndPoint}",
-                TimeSpan.FromSeconds(2));
-            return false;
-        }
-
-        var payloadSpan = payload.Span;
-        if (payloadSpan.Length > ushort.MaxValue - 8)
-        {
-            LogDetail(
-                $"UDP inject skipped because datagram is too large length={payloadSpan.Length} app={target.AppLabel} appLocal={target.ClientEndpoint}",
-                $"udp-inject-datagram-too-large:{target.ProcessId}:{target.ClientEndpoint}",
-                TimeSpan.FromSeconds(2));
-            return false;
-        }
-
-        var linkHeaderLength = target.LinkHeader is { Length: >= PacketView.EthernetHeaderLength } linkHeader
-            ? linkHeader.Length
-            : PacketView.EthernetHeaderLength;
-        var ipHeaderLength = clientAddress.AddressFamily == AddressFamily.InterNetwork ? 20 : 40;
-        var mtu = _adapterMtus.TryGetValue(target.AdapterHandle, out var configuredMtu)
-            ? configuredMtu
-            : 1500;
-        var maxFramePayload = NdisApi.MaxEtherFrame - linkHeaderLength;
-        var maxDatagramDataLength = Math.Max(
-            8,
-            Math.Min(mtu, maxFramePayload) - ipHeaderLength - 8);
-
-        if (payloadSpan.Length > maxDatagramDataLength)
-        {
-            return InjectFragmentedUdpResponse(
-                target,
-                remoteEndPoint,
-                clientAddress,
-                remoteAddress,
-                linkHeaderLength,
-                ipHeaderLength,
-                maxDatagramDataLength,
-                payloadSpan);
-        }
-
-        var packetLength = linkHeaderLength + ipHeaderLength + 8 + payloadSpan.Length;
-        var buffer = default(NdisApi.IntermediateBuffer);
-        buffer.AdapterOrListFlink = target.AdapterHandle;
-        buffer.DeviceFlags = NdisApi.PacketFlagOnReceive;
-        buffer.Dot1q = target.Dot1q;
-        buffer.Length = (uint)packetLength;
-        var frame = new Span<byte>(buffer.Data, NdisApi.MaxEtherFrame);
-        frame[..packetLength].Clear();
-        WriteInboundLinkHeader(frame, target, linkHeaderLength);
-
-        if (clientAddress.AddressFamily == AddressFamily.InterNetwork)
-        {
-            BinaryPrimitives.WriteUInt16BigEndian(
-                frame.Slice(linkHeaderLength - 2, 2),
-                PacketView.EtherTypeIpv4);
-            BuildIpv4UdpPacket(frame.Slice(linkHeaderLength), remoteAddress, clientAddress, (ushort)remoteEndPoint.Port, target.ClientPort, payloadSpan);
-        }
-        else
-        {
-            BinaryPrimitives.WriteUInt16BigEndian(
-                frame.Slice(linkHeaderLength - 2, 2),
-                PacketView.EtherTypeIpv6);
-            BuildIpv6UdpPacket(frame.Slice(linkHeaderLength), remoteAddress, clientAddress, (ushort)remoteEndPoint.Port, target.ClientPort, payloadSpan);
-        }
-
-        if (!SendInjectedPacketToMstcp(&buffer))
-        {
-            LogDetail(
-                $"UDP inject SendPacketToMstcp failed app={target.AppLabel} appLocal={target.ClientEndpoint} from={remoteEndPoint} length={packetLength} win32={NdisApi.LastWin32Error}",
-                $"udp-inject-send-failed:{target.ProcessId}:{target.ClientEndpoint}:{remoteEndPoint}",
-                TimeSpan.FromSeconds(2));
-            return false;
-        }
-
-        LogDetail(
-            $"RESTORE UDP RECV app={target.AppLabel} appLocal={target.ClientEndpoint} from={remoteEndPoint} injectedBytes={payloadSpan.Length}",
-            $"udp-inject:{target.ProcessId}:{target.ClientEndpoint}:{remoteEndPoint}",
-            TimeSpan.FromSeconds(2));
-        return true;
-    }
-
-    private void InjectUdpErrorToClient(
-        DirectRelayTarget target,
-        IPEndPoint remoteEndPoint,
-        ReadOnlyMemory<byte> originalPayload,
-        SocketError socketError)
-    {
-        if (target.ClientAddress is null || target.ClientPort == 0 || target.AdapterHandle == IntPtr.Zero)
-        {
-            return;
-        }
-
-        if (target.LinkHeader is not { Length: >= PacketView.EthernetHeaderLength }
-            && (target.InboundEthernetSource is not { Length: 6 }
-                || target.InboundEthernetDestination is not { Length: 6 }))
-        {
-            return;
-        }
-
-        var clientAddress = NetworkAddress.Normalize(target.ClientAddress);
-        var remoteAddress = NetworkAddress.Normalize(remoteEndPoint.Address);
-        if (clientAddress.AddressFamily != remoteAddress.AddressFamily)
-        {
-            return;
-        }
-
-        var linkHeaderLength = target.LinkHeader is { Length: >= PacketView.EthernetHeaderLength } linkHeader
-            ? linkHeader.Length
-            : PacketView.EthernetHeaderLength;
-        if (clientAddress.AddressFamily == AddressFamily.InterNetwork)
-        {
-            var icmp = BuildIpv4IcmpError(
-                clientAddress,
-                target.ClientPort,
-                remoteAddress,
-                (ushort)remoteEndPoint.Port,
-                originalPayload.Span,
-                MapIpv4IcmpCode(socketError));
-            InjectIcmpPacket(target, remoteAddress, clientAddress, PacketView.EtherTypeIpv4, linkHeaderLength, icmp);
-            return;
-        }
-
-        var icmpv6 = BuildIpv6IcmpError(
-            clientAddress,
-            target.ClientPort,
-            remoteAddress,
-            (ushort)remoteEndPoint.Port,
-            originalPayload.Span,
-            MapIpv6IcmpCode(socketError));
-        InjectIcmpPacket(target, remoteAddress, clientAddress, PacketView.EtherTypeIpv6, linkHeaderLength, icmpv6);
-    }
-
-    private void InjectIcmpPacket(
-        DirectRelayTarget target,
-        IPAddress sourceAddress,
-        IPAddress destinationAddress,
-        ushort etherType,
-        int linkHeaderLength,
-        byte[] icmpPayload)
-    {
-        var ipHeaderLength = sourceAddress.AddressFamily == AddressFamily.InterNetwork ? 20 : 40;
-        var packetLength = linkHeaderLength + ipHeaderLength + icmpPayload.Length;
-        if (packetLength > NdisApi.MaxEtherFrame)
-        {
-            return;
-        }
-
-        var buffer = default(NdisApi.IntermediateBuffer);
-        buffer.AdapterOrListFlink = target.AdapterHandle;
-        buffer.DeviceFlags = NdisApi.PacketFlagOnReceive;
-        buffer.Dot1q = target.Dot1q;
-        buffer.Length = (uint)packetLength;
-        var frame = new Span<byte>(buffer.Data, NdisApi.MaxEtherFrame);
-        frame[..packetLength].Clear();
-        WriteInboundLinkHeader(frame, target, linkHeaderLength);
-        BinaryPrimitives.WriteUInt16BigEndian(frame.Slice(linkHeaderLength - 2, 2), etherType);
-        var ip = frame.Slice(linkHeaderLength);
-        if (sourceAddress.AddressFamily == AddressFamily.InterNetwork)
-        {
-            ip[0] = 0x45;
-            BinaryPrimitives.WriteUInt16BigEndian(ip.Slice(2, 2), (ushort)(20 + icmpPayload.Length));
-            ip[8] = 64;
-            ip[9] = 1;
-            sourceAddress.GetAddressBytes().CopyTo(ip.Slice(12, 4));
-            destinationAddress.GetAddressBytes().CopyTo(ip.Slice(16, 4));
-            BinaryPrimitives.WriteUInt16BigEndian(ip.Slice(10, 2), ComputeOnesComplement(ip[..20]));
-            icmpPayload.CopyTo(ip.Slice(20));
-        }
-        else
-        {
-            ip[0] = 0x60;
-            BinaryPrimitives.WriteUInt16BigEndian(ip.Slice(4, 2), (ushort)icmpPayload.Length);
-            ip[6] = 58;
-            ip[7] = 64;
-            sourceAddress.GetAddressBytes().CopyTo(ip.Slice(8, 16));
-            destinationAddress.GetAddressBytes().CopyTo(ip.Slice(24, 16));
-            icmpPayload.CopyTo(ip.Slice(40));
-        }
-
-        if (!SendInjectedPacketToMstcp(&buffer))
-        {
-            LogDetail(
-                $"ICMP inject SendPacketToMstcp failed app={target.AppLabel} appLocal={target.ClientEndpoint} from={sourceAddress} win32={NdisApi.LastWin32Error}",
-                $"icmp-inject-send-failed:{target.ProcessId}:{target.ClientEndpoint}",
-                TimeSpan.FromSeconds(2));
-        }
-    }
-
-    private static byte[] BuildIpv4IcmpError(
-        IPAddress clientAddress,
-        ushort clientPort,
-        IPAddress remoteAddress,
-        ushort remotePort,
-        ReadOnlySpan<byte> originalPayload,
-        byte code)
-    {
-        var quoteLength = Math.Min(8, originalPayload.Length);
-        var originalLength = checked((ushort)(20 + 8 + Math.Min(originalPayload.Length, ushort.MaxValue - 28)));
-        var original = new byte[20 + 8 + quoteLength];
-        original[0] = 0x45;
-        BinaryPrimitives.WriteUInt16BigEndian(original.AsSpan(2, 2), originalLength);
-        original[8] = 64;
-        original[9] = PacketView.ProtocolUdp;
-        clientAddress.GetAddressBytes().CopyTo(original.AsSpan(12, 4));
-        remoteAddress.GetAddressBytes().CopyTo(original.AsSpan(16, 4));
-        BinaryPrimitives.WriteUInt16BigEndian(
-            original.AsSpan(10, 2),
-            ComputeOnesComplement(original.AsSpan(0, 20)));
-        BinaryPrimitives.WriteUInt16BigEndian(original.AsSpan(20, 2), clientPort);
-        BinaryPrimitives.WriteUInt16BigEndian(original.AsSpan(22, 2), remotePort);
-        BinaryPrimitives.WriteUInt16BigEndian(original.AsSpan(24, 2), (ushort)(8 + Math.Min(originalPayload.Length, ushort.MaxValue - 28)));
-        originalPayload[..quoteLength].CopyTo(original.AsSpan(28));
-
-        var icmp = new byte[8 + original.Length];
-        icmp[0] = 3;
-        icmp[1] = code;
-        original.CopyTo(icmp, 8);
-        BinaryPrimitives.WriteUInt16BigEndian(icmp.AsSpan(2, 2), ComputeOnesComplement(icmp));
-        return icmp;
-    }
-
-    private static byte[] BuildIpv6IcmpError(
-        IPAddress clientAddress,
-        ushort clientPort,
-        IPAddress remoteAddress,
-        ushort remotePort,
-        ReadOnlySpan<byte> originalPayload,
-        byte code)
-    {
-        var quoteLength = Math.Min(8, originalPayload.Length);
-        var original = new byte[40 + 8 + quoteLength];
-        original[0] = 0x60;
-        BinaryPrimitives.WriteUInt16BigEndian(original.AsSpan(4, 2), (ushort)(8 + originalPayload.Length));
-        original[6] = PacketView.ProtocolUdp;
-        original[7] = 64;
-        clientAddress.GetAddressBytes().CopyTo(original.AsSpan(8, 16));
-        remoteAddress.GetAddressBytes().CopyTo(original.AsSpan(24, 16));
-        BinaryPrimitives.WriteUInt16BigEndian(original.AsSpan(40, 2), clientPort);
-        BinaryPrimitives.WriteUInt16BigEndian(original.AsSpan(42, 2), remotePort);
-        BinaryPrimitives.WriteUInt16BigEndian(original.AsSpan(44, 2), (ushort)(8 + originalPayload.Length));
-        originalPayload[..quoteLength].CopyTo(original.AsSpan(48));
-
-        var icmp = new byte[8 + original.Length];
-        icmp[0] = 1;
-        icmp[1] = code;
-        original.CopyTo(icmp, 8);
-        var checksum = ComputeTransportChecksum(
-            remoteAddress,
-            clientAddress,
-            58,
-            icmp);
-        BinaryPrimitives.WriteUInt16BigEndian(icmp.AsSpan(2, 2), checksum);
-        return icmp;
-    }
-
-    private static byte MapIpv4IcmpCode(SocketError error)
-    {
-        return error switch
-        {
-            SocketError.ConnectionRefused => 3,
-            SocketError.HostUnreachable => 1,
-            SocketError.MessageSize => 4,
-            _ => 0
-        };
-    }
-
-    private static byte MapIpv6IcmpCode(SocketError error)
-    {
-        return error switch
-        {
-            SocketError.ConnectionRefused => 4,
-            SocketError.HostUnreachable => 3,
-            SocketError.MessageSize => 2,
-            _ => 0
-        };
-    }
-
-    private bool InjectFragmentedUdpResponse(
-        DirectRelayTarget target,
-        IPEndPoint remoteEndPoint,
-        IPAddress clientAddress,
-        IPAddress remoteAddress,
-        int linkHeaderLength,
-        int ipHeaderLength,
-        int maxDatagramDataLength,
-        ReadOnlySpan<byte> payload)
-    {
-        var udpDatagram = new byte[8 + payload.Length];
-        var success = true;
-        BinaryPrimitives.WriteUInt16BigEndian(udpDatagram.AsSpan(0, 2), (ushort)remoteEndPoint.Port);
-        BinaryPrimitives.WriteUInt16BigEndian(udpDatagram.AsSpan(2, 2), target.ClientPort);
-        BinaryPrimitives.WriteUInt16BigEndian(udpDatagram.AsSpan(4, 2), checked((ushort)udpDatagram.Length));
-        payload.CopyTo(udpDatagram.AsSpan(8));
-        var checksum = ComputeUdpChecksum(remoteAddress, clientAddress, PacketView.ProtocolUdp, udpDatagram);
-        BinaryPrimitives.WriteUInt16BigEndian(udpDatagram.AsSpan(6, 2), checksum);
-
-        if (clientAddress.AddressFamily == AddressFamily.InterNetwork)
-        {
-            var maxFragmentData = Math.Max(8, maxDatagramDataLength & ~7);
-            var identification = (ushort)RandomNumberGenerator.GetInt32(1, ushort.MaxValue);
-            var moreFragments = true;
-            var offset = 0;
-            while (moreFragments)
-            {
-                var fragmentLength = Math.Min(maxFragmentData, udpDatagram.Length - offset);
-                moreFragments = offset + fragmentLength < udpDatagram.Length;
-                var packetLength = linkHeaderLength + 20 + fragmentLength;
-                var buffer = default(NdisApi.IntermediateBuffer);
-                buffer.AdapterOrListFlink = target.AdapterHandle;
-                buffer.DeviceFlags = NdisApi.PacketFlagOnReceive;
-                buffer.Dot1q = target.Dot1q;
-                buffer.Length = (uint)packetLength;
-                var frame = new Span<byte>(buffer.Data, NdisApi.MaxEtherFrame);
-                frame[..packetLength].Clear();
-                WriteInboundLinkHeader(frame, target, linkHeaderLength);
-                BinaryPrimitives.WriteUInt16BigEndian(
-                    frame.Slice(linkHeaderLength - 2, 2),
-                    PacketView.EtherTypeIpv4);
-
-                var ip = frame.Slice(linkHeaderLength, 20);
-                ip[0] = 0x45;
-                ip[1] = 0;
-                BinaryPrimitives.WriteUInt16BigEndian(ip.Slice(2, 2), (ushort)(20 + fragmentLength));
-                BinaryPrimitives.WriteUInt16BigEndian(ip.Slice(4, 2), identification);
-                BinaryPrimitives.WriteUInt16BigEndian(
-                    ip.Slice(6, 2),
-                    (ushort)((offset / 8) | (moreFragments ? 0x2000 : 0)));
-                ip[8] = 64;
-                ip[9] = PacketView.ProtocolUdp;
-                remoteAddress.GetAddressBytes().CopyTo(ip.Slice(12, 4));
-                clientAddress.GetAddressBytes().CopyTo(ip.Slice(16, 4));
-                var ipChecksum = ComputeOnesComplement(ip);
-                BinaryPrimitives.WriteUInt16BigEndian(ip.Slice(10, 2), ipChecksum);
-                CopyIpv4UdpFragmentPayload(
-                    frame,
-                    linkHeaderLength,
-                    udpDatagram.AsSpan(offset, fragmentLength));
-                success &= SendInjectedUdpFragment(target, remoteEndPoint, &buffer);
-                offset += fragmentLength;
-            }
-
-            return success;
-        }
-
-        var maxIpv6FragmentData = Math.Max(8, (maxDatagramDataLength - 8) & ~7);
-        Span<byte> identificationBytes = stackalloc byte[4];
-        RandomNumberGenerator.Fill(identificationBytes);
-        var ipv6Identification = BinaryPrimitives.ReadUInt32BigEndian(identificationBytes);
-        var ipv6MoreFragments = true;
-        var ipv6Offset = 0;
-        while (ipv6MoreFragments)
-        {
-            var fragmentLength = Math.Min(maxIpv6FragmentData, udpDatagram.Length - ipv6Offset);
-            ipv6MoreFragments = ipv6Offset + fragmentLength < udpDatagram.Length;
-            var packetLength = linkHeaderLength + 40 + 8 + fragmentLength;
-            var buffer = default(NdisApi.IntermediateBuffer);
-            buffer.AdapterOrListFlink = target.AdapterHandle;
-            buffer.DeviceFlags = NdisApi.PacketFlagOnReceive;
-            buffer.Dot1q = target.Dot1q;
-            buffer.Length = (uint)packetLength;
-            var frame = new Span<byte>(buffer.Data, NdisApi.MaxEtherFrame);
-            frame[..packetLength].Clear();
-            WriteInboundLinkHeader(frame, target, linkHeaderLength);
-            BinaryPrimitives.WriteUInt16BigEndian(
-                frame.Slice(linkHeaderLength - 2, 2),
-                PacketView.EtherTypeIpv6);
-
-            var ipv6 = frame.Slice(linkHeaderLength, 40);
-            ipv6[0] = 0x60;
-            BinaryPrimitives.WriteUInt16BigEndian(ipv6.Slice(4, 2), (ushort)(8 + fragmentLength));
-            ipv6[6] = 44;
-            ipv6[7] = 64;
-            remoteAddress.GetAddressBytes().CopyTo(ipv6.Slice(8, 16));
-            clientAddress.GetAddressBytes().CopyTo(ipv6.Slice(24, 16));
-
-            var fragment = frame.Slice(linkHeaderLength + 40, 8);
-            fragment[0] = PacketView.ProtocolUdp;
-            BinaryPrimitives.WriteUInt16BigEndian(
-                fragment.Slice(2, 2),
-                (ushort)(((ipv6Offset / 8) << 3) | (ipv6MoreFragments ? 1 : 0)));
-            BinaryPrimitives.WriteUInt32BigEndian(fragment.Slice(4, 4), ipv6Identification);
-            udpDatagram.AsSpan(ipv6Offset, fragmentLength).CopyTo(frame.Slice(linkHeaderLength + 48));
-            success &= SendInjectedUdpFragment(target, remoteEndPoint, &buffer);
-            ipv6Offset += fragmentLength;
-        }
-
-        return success;
-    }
-
-    internal static void CopyIpv4UdpFragmentPayload(
-        Span<byte> frame,
-        int linkHeaderLength,
-        ReadOnlySpan<byte> payload)
-    {
-        payload.CopyTo(frame.Slice(linkHeaderLength + 20, payload.Length));
-    }
-
-    private bool SendInjectedUdpFragment(
-        DirectRelayTarget target,
-        IPEndPoint remoteEndPoint,
-        NdisApi.IntermediateBuffer* buffer)
-    {
-        if (!SendInjectedPacketToMstcp(buffer))
-        {
-            LogDetail(
-                $"UDP fragment SendPacketToMstcp failed app={target.AppLabel} appLocal={target.ClientEndpoint} from={remoteEndPoint} length={buffer->Length} win32={NdisApi.LastWin32Error}",
-                $"udp-fragment-send-failed:{target.ProcessId}:{target.ClientEndpoint}:{remoteEndPoint}",
-                TimeSpan.FromSeconds(2));
-            return false;
-        }
-
-        return true;
-    }
-
-    private bool SendInjectedPacketToMstcp(NdisApi.IntermediateBuffer* buffer)
-    {
-        var request = CreateRequest(buffer);
-        if (!NdisApi.SendPacketToMstcp(_driverHandle, ref request))
-        {
-            _mstcpSendFailed++;
-            return false;
-        }
-
-        _mstcpSendSucceeded++;
-        return true;
-    }
-
-    private static void BuildIpv4UdpPacket(Span<byte> packet, IPAddress sourceAddress, IPAddress destinationAddress, ushort sourcePort, ushort destinationPort, ReadOnlySpan<byte> payload)
-    {
-        var totalLength = 20 + 8 + payload.Length;
-        packet[0] = 0x45;
-        packet[1] = 0;
-        BinaryPrimitives.WriteUInt16BigEndian(packet.Slice(2, 2), (ushort)totalLength);
-        BinaryPrimitives.WriteUInt16BigEndian(packet.Slice(4, 2), 0);
-        BinaryPrimitives.WriteUInt16BigEndian(packet.Slice(6, 2), 0);
-        packet[8] = 64;
-        packet[9] = PacketView.ProtocolUdp;
-        sourceAddress.GetAddressBytes().CopyTo(packet.Slice(12, 4));
-        destinationAddress.GetAddressBytes().CopyTo(packet.Slice(16, 4));
-        var ipChecksum = ComputeOnesComplement(packet[..20]);
-        BinaryPrimitives.WriteUInt16BigEndian(packet.Slice(10, 2), ipChecksum);
-
-        var udp = packet.Slice(20, 8 + payload.Length);
-        BinaryPrimitives.WriteUInt16BigEndian(udp[..2], sourcePort);
-        BinaryPrimitives.WriteUInt16BigEndian(udp.Slice(2, 2), destinationPort);
-        BinaryPrimitives.WriteUInt16BigEndian(udp.Slice(4, 2), (ushort)(8 + payload.Length));
-        payload.CopyTo(udp[8..]);
-        var checksum = ComputeUdpChecksum(sourceAddress, destinationAddress, PacketView.ProtocolUdp, udp);
-        BinaryPrimitives.WriteUInt16BigEndian(udp.Slice(6, 2), checksum == 0 ? (ushort)0xFFFF : checksum);
-    }
-
-    private static void BuildIpv4TcpPacket(
-        Span<byte> packet,
-        IPAddress sourceAddress,
-        IPAddress destinationAddress,
-        ushort sourcePort,
-        ushort destinationPort,
-        uint sequenceNumber,
-        uint acknowledgmentNumber,
-        byte flags,
-        ushort window,
-        ushort urgentPointer,
-        ReadOnlySpan<byte> options,
-        ReadOnlySpan<byte> payload)
-    {
-        var tcpHeaderLength = 20 + options.Length;
-        var totalLength = 20 + tcpHeaderLength + payload.Length;
-        packet[0] = 0x45;
-        packet[1] = 0;
-        BinaryPrimitives.WriteUInt16BigEndian(packet.Slice(2, 2), (ushort)totalLength);
-        BinaryPrimitives.WriteUInt16BigEndian(packet.Slice(4, 2), 0);
-        BinaryPrimitives.WriteUInt16BigEndian(packet.Slice(6, 2), 0);
-        packet[8] = 64;
-        packet[9] = PacketView.ProtocolTcp;
-        sourceAddress.GetAddressBytes().CopyTo(packet.Slice(12, 4));
-        destinationAddress.GetAddressBytes().CopyTo(packet.Slice(16, 4));
-        var ipChecksum = ComputeOnesComplement(packet[..20]);
-        BinaryPrimitives.WriteUInt16BigEndian(packet.Slice(10, 2), ipChecksum);
-
-        var tcp = packet.Slice(20, tcpHeaderLength + payload.Length);
-        BinaryPrimitives.WriteUInt16BigEndian(tcp[..2], sourcePort);
-        BinaryPrimitives.WriteUInt16BigEndian(tcp.Slice(2, 2), destinationPort);
-        BinaryPrimitives.WriteUInt32BigEndian(tcp.Slice(4, 4), sequenceNumber);
-        BinaryPrimitives.WriteUInt32BigEndian(tcp.Slice(8, 4), acknowledgmentNumber);
-        tcp[12] = (byte)((tcpHeaderLength / 4) << 4);
-        tcp[13] = flags;
-        BinaryPrimitives.WriteUInt16BigEndian(tcp.Slice(14, 2), window);
-        BinaryPrimitives.WriteUInt16BigEndian(tcp.Slice(18, 2), urgentPointer);
-        options.CopyTo(tcp.Slice(20, options.Length));
-        payload.CopyTo(tcp.Slice(tcpHeaderLength));
-        var checksum = ComputeTransportChecksum(sourceAddress, destinationAddress, PacketView.ProtocolTcp, tcp);
-        BinaryPrimitives.WriteUInt16BigEndian(tcp.Slice(16, 2), checksum);
-    }
-
-    private static void BuildIpv6UdpPacket(Span<byte> packet, IPAddress sourceAddress, IPAddress destinationAddress, ushort sourcePort, ushort destinationPort, ReadOnlySpan<byte> payload)
-    {
-        var payloadLength = 8 + payload.Length;
-        packet[0] = 0x60;
-        BinaryPrimitives.WriteUInt16BigEndian(packet.Slice(4, 2), (ushort)payloadLength);
-        packet[6] = PacketView.ProtocolUdp;
-        packet[7] = 64;
-        sourceAddress.GetAddressBytes().CopyTo(packet.Slice(8, 16));
-        destinationAddress.GetAddressBytes().CopyTo(packet.Slice(24, 16));
-
-        var udp = packet.Slice(40, payloadLength);
-        BinaryPrimitives.WriteUInt16BigEndian(udp[..2], sourcePort);
-        BinaryPrimitives.WriteUInt16BigEndian(udp.Slice(2, 2), destinationPort);
-        BinaryPrimitives.WriteUInt16BigEndian(udp.Slice(4, 2), (ushort)payloadLength);
-        payload.CopyTo(udp[8..]);
-        var checksum = ComputeUdpChecksum(sourceAddress, destinationAddress, PacketView.ProtocolUdp, udp);
-        BinaryPrimitives.WriteUInt16BigEndian(udp.Slice(6, 2), checksum == 0 ? (ushort)0xFFFF : checksum);
-    }
-
-    private static void BuildIpv6TcpPacket(
-        Span<byte> packet,
-        IPAddress sourceAddress,
-        IPAddress destinationAddress,
-        ushort sourcePort,
-        ushort destinationPort,
-        uint sequenceNumber,
-        uint acknowledgmentNumber,
-        byte flags,
-        ushort window,
-        ushort urgentPointer,
-        ReadOnlySpan<byte> options,
-        ReadOnlySpan<byte> payload)
-    {
-        var tcpHeaderLength = 20 + options.Length;
-        var payloadLength = tcpHeaderLength + payload.Length;
-        packet[0] = 0x60;
-        BinaryPrimitives.WriteUInt16BigEndian(packet.Slice(4, 2), (ushort)payloadLength);
-        packet[6] = PacketView.ProtocolTcp;
-        packet[7] = 64;
-        sourceAddress.GetAddressBytes().CopyTo(packet.Slice(8, 16));
-        destinationAddress.GetAddressBytes().CopyTo(packet.Slice(24, 16));
-
-        var tcp = packet.Slice(40, payloadLength);
-        BinaryPrimitives.WriteUInt16BigEndian(tcp[..2], sourcePort);
-        BinaryPrimitives.WriteUInt16BigEndian(tcp.Slice(2, 2), destinationPort);
-        BinaryPrimitives.WriteUInt32BigEndian(tcp.Slice(4, 4), sequenceNumber);
-        BinaryPrimitives.WriteUInt32BigEndian(tcp.Slice(8, 4), acknowledgmentNumber);
-        tcp[12] = (byte)((tcpHeaderLength / 4) << 4);
-        tcp[13] = flags;
-        BinaryPrimitives.WriteUInt16BigEndian(tcp.Slice(14, 2), window);
-        BinaryPrimitives.WriteUInt16BigEndian(tcp.Slice(18, 2), urgentPointer);
-        options.CopyTo(tcp.Slice(20, options.Length));
-        payload.CopyTo(tcp.Slice(tcpHeaderLength));
-        var checksum = ComputeTransportChecksum(sourceAddress, destinationAddress, PacketView.ProtocolTcp, tcp);
-        BinaryPrimitives.WriteUInt16BigEndian(tcp.Slice(16, 2), checksum);
-    }
-
-    private static ushort ComputeUdpChecksum(IPAddress sourceAddress, IPAddress destinationAddress, byte protocol, ReadOnlySpan<byte> udpDatagram)
-    {
-        var checksum = ComputeTransportChecksum(sourceAddress, destinationAddress, protocol, udpDatagram);
-        return checksum == 0 ? (ushort)0xFFFF : checksum;
-    }
-
-    private static ushort ComputeTransportChecksum(IPAddress sourceAddress, IPAddress destinationAddress, byte protocol, ReadOnlySpan<byte> datagram)
-    {
-        uint sum = 0;
-        var sourceBytes = sourceAddress.GetAddressBytes();
-        var destinationBytes = destinationAddress.GetAddressBytes();
-        sum = AddChecksumBytes(sum, sourceBytes);
-        sum = AddChecksumBytes(sum, destinationBytes);
-        if (sourceAddress.AddressFamily == AddressFamily.InterNetwork)
-        {
-            sum += protocol;
-            sum += (uint)datagram.Length;
-        }
-        else
-        {
-            sum += (uint)(datagram.Length >> 16);
-            sum += (uint)(datagram.Length & 0xFFFF);
-            sum += protocol;
-        }
-
-        sum = AddChecksumBytes(sum, datagram);
-        return FoldChecksum(sum);
-    }
-
-    private static ushort ComputeOnesComplement(ReadOnlySpan<byte> data)
-    {
-        return FoldChecksum(AddChecksumBytes(0, data));
-    }
-
-    private static uint AddChecksumBytes(uint sum, ReadOnlySpan<byte> data)
-    {
-        var i = 0;
-        for (; i + 1 < data.Length; i += 2)
-        {
-            sum += BinaryPrimitives.ReadUInt16BigEndian(data.Slice(i, 2));
-        }
-
-        if (i < data.Length)
-        {
-            sum += (uint)(data[i] << 8);
-        }
-
-        return sum;
-    }
-
-    private static ushort FoldChecksum(uint sum)
-    {
-        while ((sum >> 16) != 0)
-        {
-            sum = (sum & 0xFFFF) + (sum >> 16);
-        }
-
-        return (ushort)~sum;
-    }
-
     private DirectRelayTarget CreateTarget(
         IntPtr adapterHandle,
         uint dot1q,
@@ -2282,12 +979,8 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         ProcessInfo process,
         string? matchedPattern)
     {
-        var adapterMtu = _adapterMtus.TryGetValue(adapterHandle, out var configuredMtu)
-            ? configuredMtu
-            : 1500;
-        var interfaceIndex = _adapterInterfaceIndices.TryGetValue(adapterHandle, out var configuredIndex)
-            ? configuredIndex
-            : 0;
+        _ = _adapterPipelines!.TryGetMtu(adapterHandle, out var adapterMtu);
+        _ = _adapterPipelines.TryGetInterfaceIndex(adapterHandle, out var interfaceIndex);
         return new DirectRelayTarget(
             packet.DestinationAddress,
             packet.DestinationPort,
@@ -2344,10 +1037,12 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         LogPacketStats();
         if (buffer->DeviceFlags == NdisApi.PacketFlagOnSend)
         {
+            SetStage("returning-packet-to-adapter");
             SendToAdapter(buffer);
         }
         else
         {
+            SetStage("returning-packet-to-mstcp");
             SendToMstcp(buffer);
         }
     }
@@ -2366,13 +1061,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         }
 
         _lastPacketStatsLog = now;
-        int kernelPassFlows;
-        lock (_outboundBypassSync)
-        {
-            kernelPassFlows = _outboundBypassFlows.Count + _temporaryPassFlows.Count;
-        }
-
-        _log($"Packet stats: read={_packetsRead}, passed={_packetsPassed}, redirected={_packetsRedirected}, kernelPassFlows={kernelPassFlows}");
+        _log($"Packet stats: read={_packetsRead}, passed={_packetsPassed}, redirected={_packetsRedirected}, kernelPassFlows={_outboundFilters.KernelPassFlowCount}");
     }
 
     private void LogHealth(bool force = false)
@@ -2386,18 +1075,16 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         }
 
         _nextHealthLog = now + HealthLogInterval;
-        int kernelPassFlows;
-        lock (_outboundBypassSync)
-        {
-            kernelPassFlows = _outboundBypassFlows.Count + _temporaryPassFlows.Count;
-        }
-
         long queueTotal = 0;
         uint queueMax = 0;
+        long adapterReadMin = long.MaxValue;
+        long adapterReadMax = 0;
         string? queueMaxAdapter = null;
-        foreach (var adapter in _adapters)
+        foreach (var adapter in _adapterPipelines!.Pipelines)
         {
-            if (!NdisApi.GetAdapterPacketQueueSize(_driverHandle, adapter, out var queueSize))
+            adapterReadMin = Math.Min(adapterReadMin, adapter.PacketsRead);
+            adapterReadMax = Math.Max(adapterReadMax, adapter.PacketsRead);
+            if (!NdisApi.GetAdapterPacketQueueSize(_driverHandle, adapter.Handle, out var queueSize))
             {
                 continue;
             }
@@ -2409,14 +1096,39 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             }
 
             queueMax = queueSize;
-            queueMaxAdapter = _adapterNames.TryGetValue(adapter, out var name)
-                ? name
-                : $"0x{adapter.ToInt64():X}";
+            queueMaxAdapter = adapter.Name;
         }
 
-        var mode = _useWfpClassifier ? "wfp-target-only" : "legacy-send-tunnel";
+        if (adapterReadMin == long.MaxValue)
+        {
+            adapterReadMin = 0;
+        }
+
+        _lastHealthQueueTotal = queueTotal;
+        _lastHealthQueueMax = queueMax;
+        _lastHealthQueueMaxName = queueMaxAdapter;
+
+        var mode = _outboundFilters.UseWfpClassifier ? "wfp-target-only" : "userspace-send-tunnel";
         _log(
-            $"Packet loop health: mode={mode} adapters={_adapters.Count} read={_packetsRead} passed={_packetsPassed} redirected={_packetsRedirected} adapterSends={_adapterSendSucceeded} adapterSendFailures={_adapterSendFailed} mstcpSends={_mstcpSendSucceeded} mstcpSendFailures={_mstcpSendFailed} kernelPassFlows={kernelPassFlows} filterApplyFailures={_filterApplyFailures} adapterQueueTotal={queueTotal} adapterQueueMax={queueMax} adapterQueueMaxName={queueMaxAdapter ?? "none"}");
+            $"Packet loop health: mode={mode} adapters={_adapterPipelines.Count} read={_packetsRead} passed={_packetsPassed} redirected={_packetsRedirected} adapterReadMin={adapterReadMin} adapterReadMax={adapterReadMax} adapterSends={_adapterSendSucceeded} adapterSendFailures={_adapterSendFailed} mstcpSends={_packetInjector.MstcpSendSucceeded + _mstcpPassSucceeded} mstcpSendFailures={_packetInjector.MstcpSendFailed + _mstcpPassFailed} kernelPassFlows={_outboundFilters.KernelPassFlowCount} filterApplyFailures={_outboundFilters.FilterApplyFailures} adapterQueueTotal={queueTotal} adapterQueueMax={queueMax} adapterQueueMaxName={queueMaxAdapter ?? "none"}");
+    }
+
+    private void ValidateAdapters()
+    {
+        var now = _timeProvider.GetUtcNow();
+        if (now < _nextAdapterValidation)
+        {
+            return;
+        }
+
+        _nextAdapterValidation = now + AdapterValidationInterval;
+        if (_packetEvent is null
+            || !_adapterPipelines!.RebindIfChanged(_packetEvent.SafeWaitHandle))
+        {
+            return;
+        }
+
+        _outboundFilters.MarkDirty(force: true);
     }
 
     private void LogDetail(string message, string key, TimeSpan interval)
@@ -2463,36 +1175,12 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         return index == 0 ? "none" : new string(chars[..index]);
     }
 
-    private static string FormatBytes(ReadOnlySpan<byte> bytes, int maxLength)
-    {
-        if (bytes.IsEmpty || maxLength <= 0)
-        {
-            return string.Empty;
-        }
-
-        var length = Math.Min(bytes.Length, maxLength);
-        Span<char> chars = stackalloc char[length * 2];
-        for (var i = 0; i < length; i++)
-        {
-            var value = bytes[i];
-            chars[i * 2] = GetHexChar(value >> 4);
-            chars[(i * 2) + 1] = GetHexChar(value & 0x0F);
-        }
-
-        return new string(chars);
-    }
-
-    private static char GetHexChar(int value)
-    {
-        return (char)(value < 10 ? '0' + value : 'A' + value - 10);
-    }
-
     private void SendToMstcp(NdisApi.IntermediateBuffer* buffer)
     {
         var request = CreateRequest(buffer);
         if (!NdisApi.SendPacketToMstcp(_driverHandle, ref request))
         {
-            _mstcpSendFailed++;
+            _mstcpPassFailed++;
             LogThrottled(
                 $"SendPacketToMstcp failed. adapter=0x{request.AdapterHandle.ToInt64():X} length={buffer->Length} flags={buffer->DeviceFlags} win32={NdisApi.LastWin32Error}",
                 "send-mstcp-failed",
@@ -2500,7 +1188,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
             return;
         }
 
-        _mstcpSendSucceeded++;
+        _mstcpPassSucceeded++;
     }
 
     private void SendToAdapter(NdisApi.IntermediateBuffer* buffer)
@@ -2521,166 +1209,6 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         _adapterSendSucceeded++;
     }
 
-    private bool TryHandleDnsSpoof(IntPtr adapterHandle, uint dot1q, PacketView packet)
-    {
-        if (!_configuration.Current.EnableFakeIpWhitelist)
-        {
-            return false;
-        }
-
-        bool isDnsPort = packet.DestinationPort == 53 || packet.DestinationPort == 5353;
-        if (!isDnsPort || !packet.IsUdp)
-        {
-            return false;
-        }
-
-        var process = _processLookup.LookupUdpOwner(
-            CreateUdpEndpointKey(packet.SourceAddress, packet.SourcePort, adapterHandle));
-
-        var payload = packet.UdpPayload;
-        if (payload.Length < 12)
-        {
-            return false;
-        }
-
-        // Read DNS Header
-        ushort transactionId = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(payload[..2]);
-        ushort flags = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(payload.Slice(2, 2));
-        ushort qCount = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(payload.Slice(4, 2));
-
-        if (qCount == 0 || (flags & 0x8000) != 0) // Only query, not response
-        {
-            return false;
-        }
-
-        // Parse QNAME
-        int offset = 12;
-        var domain = new System.Text.StringBuilder();
-        while (offset < payload.Length)
-        {
-            byte len = payload[offset];
-            if (len == 0)
-            {
-                offset++;
-                break;
-            }
-            if (offset + 1 + len > payload.Length)
-            {
-                return false;
-            }
-
-            if (domain.Length > 0)
-            {
-                domain.Append('.');
-            }
-            domain.Append(System.Text.Encoding.ASCII.GetString(payload.Slice(offset + 1, len)));
-            offset += 1 + len;
-        }
-
-        if (offset + 4 > payload.Length)
-        {
-            return false;
-        }
-
-        ushort qType = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(payload.Slice(offset, 2));
-        offset += 4;
-
-        string queryDomain = domain.ToString();
-        // Check if query is fakeip format, e.g. fakeip-140-82-113-3.store.steampowered.com
-        if ((qType == 1 || qType == 28) && queryDomain.StartsWith("fakeip-", StringComparison.OrdinalIgnoreCase))
-        {
-            int firstDot = queryDomain.IndexOf('.');
-            if (firstDot == -1) return false;
-
-            string firstLabel = queryDomain[..firstDot]; // "fakeip-140-82-113-3"
-            string[] parts = firstLabel.Split('-');
-            if (parts.Length != 5) return false; // Must be "fakeip", "140", "82", "113", "3"
-
-            if (!IPAddress.TryParse($"{parts[1]}.{parts[2]}.{parts[3]}.{parts[4]}", out var fakeIp))
-            {
-                return false;
-            }
-
-            int questionLength = offset - 12;
-            int ipLength = qType == 1 ? 4 : 16;
-            int dnsResponseLength = 12 + questionLength + 12 + ipLength;
-            byte[] dnsResponse = new byte[dnsResponseLength];
-
-            // 1. Header
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(dnsResponse.AsSpan(0, 2), transactionId);
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(dnsResponse.AsSpan(2, 2), 0x8180); // Response, No error
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(dnsResponse.AsSpan(4, 2), 1);
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(dnsResponse.AsSpan(6, 2), 1);
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(dnsResponse.AsSpan(8, 2), 0);
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(dnsResponse.AsSpan(10, 2), 0);
-
-            // 2. Question
-            payload.Slice(12, questionLength).CopyTo(dnsResponse.AsSpan(12));
-
-            // 3. Answer
-            int answerOffset = 12 + questionLength;
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(dnsResponse.AsSpan(answerOffset, 2), 0xC00C);
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(dnsResponse.AsSpan(answerOffset + 2, 2), qType); // Type A (1) or AAAA (28)
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(dnsResponse.AsSpan(answerOffset + 4, 2), 1);    // Class IN
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(dnsResponse.AsSpan(answerOffset + 6, 4), 60);   // TTL 60
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt16BigEndian(dnsResponse.AsSpan(answerOffset + 10, 2), (ushort)ipLength);
-
-            if (qType == 1)
-            {
-                fakeIp.GetAddressBytes().CopyTo(dnsResponse.AsSpan(answerOffset + 12, 4));
-            }
-            else
-            {
-                // Write IPv4-mapped IPv6 address (16 bytes)
-                byte[] ipv6Bytes = new byte[16];
-                ipv6Bytes[10] = 0xFF;
-                ipv6Bytes[11] = 0xFF;
-                fakeIp.GetAddressBytes().CopyTo(ipv6Bytes.AsSpan(12, 4));
-                ipv6Bytes.CopyTo(dnsResponse.AsSpan(answerOffset + 12, 16));
-            }
-
-            // 1. Send the response with the original queried port to satisfy the client application
-            InjectUdpResponse(adapterHandle, dot1q, packet, packet.DestinationPort, dnsResponse);
-
-            // 2. If the query came from a non-standard port (like 5353), also inject a response with source port 53 
-            // to trigger Leigod's WFP driver to whitelist the IP
-            if (packet.DestinationPort != 53)
-            {
-                InjectUdpResponse(adapterHandle, dot1q, packet, 53, dnsResponse);
-            }
-
-            var processInfoStr = process != null ? $"process={process.Name} pid={process.ProcessId}" : "process=unknown";
-            _log($"[DNS SPOOF] Spoofed {queryDomain} (Type={qType}) -> {fakeIp} ({processInfoStr}) (TargetPort={packet.DestinationPort})");
-            return true;
-        }
-
-        return false;
-    }
-
-    private void InjectUdpResponse(
-        IntPtr adapterHandle,
-        uint dot1q,
-        PacketView originalQuery,
-        ushort sourcePort,
-        ReadOnlySpan<byte> dnsPayload)
-    {
-        var target = new DirectRelayTarget(
-            originalQuery.DestinationAddress,
-            sourcePort,
-            _timeProvider.GetUtcNow(),
-            AdapterHandle: adapterHandle,
-            ClientAddress: originalQuery.SourceAddress,
-            ClientPort: originalQuery.SourcePort,
-            LinkHeader: originalQuery.GetLinkHeader(),
-            InboundEthernetSource: originalQuery.GetEthernetDestination(),
-            InboundEthernetDestination: originalQuery.GetEthernetSource(),
-            Dot1q: dot1q);
-        InjectUdpResponseToClient(
-            target,
-            new IPEndPoint(originalQuery.DestinationAddress, sourcePort),
-            dnsPayload.ToArray());
-    }
-
     private static NdisApi.EthRequest CreateRequest(NdisApi.IntermediateBuffer* buffer)
     {
         return new NdisApi.EthRequest
@@ -2699,7 +1227,7 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
 
         _disposed = true;
 
-        RestoreAdapterState();
+        _adapterPipelines?.Restore();
 
         if (_driverHandle != IntPtr.Zero)
         {
@@ -2710,76 +1238,4 @@ internal sealed unsafe class PacketFilterLoop : IDisposable
         GC.SuppressFinalize(this);
     }
 
-    private static bool TryGetDnsQueryDomain(ReadOnlySpan<byte> payload, out string domain)
-    {
-        domain = string.Empty;
-        if (payload.Length < 12)
-        {
-            return false;
-        }
-
-        ushort flags = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(payload.Slice(2, 2));
-        ushort qCount = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(payload.Slice(4, 2));
-        ushort ansCount = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(payload.Slice(6, 2));
-        ushort nsCount = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(payload.Slice(8, 2));
-        ushort addCount = System.Buffers.Binary.BinaryPrimitives.ReadUInt16BigEndian(payload.Slice(10, 2));
-
-        // Basic DNS query checks
-        if (qCount == 0 || (flags & 0x8000) != 0 || ansCount != 0 || nsCount != 0 || addCount > 1)
-        {
-            return false;
-        }
-
-        try
-        {
-            int offset = 12;
-            var sb = new System.Text.StringBuilder();
-            while (offset < payload.Length)
-            {
-                byte len = payload[offset];
-                if (len == 0)
-                {
-                    offset++;
-                    break;
-                }
-
-                if ((len & 0xC0) != 0 || len > 63)
-                {
-                    return false;
-                }
-
-                if (offset + 1 + len > payload.Length)
-                {
-                    return false;
-                }
-
-                for (int i = 0; i < len; i++)
-                {
-                    char c = (char)payload[offset + 1 + i];
-                    if (!char.IsLetterOrDigit(c) && c != '-' && c != '_' && c != '.')
-                    {
-                        return false;
-                    }
-                }
-
-                if (sb.Length > 0)
-                {
-                    sb.Append('.');
-                }
-                sb.Append(System.Text.Encoding.ASCII.GetString(payload.Slice(offset + 1, len)));
-                offset += 1 + len;
-            }
-
-            if (sb.Length > 0)
-            {
-                domain = sb.ToString();
-                return true;
-            }
-        }
-        catch
-        {
-        }
-
-        return false;
-    }
 }

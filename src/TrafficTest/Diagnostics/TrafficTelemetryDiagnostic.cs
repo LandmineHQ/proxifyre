@@ -61,9 +61,24 @@ internal static class TrafficTelemetryDiagnostic
 
         for (var i = 1; i <= 3; i++)
         {
-            var snapshot = new TrafficSnapshot(i * 100, i * 200, i * 10, i * 20);
+            var snapshot = new TrafficSnapshot(
+                i * 100,
+                i * 200,
+                i * 10,
+                i * 20,
+                i * 60,
+                i * 120,
+                i * 6,
+                i * 12,
+                i * 40,
+                i * 80,
+                i * 4,
+                i * 8);
             writer.WriteLine(TrafficTelemetryProtocol.Serialize(snapshot, i));
-            Console.WriteLine($"  sent up={snapshot.UploadBytes} down={snapshot.DownloadBytes} upRate={snapshot.UploadBytesPerSecond} downRate={snapshot.DownloadBytesPerSecond}");
+            Console.WriteLine(
+                $"  sent up={snapshot.UploadBytes} down={snapshot.DownloadBytes} " +
+                $"tcpUp={snapshot.TcpUploadBytes} tcpDown={snapshot.TcpDownloadBytes} " +
+                $"udpUp={snapshot.UdpUploadBytes} udpDown={snapshot.UdpDownloadBytes}");
             await Task.Delay(100, cancellationToken).ConfigureAwait(false);
         }
 
@@ -94,7 +109,23 @@ internal static class TrafficTelemetryDiagnostic
             {
                 Console.WriteLine(
                     $"  up={snapshot.UploadBytes} down={snapshot.DownloadBytes} " +
-                    $"upRate={snapshot.UploadBytesPerSecond} downRate={snapshot.DownloadBytesPerSecond}");
+                    $"tcpUp={snapshot.TcpUploadBytes} tcpDown={snapshot.TcpDownloadBytes} " +
+                    $"udpUp={snapshot.UdpUploadBytes} udpDown={snapshot.UdpDownloadBytes}");
+            }
+
+            for (var i = 0; i < received.Count; i++)
+            {
+                var expected = (i + 1);
+                var snapshot = received[i];
+                if (snapshot.TcpUploadBytes != expected * 60
+                    || snapshot.TcpDownloadBytes != expected * 120
+                    || snapshot.UdpUploadBytes != expected * 40
+                    || snapshot.UdpDownloadBytes != expected * 80)
+                {
+                    Console.Error.WriteLine(
+                        $"FAIL: protocol telemetry counters were not preserved for snapshot {expected}.");
+                    return 1;
+                }
             }
         }
 

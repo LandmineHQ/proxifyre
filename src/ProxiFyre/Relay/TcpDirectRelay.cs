@@ -1022,7 +1022,7 @@ internal sealed class TcpDirectRelay : IDisposable
                     if (item.Payload.Length > 0)
                     {
                         await SendClientPayloadAsync(socket, item).ConfigureAwait(false);
-                        _trafficCounter.AddUpload(item.Payload.Length);
+                        _trafficCounter.AddTcpUpload(item.Payload.Length);
                         _packetWakeSignal?.Pulse();
                     }
 
@@ -1177,7 +1177,7 @@ internal sealed class TcpDirectRelay : IDisposable
                         TrySendQueuedToClientLocked();
                     }
 
-                    _trafficCounter.AddDownload(read);
+                    _trafficCounter.AddTcpDownload(read);
                     _packetWakeSignal?.Pulse();
                 }
             }

@@ -9,9 +9,10 @@ public partial class TrafficStatusBar : UserControl
         InitializeComponent();
     }
 
-    public void SetTrafficStatus(string uploadText, string downloadText)
+    public void SetTrafficStatus(string uploadText, string downloadText, string? tooltip = null)
     {
         TrafficUploadText.Text = uploadText;
         TrafficDownloadText.Text = downloadText;
+        ToolTip = tooltip;
     }
 }

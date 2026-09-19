@@ -21,13 +21,14 @@ internal static class PacketSelfTest
             TestIpv4FragmentReassembly();
             TestIpv6FragmentReassembly();
             TestOutboundPassFlowRegistry();
+            TestTrafficCounterBreakdown();
             TestWfpProtocolLayout();
             TestUuPatchProfileCatalog();
             TestUuPatchPersistence();
             TestDisabledApplicationPersistence();
             TestNetworkInterfaceIndexResolution();
             TestRuntimeModuleCopy();
-            Console.WriteLine("PASS: packet parsing, multicast detection, VLAN, TCP fields, fragment reassembly, UU patch profiles/config, interface indexes, and runtime module copies.");
+            Console.WriteLine("PASS: packet parsing, multicast detection, VLAN, TCP fields, fragment reassembly, TCP/UDP traffic counters, UU patch profiles/config, interface indexes, and runtime module copies.");
             return 0;
         }
         catch (Exception ex)
@@ -56,6 +57,27 @@ internal static class PacketSelfTest
         Assert(view.UdpPayload.SequenceEqual(payload), "UDP payload should use the declared UDP length.");
     }
 
+    private static void TestTrafficCounterBreakdown()
+    {
+        var counter = new TrafficCounter();
+        counter.AddTcpUpload(1000);
+        counter.AddTcpDownload(2000);
+        counter.AddUdpUpload(3000);
+        counter.AddUdpDownload(4000);
+
+        var first = counter.Snapshot(TrafficSnapshot.Empty, elapsedSeconds: 1);
+        Assert(first.UploadBytes == 4000, "TCP/UDP upload totals mismatch.");
+        Assert(first.DownloadBytes == 6000, "TCP/UDP download totals mismatch.");
+        Assert(first.TcpUploadBytes == 1000 && first.TcpDownloadBytes == 2000, "TCP traffic counters mismatch.");
+        Assert(first.UdpUploadBytes == 3000 && first.UdpDownloadBytes == 4000, "UDP traffic counters mismatch.");
+
+        counter.AddTcpUpload(500);
+        counter.AddUdpDownload(1000);
+        var second = counter.Snapshot(first, elapsedSeconds: 0.5);
+        Assert(second.TcpUploadBytesPerSecond == 1000, "TCP upload rate mismatch.");
+        Assert(second.UdpDownloadBytesPerSecond == 2000, "UDP download rate mismatch.");
+    }
+
     private static void TestVlanParsing()
     {
         var payload = "vlan"u8.ToArray();
@@ -82,7 +104,7 @@ internal static class PacketSelfTest
     {
         var frame = new byte[PacketView.EthernetHeaderLength + 20 + 16];
         var payload = "fragment-payload"u8;
-        PacketFilterLoop.CopyIpv4UdpFragmentPayload(
+        PacketInjector.CopyIpv4UdpFragmentPayload(
             frame,
             PacketView.EthernetHeaderLength,
             payload);

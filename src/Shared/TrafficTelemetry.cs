@@ -15,7 +15,7 @@ internal static class TrafficTelemetryProtocol
     {
         return string.Create(
             CultureInfo.InvariantCulture,
-            $"seq={sequence} up={snapshot.UploadBytes} down={snapshot.DownloadBytes} upRate={snapshot.UploadBytesPerSecond} downRate={snapshot.DownloadBytesPerSecond}");
+            $"seq={sequence} up={snapshot.UploadBytes} down={snapshot.DownloadBytes} upRate={snapshot.UploadBytesPerSecond} downRate={snapshot.DownloadBytesPerSecond} tcpUp={snapshot.TcpUploadBytes} tcpDown={snapshot.TcpDownloadBytes} tcpUpRate={snapshot.TcpUploadBytesPerSecond} tcpDownRate={snapshot.TcpDownloadBytesPerSecond} udpUp={snapshot.UdpUploadBytes} udpDown={snapshot.UdpDownloadBytes} udpUpRate={snapshot.UdpUploadBytesPerSecond} udpDownRate={snapshot.UdpDownloadBytesPerSecond}");
     }
 
     public static bool TryParse(string line, out long sequence, out TrafficSnapshot snapshot)
@@ -31,6 +31,14 @@ internal static class TrafficTelemetryProtocol
         long down = 0;
         long upRate = 0;
         long downRate = 0;
+        long tcpUp = 0;
+        long tcpDown = 0;
+        long tcpUpRate = 0;
+        long tcpDownRate = 0;
+        long udpUp = 0;
+        long udpDown = 0;
+        long udpUpRate = 0;
+        long udpDownRate = 0;
         var hasSequence = false;
 
         foreach (var part in line.Split(' ', StringSplitOptions.RemoveEmptyEntries))
@@ -66,6 +74,30 @@ internal static class TrafficTelemetryProtocol
                 case "downRate":
                     downRate = parsed;
                     break;
+                case "tcpUp":
+                    tcpUp = parsed;
+                    break;
+                case "tcpDown":
+                    tcpDown = parsed;
+                    break;
+                case "tcpUpRate":
+                    tcpUpRate = parsed;
+                    break;
+                case "tcpDownRate":
+                    tcpDownRate = parsed;
+                    break;
+                case "udpUp":
+                    udpUp = parsed;
+                    break;
+                case "udpDown":
+                    udpDown = parsed;
+                    break;
+                case "udpUpRate":
+                    udpUpRate = parsed;
+                    break;
+                case "udpDownRate":
+                    udpDownRate = parsed;
+                    break;
                 default:
                     return false;
             }
@@ -76,7 +108,19 @@ internal static class TrafficTelemetryProtocol
             return false;
         }
 
-        snapshot = new TrafficSnapshot(up, down, upRate, downRate);
+        snapshot = new TrafficSnapshot(
+            up,
+            down,
+            upRate,
+            downRate,
+            tcpUp,
+            tcpDown,
+            tcpUpRate,
+            tcpDownRate,
+            udpUp,
+            udpDown,
+            udpUpRate,
+            udpDownRate);
         return true;
     }
 }

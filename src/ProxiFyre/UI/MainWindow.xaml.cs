@@ -1382,9 +1382,15 @@ public partial class MainWindow : Window
 
     private void UpdateTrafficStatus(TrafficSnapshot snapshot)
     {
+        var tooltip =
+            $"TCP  ↑ {FormatBytes(snapshot.TcpUploadBytesPerSecond)}/s · {FormatBytes(snapshot.TcpUploadBytes)}\n" +
+            $"TCP  ↓ {FormatBytes(snapshot.TcpDownloadBytesPerSecond)}/s · {FormatBytes(snapshot.TcpDownloadBytes)}\n" +
+            $"UDP  ↑ {FormatBytes(snapshot.UdpUploadBytesPerSecond)}/s · {FormatBytes(snapshot.UdpUploadBytes)}\n" +
+            $"UDP  ↓ {FormatBytes(snapshot.UdpDownloadBytesPerSecond)}/s · {FormatBytes(snapshot.UdpDownloadBytes)}";
         Tabs.SetTrafficStatus(
             $"↑ {FormatBytes(snapshot.UploadBytesPerSecond)}/s · {FormatBytes(snapshot.UploadBytes)}",
-            $"↓ {FormatBytes(snapshot.DownloadBytesPerSecond)}/s · {FormatBytes(snapshot.DownloadBytes)}");
+            $"↓ {FormatBytes(snapshot.DownloadBytesPerSecond)}/s · {FormatBytes(snapshot.DownloadBytes)}",
+            tooltip);
     }
 
     private static string FormatBytes(long bytes)

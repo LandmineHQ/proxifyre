@@ -599,7 +599,7 @@ internal sealed class UdpDirectRelay : IDisposable
             }
 
             _upBytes += sent;
-            _trafficCounter.AddUpload(sent);
+            _trafficCounter.AddUdpUpload(sent);
             _packetWakeSignal?.Pulse();
             LogStats("SEND");
         }
@@ -686,7 +686,7 @@ internal sealed class UdpDirectRelay : IDisposable
                 _refreshTarget();
                 _remoteEndPoint = remoteEndPoint;
                 _downBytes += result.ReceivedBytes;
-                _trafficCounter.AddDownload(result.ReceivedBytes);
+                _trafficCounter.AddUdpDownload(result.ReceivedBytes);
 
                 if (_responseInjector is null)
                 {

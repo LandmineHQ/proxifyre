@@ -197,7 +197,7 @@ internal sealed class RelayService : IDisposable, IAsyncDisposable
         {
             var now = _timeProvider.GetUtcNow();
             var elapsed = Math.Max(0.001, (now - previousTime).TotalSeconds);
-            var snapshot = _trafficCounter.Snapshot(previous.UploadBytes, previous.DownloadBytes, elapsed);
+            var snapshot = _trafficCounter.Snapshot(previous, elapsed);
             previous = snapshot;
             previousTime = now;
             _trafficSink?.Invoke(snapshot);

@@ -56,9 +56,9 @@ public partial class MainTabs : UserControl
         RuntimeInfoTab.SetLicenseKey(licenseKey);
     }
 
-    public void SetTrafficStatus(string uploadText, string downloadText)
+    public void SetTrafficStatus(string uploadText, string downloadText, string? tooltip = null)
     {
-        TrafficStatusBar.SetTrafficStatus(uploadText, downloadText);
+        TrafficStatusBar.SetTrafficStatus(uploadText, downloadText, tooltip);
     }
 
     public void ScrollLogToEnd()
