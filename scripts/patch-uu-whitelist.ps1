@@ -142,6 +142,189 @@ function Convert-HexBytes {
     )
 }
 
+function Convert-HexPattern {
+    param([string]$Value)
+
+    $tokens = @($Value -split "\s+" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($tokens.Count -eq 0) {
+        throw "UU byte signature is empty."
+    }
+
+    $values = [byte[]]::new($tokens.Count)
+    $masks = [byte[]]::new($tokens.Count)
+    for ($index = 0; $index -lt $tokens.Count; $index++) {
+        $token = $tokens[$index]
+        if ($token -eq "??") {
+            continue
+        }
+
+        if ($token.Length -ne 2) {
+            throw "Invalid UU signature token: $token"
+        }
+
+        $values[$index] = [Convert]::ToByte($token, 16)
+        $masks[$index] = 0xFF
+    }
+
+    return [pscustomobject]@{
+        Values = $values
+        Masks = $masks
+    }
+}
+
+function Get-PeSections {
+    param([byte[]]$Bytes)
+
+    $peOffset = [int](Get-UInt32 -Bytes $Bytes -Offset 0x3C)
+    if ((Get-UInt32 -Bytes $Bytes -Offset $peOffset) -ne 0x00004550) {
+        throw "The input file is not a valid PE image."
+    }
+
+    $sectionCount = Get-UInt16 -Bytes $Bytes -Offset ($peOffset + 0x06)
+    $optionalHeaderSize = Get-UInt16 -Bytes $Bytes -Offset ($peOffset + 0x14)
+    $sectionTable = $peOffset + 0x18 + $optionalHeaderSize
+    $sections = @()
+    for ($index = 0; $index -lt $sectionCount; $index++) {
+        $offset = $sectionTable + ($index * 0x28)
+        if (($offset + 0x28) -gt $Bytes.Length) {
+            throw "The PE section table is truncated."
+        }
+
+        $name = [Text.Encoding]::ASCII.GetString($Bytes, $offset, 8).Trim([char]0)
+        $virtualSize = Get-UInt32 -Bytes $Bytes -Offset ($offset + 0x08)
+        $virtualAddress = Get-UInt32 -Bytes $Bytes -Offset ($offset + 0x0C)
+        $rawSize = Get-UInt32 -Bytes $Bytes -Offset ($offset + 0x10)
+        $rawOffset = Get-UInt32 -Bytes $Bytes -Offset ($offset + 0x14)
+        $characteristics = Get-UInt32 -Bytes $Bytes -Offset ($offset + 0x24)
+        if ($rawOffset -ge $Bytes.Length) {
+            continue
+        }
+
+        if ((($characteristics -band 0x20000000) -eq 0) -and ($name -ne ".text")) {
+            continue
+        }
+
+        $sections += [pscustomobject]@{
+            Name = $name
+            VirtualAddress = $virtualAddress
+            VirtualSize = $virtualSize
+            RawOffset = $rawOffset
+            RawSize = [Math]::Min($rawSize, [uint32]($Bytes.Length - $rawOffset))
+            Characteristics = $characteristics
+        }
+    }
+
+    if ($sections.Count -eq 0) {
+        throw "The PE image has no executable sections."
+    }
+
+    return $sections
+}
+
+function Find-PatternRvas {
+    param(
+        [byte[]]$Bytes,
+        [object]$Pattern
+    )
+
+    $hits = [Collections.Generic.List[uint32]]::new()
+    foreach ($section in (Get-PeSections -Bytes $Bytes)) {
+        $start = [int]$section.RawOffset
+        $end = $start + [int]$section.RawSize
+        for ($offset = $start; ($offset + $Pattern.Values.Length) -le $end; $offset++) {
+            $matched = $true
+            for ($index = 0; $index -lt $Pattern.Values.Length; $index++) {
+                if (($Bytes[$offset + $index] -band $Pattern.Masks[$index]) -ne
+                    ($Pattern.Values[$index] -band $Pattern.Masks[$index])) {
+                    $matched = $false
+                    break
+                }
+            }
+
+            if ($matched) {
+                $hits.Add([uint32]($section.VirtualAddress + ($offset - $start)))
+            }
+        }
+    }
+
+    return $hits.ToArray()
+}
+
+function Convert-Rva {
+    param([string]$Value)
+
+    $text = if ($Value.StartsWith("0x", [StringComparison]::OrdinalIgnoreCase)) {
+        $Value.Substring(2)
+    }
+    else {
+        $Value
+    }
+
+    return [Convert]::ToUInt32($text, 16)
+}
+
+function Get-ResolvedPatchSpecs {
+    param(
+        [object]$Profile,
+        [byte[]]$Bytes,
+        [bool]$AllowRvaFallback
+    )
+
+    $specs = @()
+    foreach ($target in $Profile.targets) {
+        $rva = $null
+        $hasSignature = ($target.PSObject.Properties.Name -contains "signature") -and
+            (-not [string]::IsNullOrWhiteSpace($target.signature))
+        if ($hasSignature) {
+            $pattern = Convert-HexPattern -Value $target.signature
+            $hits = @(Find-PatternRvas -Bytes $Bytes -Pattern $pattern)
+            if ($hits.Count -eq 1) {
+                $signatureOffset = if ($target.PSObject.Properties.Name -contains "signatureOffset") {
+                    [int]$target.signatureOffset
+                }
+                else {
+                    0
+                }
+
+                $resolved = [int64]$hits[0] + $signatureOffset
+                if ($resolved -lt 0 -or $resolved -gt [uint32]::MaxValue) {
+                    throw "Signature offset is outside the image for '$($target.name)'."
+                }
+
+                $rva = [uint32]$resolved
+            }
+            elseif (-not $AllowRvaFallback -or [string]::IsNullOrWhiteSpace($target.rva)) {
+                throw "Signature for '$($target.name)' matched $($hits.Count) locations."
+            }
+        }
+
+        if ($null -eq $rva) {
+            if (-not $AllowRvaFallback -or [string]::IsNullOrWhiteSpace($target.rva)) {
+                throw "No usable function signature for '$($target.name)'."
+            }
+
+            $rva = Convert-Rva -Value $target.rva
+        }
+
+        $offset = Get-RvaFileOffset -Bytes $Bytes -Rva $rva
+        $original = Convert-HexBytes -Value $target.original
+        $patched = Convert-HexBytes -Value $target.patched
+        if (-not (Test-BytePrefix -Bytes $Bytes -Offset $offset -Expected $original) -and
+            -not (Test-BytePrefix -Bytes $Bytes -Offset $offset -Expected $patched)) {
+            throw "Resolved bytes do not match the known original or patched bytes for '$($target.name)'."
+        }
+
+        $specs += [pscustomobject]@{
+            Name = $target.name
+            Rva = $rva
+            Original = $original
+            Patched = $patched
+        }
+    }
+
+    return $specs
+}
+
 function Test-BytePrefix {
     param(
         [byte[]]$Bytes,
@@ -178,26 +361,6 @@ function Assert-UuStopped {
         $names = ($running | Select-Object -ExpandProperty ProcessName -Unique) -join ", "
         throw "Stop UU before replacing local_proxy.dll. Running processes: $names"
     }
-}
-
-function Get-PatchSpecs {
-    param([string]$ProfileKey)
-
-    $profile = $KnownProfiles |
-        Where-Object { $_.key -eq $ProfileKey } |
-        Select-Object -First 1
-    if ($null -eq $profile) {
-        throw "Unknown patch profile: $ProfileKey"
-    }
-
-    return @($profile.targets | ForEach-Object {
-        [pscustomobject]@{
-            Name = $_.name
-            Rva = [Convert]::ToUInt32($_.rva.Substring(2), 16)
-            Original = Convert-HexBytes -Value $_.original
-            Patched = Convert-HexBytes -Value $_.patched
-        }
-    })
 }
 
 $sourcePath = Resolve-LocalProxyPath -Path $InputPath
@@ -238,20 +401,60 @@ else {
 }
 
 $sourceHash = Get-Sha256 -Bytes $sourceBytes
-$profile = $KnownProfiles |
+$exactProfile = $KnownProfiles |
     Where-Object {
         ($_.sha256 -eq $sourceHash) -or ($_.patchedSha256 -eq $sourceHash)
     } |
     Select-Object -First 1
-if ($null -eq $profile) {
-    throw "Unsupported local_proxy.dll SHA256 '$sourceHash'. Add and validate a new version profile before patching."
+$dynamicMatch = $false
+if ($null -ne $exactProfile) {
+    $profile = $exactProfile
+    $patchSpecs = @(Get-ResolvedPatchSpecs -Profile $profile -Bytes $sourceBytes -AllowRvaFallback $true)
 }
-if (-not $Force -and $fileVersion -ne $profile.Version) {
-    throw ("SHA256 matches '{0}', but FileVersion is '{1}' instead of '{2}'. Use -Force only after re-validating the version metadata." -f
-        $profile.Label, $fileVersion, $profile.Version)
+else {
+    $candidates = @()
+    foreach ($candidate in $KnownProfiles) {
+        $targets = @($candidate.targets)
+        $signatureCount = @($targets | Where-Object {
+            ($_.PSObject.Properties.Name -contains "signature") -and
+            (-not [string]::IsNullOrWhiteSpace($_.signature))
+        }).Count
+        if ($signatureCount -ne $targets.Count) {
+            continue
+        }
+
+        try {
+            $candidateSpecs = @(Get-ResolvedPatchSpecs -Profile $candidate -Bytes $sourceBytes -AllowRvaFallback $false)
+            $candidates += [pscustomobject]@{
+                Profile = $candidate
+                Specs = $candidateSpecs
+            }
+        }
+        catch {
+        }
+    }
+
+    if ($candidates.Count -eq 0) {
+        throw "Unsupported local_proxy.dll SHA256 '$sourceHash' and no unique function-signature profile matched."
+    }
+
+    if ($candidates.Count -gt 1) {
+        $keys = ($candidates | ForEach-Object { $_.Profile.key }) -join ", "
+        throw "Multiple UU patch profiles matched the function signatures: $keys"
+    }
+
+    $profile = $candidates[0].Profile
+    $patchSpecs = $candidates[0].Specs
+    $dynamicMatch = $true
 }
 
-$patchSpecs = @(Get-PatchSpecs -ProfileKey $profile.Key)
+if (-not $Force -and ($dynamicMatch -or $fileVersion -ne $profile.Version)) {
+    throw ("The DLL matches profile '{0}' by {1}, but FileVersion is '{2}' instead of '{3}'. Use -Force only after re-validating the version metadata." -f
+        $profile.Label,
+        $(if ($dynamicMatch) { "function signatures" } else { "SHA256" }),
+        $fileVersion,
+        $profile.Version)
+}
 $patchedBytes = [byte[]]$sourceBytes.Clone()
 $patchResults = foreach ($patch in $patchSpecs) {
     $offset = Get-RvaFileOffset -Bytes $sourceBytes -Rva $patch.Rva

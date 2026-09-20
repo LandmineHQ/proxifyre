@@ -52,11 +52,12 @@
 - Patch the loaded `local_proxy.dll` image at runtime from the WPF UI. Do not
   modify the installed DLL or its Authenticode content.
 - Store patch profiles in `src/Shared/UuPatchProfiles.json`. Each profile must
-  include an exact source SHA256, target RVAs, expected original bytes, and
-  replacement bytes.
+  include an exact source SHA256 and expected original/replacement bytes. Every
+  target must include a unique function signature; fixed RVAs are only the fast
+  path for an exact hash match.
 - Fail closed. Validate the complete profile before writing anything, report
   the mismatched function to the UI, and never guess offsets or silently accept
-  unknown DLL hashes.
+  an unresolved or ambiguous DLL version.
 - Preserve UU process matching and ACLs. Removing domain or destination
   restrictions must not make unrelated processes eligible for acceleration.
 - Suspend the target process while changing code bytes, restore page protection
@@ -64,8 +65,9 @@
 - Persist the UI switch as `enableUuWhitelistPatch`. While enabled, re-check
   loaded UU modules every three seconds and reapply the runtime patch after UU
   restarts or reloads `local_proxy.dll`.
-- Determine enabled state by inspecting the live module path, SHA256, and
-  target bytes. Do not rely only on an injected status message.
+- Determine enabled state by inspecting the live module path, SHA256 or
+  validated function signature, and target bytes. Do not rely only on an
+  injected status message.
 - If UU is elevated and ProxiFyre is not, request elevation with `runas` before
   inspecting or changing UU memory. The elevated UI must wait for the previous
   single-instance mutex to be released.
@@ -118,6 +120,8 @@ Use the repository wrapper for normal work:
   WinpkFilter, and Administrator privileges. `traffic-telemetry` does not.
 - Runtime UU validation requires a running UU process with `local_proxy.dll`
   loaded and sufficient privileges to inspect or modify that process.
+- After changing UU signatures, validate uniqueness against the supported DLL:
+  `node scripts/check-uu-signatures.cjs src/Shared/UuPatchProfiles.json <local_proxy.dll>`.
 - Build the WFP driver only when changing the WFP integration or when the task
   explicitly requires it. Loading an unsigned development driver requires test
   signing or a trusted test signature.

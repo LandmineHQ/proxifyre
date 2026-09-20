@@ -73,9 +73,13 @@ For the supported `5247` profile, the runtime patch targets are:
 | `0x994B0` | Browser QUIC block | Return not blocked. |
 | `0x9DC80` | UDP destination/port block rules | Return not blocked. |
 
-The profile is validated by SHA256 and by the expected bytes at every target
-RVA. If a function signature does not match, ProxiFyre reports the profile or
-function mismatch and does not write anything.
+Each profile contains an exact source SHA256 as a fast path and a unique
+function signature for every target. The patcher reads the PE `.text` section
+and wildcards relocation-sensitive bytes in those signatures. If the installed
+DLL is a newer build, ProxiFyre still locates the function when every target
+signature remains unique and the bytes at the resolved address match either the
+known original or known patched form. A missing or ambiguous signature fails
+closed and does not write anything.
 
 ## UI Behavior
 
@@ -117,13 +121,18 @@ state rather than a separate in-process agent.
 ## Offline Patch Script
 
 `scripts/patch-uu-whitelist.ps1` can produce an on-disk patched copy for
-diagnostics or deployment. The WPF UI uses the runtime patcher and does not
-require the offline script.
+diagnostics or deployment. It uses the same exact-hash fast path and dynamic
+function-signature matching as the WPF runtime patcher. The WPF UI uses the
+runtime patcher and does not require the offline script.
 
 ## Limitations
 
-- Patch offsets are UU-build specific.
-- A UU update can change `local_proxy.dll` and invalidate the profile.
+- Dynamic signatures tolerate DLL layout and RVA changes when the target
+  functions themselves remain unchanged.
+- A function-body change can invalidate a signature; an updated profile must
+  be added for that new function form.
+- A signature must be unique in the executable sections. Ambiguous matches are
+  rejected.
 - Process matching remains mandatory; an unrecognized process is not
   accelerated.
 - Localhost, private, broadcast, multicast, unsupported protocol, unavailable

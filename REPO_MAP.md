@@ -13,7 +13,7 @@ normal outbound sockets for selected flows, and injects synthetic response
 packets back into Windows TCP/IP without opening local TCP or UDP listeners.
 
 The WPF Settings tab also provides an optional UU Game Booster compatibility
-toggle. It applies a SHA256-validated, reversible code patch to the loaded
+toggle. It applies a signature-validated, reversible code patch to the loaded
 `local_proxy.dll` image in a running UU process. It never modifies the
 installed DLL from the UI and preserves UU's process ACL.
 
@@ -88,8 +88,9 @@ items by `ProxiFyre`, `ProxiFyre.Module`, and in some cases other projects.
 | `global.json` | Pins the expected .NET SDK to `10.0.100` with latest-feature roll-forward. |
 | `manifest.json` | Local version, source URL, and announcement metadata copied into application output. |
 | `scripts/proxifyre.ps1` | Main PowerShell development wrapper for build, UI, run, tests, config, license, publishing, reset, and clean operations. |
-| `scripts/patch-uu-whitelist.ps1` | SHA256-profile binary patcher for UU `local_proxy.dll`. It keeps the existing process ACL and disables the TCP/UDP domain and destination allow/deny gates before UU writes the active proxy settings to `uuwfp.sys`. |
-| `src/Shared/UuPatchProfiles.json` | Shared UU patch profile catalog used by both the WPF runtime patcher and the offline PowerShell patcher. Each profile contains the source SHA256, patched SHA256, function RVAs, and expected original/replacement bytes. |
+| `scripts/patch-uu-whitelist.ps1` | Binary patcher for UU `local_proxy.dll`. It keeps the existing process ACL and disables the TCP/UDP domain and destination allow/deny gates before UU writes the active proxy settings to `uuwfp.sys`. |
+| `scripts/check-uu-signatures.cjs` | Validates that every UU profile function signature resolves exactly once in the target DLL and matches its recorded RVA when present. |
+| `src/Shared/UuPatchProfiles.json` | Shared UU patch profile catalog used by both the WPF runtime patcher and the offline PowerShell patcher. Each profile contains source/patched SHA256 values, expected original/replacement bytes, and unique function signatures with offsets. |
 | `docs/UU_ACCELERATOR.md` | UU architecture, WFP driver interface, whitelist processing, runtime patch semantics, UI behavior, and known limitations. |
 | `.github/workflows/build.yml` | Windows x64 Release build, packet self-test, release staging, and named build-artifact upload. |
 | `.github/workflows/release.yml` | Manual promotion of a successful Build artifact into a GitHub Release. |
@@ -172,9 +173,10 @@ reports the version, build ID, asset path, and SHA256.
 1. The Settings tab raises `UuPatchToggleRequested` when the UU switch changes.
 2. `UuRuntimePatcher` scans processes whose executable is under a NetEase UU
    installation root and locates loaded `local_proxy.dll` modules.
-3. The module file is hashed and matched against `UuPatchProfiles.json`.
-4. Each target RVA is read from the live process. The patcher accepts only the
-   exact original bytes or the exact known patched bytes.
+3. The module file is hashed for the exact-profile fast path and scanned for
+   unique function signatures when the hash is unknown.
+4. Each resolved target address is read from the live process. The patcher
+   accepts only the exact original bytes or the exact known patched bytes.
 5. Enabling the switch asks for confirmation, then suspends the UU process,
    changes the target page to `PAGE_EXECUTE_READWRITE`, writes the replacement
    stubs, flushes the instruction cache, and restores page protection.
@@ -447,7 +449,8 @@ best-effort and intentionally separate from logs and the control channel.
 | Path | Responsibility |
 | --- | --- |
 | `UuElevation.cs` | Checks whether ProxiFyre is elevated, recognizes the elevated-UI launch argument, and restarts the WPF process through `runas` before UU process inspection or memory patching. |
-| `UuPatchCatalog.cs` | Loads and validates UU patch profiles from `UuPatchProfiles.json`, parses hex byte arrays and RVAs, and resolves a profile by source or patched SHA256. |
+| `UuPatchCatalog.cs` | Loads and validates UU patch profiles from `UuPatchProfiles.json`, parses hex byte arrays, RVAs, and wildcard function signatures, and resolves profiles by exact hash or signature. |
+| `UuPatchLocator.cs` | Parses the PE executable sections, finds each function signature uniquely, maps signature offsets to RVAs, and rejects missing, ambiguous, or byte-mismatched targets. |
 | `UuRuntimePatcher.cs` | Scans running UU processes for loaded `local_proxy.dll` modules, validates each target function, applies or restores code bytes with `VirtualProtectEx`/`WriteProcessMemory`, suspends the target process during writes, and flushes the instruction cache. |
 
 ## `src/ProxiFyre.Module`
@@ -592,7 +595,7 @@ Output locations:
 | `<app output>/runtime/<Configuration>/` | Timestamped module DLL copies prepared for injection. |
 | `<app output>/dependencies/` | Cached WinpkFilter MSI and installer logs. |
 | `<app output>/app-config.json` | UI runtime configuration. |
-| `<app output>/UuPatchProfiles.json` | UU DLL hash, RVA, and byte-signature catalog copied from `src/Shared`. |
+| `<app output>/UuPatchProfiles.json` | UU DLL hash, RVA fallback, and dynamic byte-signature catalog copied from `src/Shared`. |
 | `<app output>/proxifyre-ui.log` | UI-side log. |
 | `<app output>/proxifyre-core.log` | CLI or injected-module relay log. |
 | `artifacts/uu-patch/<version>/local_proxy.dll` | Patch output for the matching UU `local_proxy.dll` version. The installer backup is written beside the installed DLL as `local_proxy.dll.uu-original.<hash>.bak`. |
@@ -677,9 +680,9 @@ integration and regression harness.
 - `ProxiFyre.Probe` is an investigation tool, not a production fallback.
 - The Leigod redirect diagnostic depends on an external WFP/driver environment
   and is not a portable automated test.
-- UU runtime patching requires a matching `local_proxy.dll` SHA256 profile and
-  an already loaded module. The patch is lost when UU restarts and is
-  intentionally not written to the installed DLL.
+- UU runtime patching requires either a matching SHA256 profile or a unique
+  dynamic function-signature match, plus an already loaded module. The patch is
+  lost when UU restarts and is intentionally not written to the installed DLL.
 - UU process matching, local/private traffic handling, unsupported protocols,
   proxy-line availability, and region/health fallbacks remain outside the
   runtime patch.

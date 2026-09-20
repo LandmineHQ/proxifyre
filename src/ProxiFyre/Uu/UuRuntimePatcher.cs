@@ -20,6 +20,8 @@ internal sealed class UuTargetInspection
 {
     public required UuPatchTarget Target { get; init; }
 
+    public required uint Rva { get; init; }
+
     public required bool IsOriginal { get; init; }
 
     public required bool IsPatched { get; init; }
@@ -213,13 +215,19 @@ internal sealed class UuRuntimePatcher
         }
 
         var fileHash = ComputeSha256(modulePath);
-        var profile = UuPatchCatalog.FindByHash(_profiles, fileHash, allowPatchedHash: true);
-        if (profile is null)
+        if (!UuPatchLocator.TryResolve(
+                _profiles,
+                modulePath,
+                fileHash,
+                out var profile,
+                out var resolvedTargets,
+                out var resolutionError)
+            || profile is null)
         {
             return CreateErrorModule(
                 process,
                 module,
-                $"未找到匹配的 local_proxy.dll 版本：{fileHash}");
+                resolutionError ?? $"未找到匹配的 local_proxy.dll 版本：{fileHash}");
         }
 
         using var handle = OpenProcess(
@@ -228,9 +236,10 @@ internal sealed class UuRuntimePatcher
 
         var targets = new List<UuTargetInspection>();
         var mismatches = new List<string>();
-        foreach (var target in profile.Targets)
+        foreach (var resolvedTarget in resolvedTargets)
         {
-            var address = AddOffset(module.BaseAddress, target.Rva);
+            var target = resolvedTarget.Target;
+            var address = AddOffset(module.BaseAddress, resolvedTarget.Rva);
             var bytes = ReadBytes(handle, address, target.OriginalBytes.Length);
             var isOriginal = bytes.AsSpan().SequenceEqual(target.OriginalBytes);
             var isPatched = bytes.AsSpan().SequenceEqual(target.PatchedBytes);
@@ -242,6 +251,7 @@ internal sealed class UuRuntimePatcher
             targets.Add(new UuTargetInspection
             {
                 Target = target,
+                Rva = resolvedTarget.Rva,
                 IsOriginal = isOriginal,
                 IsPatched = isPatched
             });
@@ -333,7 +343,7 @@ internal sealed class UuRuntimePatcher
                 string Name)>();
             foreach (var target in module.Targets)
             {
-                var address = AddOffset(module.ModuleBaseAddress, target.Target.Rva);
+                var address = AddOffset(module.ModuleBaseAddress, target.Rva);
                 var current = ReadBytes(handle, address, target.Target.OriginalBytes.Length);
                 var isOriginal = current.AsSpan().SequenceEqual(target.Target.OriginalBytes);
                 var isPatched = current.AsSpan().SequenceEqual(target.Target.PatchedBytes);

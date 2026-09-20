@@ -8,7 +8,11 @@ internal sealed class UuPatchTarget
 {
     public required string Name { get; init; }
 
-    public required uint Rva { get; init; }
+    public uint? Rva { get; init; }
+
+    public UuBytePattern? Signature { get; init; }
+
+    public int SignatureOffset { get; init; }
 
     public required byte[] OriginalBytes { get; init; }
 
@@ -87,7 +91,27 @@ internal static class UuPatchCatalog
         foreach (var targetElement in targetsElement.EnumerateArray())
         {
             var name = GetRequiredString(targetElement, "name");
-            var rva = ParseRva(GetRequiredString(targetElement, "rva"));
+            uint? rva = TryGetString(targetElement, "rva") is { } rvaText
+                ? ParseRva(rvaText)
+                : null;
+            var signature = TryGetString(targetElement, "signature") is { } signatureText
+                ? UuBytePattern.Parse(signatureText)
+                : null;
+            var signatureOffset = TryGetString(targetElement, "signatureOffset") is { } offsetText
+                ? ParseInt32(offsetText)
+                : 0;
+            if (signature is null)
+            {
+                throw new InvalidDataException(
+                    $"UU patch target '{key}/{name}' has no function signature.");
+            }
+
+            if (rva is null)
+            {
+                throw new InvalidDataException(
+                    $"UU patch target '{key}/{name}' has no RVA fallback.");
+            }
+
             var original = ParseBytes(GetRequiredString(targetElement, "original"));
             var patched = ParseBytes(GetRequiredString(targetElement, "patched"));
             if (original.Length == 0 || original.Length != patched.Length)
@@ -100,6 +124,8 @@ internal static class UuPatchCatalog
             {
                 Name = name,
                 Rva = rva,
+                Signature = signature,
+                SignatureOffset = signatureOffset,
                 OriginalBytes = original,
                 PatchedBytes = patched
             });
@@ -128,12 +154,34 @@ internal static class UuPatchCatalog
         return property.GetString()!.Trim();
     }
 
+    private static string? TryGetString(JsonElement element, string propertyName)
+    {
+        if (!element.TryGetProperty(propertyName, out var property)
+            || property.ValueKind != JsonValueKind.String)
+        {
+            return null;
+        }
+
+        var value = property.GetString();
+        return string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+    }
+
     private static uint ParseRva(string value)
     {
         var text = value.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
             ? value[2..]
             : value;
         return uint.Parse(text, NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture);
+    }
+
+    private static int ParseInt32(string value)
+    {
+        if (value.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+        {
+            return int.Parse(value[2..], NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture);
+        }
+
+        return int.Parse(value, NumberStyles.Integer, CultureInfo.InvariantCulture);
     }
 
     private static byte[] ParseBytes(string value)

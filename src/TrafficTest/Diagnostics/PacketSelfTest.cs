@@ -307,16 +307,41 @@ internal static class PacketSelfTest
         var repositoryRoot = RepositoryPaths.FindRepositoryRoot(AppContext.BaseDirectory);
         var catalogPath = Path.Combine(repositoryRoot, "src", "Shared", "UuPatchProfiles.json");
         var profiles = UuPatchCatalog.Load(catalogPath);
-        Assert(profiles.Count >= 2, "UU patch profile catalog did not load all known profiles.");
+        Assert(profiles.Count == 1, "UU patch profile catalog should only contain the current supported profile.");
 
         var current = profiles.Single(profile => profile.Key == "uu-5247");
         Assert(current.Version == "9.9.9.99", "Current UU patch profile version mismatch.");
         Assert(current.Targets.Count == 7, "Current UU patch profile target count mismatch.");
         Assert(
+            current.Targets.All(target => target.Signature is not null),
+            "Current UU patch profile must provide a dynamic function signature for every target.");
+        Assert(
             current.Targets.All(target =>
                 target.OriginalBytes.Length == target.PatchedBytes.Length
                 && target.OriginalBytes.Length > 0),
             "UU patch profile contains invalid target bytes.");
+
+        var installedDll = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
+            "Netease",
+            "UU",
+            "5247",
+            "local_proxy.dll");
+        if (File.Exists(installedDll))
+        {
+            Assert(
+                UuPatchLocator.TryResolve(
+                    profiles,
+                    installedDll,
+                    "UNKNOWN-UU-HASH",
+                    out var resolvedProfile,
+                    out var resolvedTargets,
+                    out var resolutionError),
+                $"UU dynamic signature resolution failed: {resolutionError}");
+            Assert(
+                resolvedProfile?.Key == "uu-5247" && resolvedTargets.Count == current.Targets.Count,
+                "UU dynamic signature resolution selected the wrong profile or target count.");
+        }
     }
 
     private static void TestUuPatchPersistence()

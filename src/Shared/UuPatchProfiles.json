@@ -10,95 +10,58 @@
         {
           "name": "Disable TCP process-domain restriction",
           "rva": "0x526C0",
+          "signature": "55 8B EC 6A FF 68 ?? ?? ?? ?? 64 A1 00 00 00 00 50 81 EC DC 02 00 00 A1 ?? ?? ?? ?? 33 C5 89 45 F0 50 8D 45 F4 64 A3 00 00 00 00",
+          "signatureOffset": "0",
           "original": "55 8B EC 6A FF",
           "patched": "32 C0 C2 08 00"
         },
         {
           "name": "Disable UDP process-domain restriction",
           "rva": "0xB2A10",
+          "signature": "55 8B EC 6A FF 68 ?? ?? ?? ?? 64 A1 00 00 00 00 50 81 EC AC 01 00 00 A1 ?? ?? ?? ?? 33 C5 89 45 F0 50 8D 45 F4 64 A3 00 00 00 00",
+          "signatureOffset": "0",
           "original": "55 8B EC 6A FF",
           "patched": "32 C0 C2 10 00"
         },
         {
           "name": "Treat every destination as proxy ACL match",
           "rva": "0x996A0",
+          "signature": "55 8B EC 6A FF 68 ?? ?? ?? ?? 64 A1 00 00 00 00 50 51 81 EC 24 01 00 00 A1 ?? ?? ?? ?? 33 C5 89 45 EC 53 56 57 50 8D 45 F4 64 A3 00 00 00 00",
+          "signatureOffset": "0",
           "original": "55 8B EC 6A FF",
           "patched": "B0 01 C2 0C 00"
         },
         {
           "name": "Disable TCP destination ban list",
           "rva": "0x9A770",
+          "signature": "55 8B EC 83 EC 48 89 4D FC 8B 45 08 0F B7 48 02 51 FF 15 ?? ?? ?? ?? 0F B7 D0 89 55 F8 8B 45 FC 89 45 F4 8D 4D F8 51 8D 55 C4 52 8B 4D F4 E8 ?? ?? ?? ??",
+          "signatureOffset": "0",
           "original": "55 8B EC 83 EC",
           "patched": "32 C0 C2 04 00"
         },
         {
           "name": "Disable UDP game ban list",
           "rva": "0x9A870",
+          "signature": "55 8B EC 83 EC 48 89 4D FC 8B 45 08 0F B7 48 02 51 FF 15 ?? ?? ?? ?? 0F B7 D0 89 55 F8 8B 45 FC 83 C0 08 89 45 F4 8D 4D F8 51 8D 55 C4 52 8B 4D F4 E8 ?? ?? ?? ??",
+          "signatureOffset": "0",
           "original": "55 8B EC 83 EC",
           "patched": "32 C0 C2 04 00"
         },
         {
           "name": "Disable browser QUIC block",
           "rva": "0x994B0",
+          "signature": "55 8B EC 6A FF 68 ?? ?? ?? ?? 64 A1 00 00 00 00 50 81 EC AC 00 00 00 A1 ?? ?? ?? ?? 33 C5 89 45 F0 50 8D 45 F4 64 A3 00 00 00 00 89 4D 84 8D 4D 88 E8 ?? ?? ?? ??",
+          "signatureOffset": "0",
           "original": "55 8B EC 6A FF",
           "patched": "32 C0 C2 0C 00"
         },
         {
           "name": "Disable UDP destination/port block rules",
           "rva": "0x9DC80",
+          "signature": "55 8B EC 83 EC 4C 89 4D E4 8B 45 E4 50 8D 4D DC E8 ?? ?? ?? ?? 8B 4D 08 8B 51 04 52 FF 15 ?? ?? ?? ?? 89 45 C0 8B 45 08 0F B7 48 02 51 FF 15 ?? ?? ?? ??",
+          "signatureOffset": "0",
           "original": "55 8B EC 83 EC",
           "patched": "32 C0 C2 04 00"
-        }
-      ]
-    },
-    {
-      "key": "uu-5223",
-      "label": "UU 6.9.2.615 / local_proxy 1.0.0.2948",
-      "version": "1.0.0.2948",
-      "sha256": "7692FF2A1DE72857B8D1E7C2A711D7731A83145924C3F473B5BAAF225A33BA0E",
-      "patchedSha256": "896BD3A977ED08DCB643320537A749DCB9F03E437ADCCDCAF1EB5F1B5F39D2E6",
-      "targets": [
-        {
-          "name": "Disable TCP process-domain restriction",
-          "rva": "0x52380",
-          "original": "55 8B EC 6A FF",
-          "patched": "32 C0 C2 08 00"
-        },
-        {
-          "name": "Disable UDP process-domain restriction",
-          "rva": "0xCF380",
-          "original": "55 8B EC 6A FF",
-          "patched": "32 C0 C2 10 00"
-        },
-        {
-          "name": "Treat every destination as proxy ACL match",
-          "rva": "0xB0940",
-          "original": "55 8B EC 6A FF",
-          "patched": "B0 01 C2 0C 00"
-        },
-        {
-          "name": "Disable TCP destination ban list",
-          "rva": "0xB1740",
-          "original": "55 8B EC 83 EC",
-          "patched": "32 C0 C2 04 00"
-        },
-        {
-          "name": "Disable UDP game ban list",
-          "rva": "0xB1800",
-          "original": "55 8B EC 83 EC",
-          "patched": "32 C0 C2 04 00"
-        },
-        {
-          "name": "Disable browser QUIC block",
-          "rva": "0xB0790",
-          "original": "55 8B EC 6A FF",
-          "patched": "32 C0 C2 0C 00"
-        },
-        {
-          "name": "Disable UDP destination/port block rules",
-          "rva": "0xB4820",
-          "original": "55 8B EC 6A FF",
-          "patched": "32 C0 C2 08 00"
         }
       ]
     }
