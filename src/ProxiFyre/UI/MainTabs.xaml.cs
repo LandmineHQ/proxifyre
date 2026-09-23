@@ -12,7 +12,6 @@ public partial class MainTabs : UserControl
         ApplicationRulesTab.ToggleEnabledRequested += (_, e) => ToggleEnabledRequested?.Invoke(this, e);
         ApplicationRulesTab.RemoveAppRequested += (_, e) => RemoveAppRequested?.Invoke(this, e);
         RuntimeInfoTab.ReloadRequested += (_, _) => ReloadRequested?.Invoke(this, EventArgs.Empty);
-        SettingsTab.WinpkFilterActionRequested += (_, _) => WinpkFilterActionRequested?.Invoke(this, EventArgs.Empty);
         SettingsTab.UuPatchToggleRequested += (_, e) => UuPatchToggleRequested?.Invoke(this, e);
     }
 
@@ -25,8 +24,6 @@ public partial class MainTabs : UserControl
     public event EventHandler<ItemRequestedEventArgs>? RemoveAppRequested;
 
     public event EventHandler? ReloadRequested;
-
-    public event EventHandler? WinpkFilterActionRequested;
 
     public event EventHandler<UuPatchToggleRequestedEventArgs>? UuPatchToggleRequested;
 

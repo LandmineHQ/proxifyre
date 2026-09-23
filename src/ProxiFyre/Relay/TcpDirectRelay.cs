@@ -29,11 +29,13 @@ internal sealed class TcpDirectRelay : IDisposable
     private static readonly TimeSpan InitialRetransmissionTimeout = TimeSpan.FromMilliseconds(600);
     private static readonly TimeSpan MaxRetransmissionTimeout = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan ConnectTimeout = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan IdleTimeout = TimeSpan.FromMinutes(30);
     private static readonly TimeSpan MaintenanceInterval = TimeSpan.FromMilliseconds(200);
     private static readonly TimeSpan BypassFlowTtl = TimeSpan.FromSeconds(30);
 
     private readonly ConcurrentDictionary<TcpRelayKey, TcpRelayConnection> _connections = new();
     private readonly ConcurrentDictionary<TcpRelayKey, byte> _relayOutboundFlows = new();
+    private readonly ConcurrentDictionary<RelayOwnedTcpEndpoint, int> _relayOutboundLocalEndpoints = new();
     private readonly ConcurrentDictionary<TcpRelayKey, DateTimeOffset> _bypassedFlows = new();
     private readonly Action<string> _log;
     private readonly bool _detailedLogging;
@@ -158,6 +160,22 @@ internal sealed class TcpDirectRelay : IDisposable
             flowKey.RemotePort));
     }
 
+    public bool IsRelayOutboundLocalEndpoint(IPAddress localAddress, ushort localPort)
+    {
+        localAddress = NetworkAddress.Normalize(localAddress);
+        if (_relayOutboundLocalEndpoints.ContainsKey(
+                new RelayOwnedTcpEndpoint(localAddress, localPort)))
+        {
+            return true;
+        }
+
+        var wildcard = localAddress.AddressFamily == AddressFamily.InterNetwork
+            ? IPAddress.Any
+            : IPAddress.IPv6Any;
+        return _relayOutboundLocalEndpoints.ContainsKey(
+            new RelayOwnedTcpEndpoint(wildcard, localPort));
+    }
+
     public int ConnectionCount => _connections.Count;
 
     public void MarkBypassedFlow(TcpRelayKey flowKey)
@@ -181,6 +199,22 @@ internal sealed class TcpDirectRelay : IDisposable
         return false;
     }
 
+    public void ApplyConfiguration(AppConfiguration configuration)
+    {
+        foreach (var connection in _connections.Values.ToArray())
+        {
+            var process = new ProcessInfo(
+                connection.Target.ProcessId,
+                connection.Target.ProcessName,
+                connection.Target.ProcessPath,
+                connection.Target.ProcessStartTimeUtcTicks);
+            if (!configuration.TryGetMatchingPattern(process, out _, out _))
+            {
+                Remove(connection);
+            }
+        }
+    }
+
     public void Remove(TcpRelayConnection connection)
     {
         if (_connections.TryGetValue(connection.FlowKey, out var current)
@@ -202,6 +236,14 @@ internal sealed class TcpDirectRelay : IDisposable
 
     private void RegisterOutboundFlow(RelayOutboundFlow flow)
     {
+        if (flow.LocalPort != 0)
+        {
+            _relayOutboundLocalEndpoints.AddOrUpdate(
+                new RelayOwnedTcpEndpoint(flow.LocalAddress, flow.LocalPort),
+                1,
+                static (_, count) => count + 1);
+        }
+
         _relayOutboundFlows[new TcpRelayKey(
             flow.AdapterHandle,
             flow.Dot1q,
@@ -214,6 +256,16 @@ internal sealed class TcpDirectRelay : IDisposable
 
     private void UnregisterOutboundFlow(RelayOutboundFlow flow)
     {
+        var endpoint = new RelayOwnedTcpEndpoint(flow.LocalAddress, flow.LocalPort);
+        if (flow.LocalPort != 0
+            && _relayOutboundLocalEndpoints.AddOrUpdate(
+                endpoint,
+                0,
+                static (_, count) => Math.Max(0, count - 1)) == 0)
+        {
+            _relayOutboundLocalEndpoints.TryRemove(endpoint, out _);
+        }
+
         _relayOutboundFlows.TryRemove(
             new TcpRelayKey(
                 flow.AdapterHandle,
@@ -232,6 +284,8 @@ internal sealed class TcpDirectRelay : IDisposable
         RandomNumberGenerator.Fill(bytes);
         return BinaryPrimitives.ReadUInt32BigEndian(bytes);
     }
+
+    private readonly record struct RelayOwnedTcpEndpoint(IPAddress Address, ushort Port);
 
     private void LogDetail(string message)
     {
@@ -283,6 +337,7 @@ internal sealed class TcpDirectRelay : IDisposable
 
         _connections.Clear();
         _relayOutboundFlows.Clear();
+        _relayOutboundLocalEndpoints.Clear();
         _bypassedFlows.Clear();
     }
 
@@ -401,6 +456,8 @@ internal sealed class TcpDirectRelay : IDisposable
         public TcpClientKey ClientKey => _clientKey;
 
         public uint ClientInitialSequence => _clientInitialSequence;
+
+        public DirectRelayTarget Target => _target;
 
         public bool IsClosed
         {
@@ -1164,6 +1221,7 @@ internal sealed class TcpDirectRelay : IDisposable
                             return;
                         }
 
+                        _lastActivity = _timeProvider.GetUtcNow();
                         var sequence = _remoteSendNext;
                         var segment = new TcpSegment(
                             (uint)sequence,
@@ -1186,7 +1244,10 @@ internal sealed class TcpDirectRelay : IDisposable
             }
             catch (Exception ex)
             {
-                FailClient($"DIRECT TCP remote receive failed for {_clientKey.ClientAddress}:{_clientKey.ClientPort} -> {_target.RemoteAddress}:{_target.RemotePort}: {ex.Message}");
+                var socketError = ex is SocketException socketException
+                    ? $" socketError={socketException.SocketErrorCode}"
+                    : string.Empty;
+                FailClient($"DIRECT TCP remote receive failed for {_clientKey.ClientAddress}:{_clientKey.ClientPort} -> {_target.RemoteAddress}:{_target.RemotePort}:{socketError} {ex.Message}");
             }
         }
 
@@ -1511,6 +1572,10 @@ internal sealed class TcpDirectRelay : IDisposable
                 if (!_connectedFlag && now - _createdAt > ConnectTimeout)
                 {
                     failureMessage = "DIRECT TCP relay timed out while connecting.";
+                }
+                else if (now - _lastActivity > IdleTimeout)
+                {
+                    failureMessage = "DIRECT TCP relay timed out while idle.";
                 }
                 else if (_outboundToClient.Count > 0)
                 {

@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.IO;
 
 namespace ProxiFyre;
@@ -9,31 +8,33 @@ internal sealed class RelayService : IDisposable, IAsyncDisposable
     private readonly Action<TrafficSnapshot>? _trafficSink;
     private readonly bool _detailedLogging;
     private readonly TimeProvider _timeProvider;
+    private readonly ProcessLookup _processLookup;
     private readonly TrafficCounter _trafficCounter = new();
     private readonly PacketWakeSignal _packetWakeSignal = new();
+    private readonly SemaphoreSlim _lifecycleGate = new(1, 1);
     private CancellationTokenSource? _cts;
     private DynamicAppConfiguration? _configuration;
-    private TcpDirectRelay? _tcpRelay;
-    private UdpDirectRelay? _udpRelay;
-    private PacketFilterLoop? _filter;
-    private Task? _filterTask;
-    private WfpFlowClassifier? _wfpClassifier;
-    private Task? _wfpClassifierTask;
-    private bool _wfpClassifierFallback;
+    private WinDivertPacketRouter? _router;
+    private Task? _routerTask;
     private Task? _trafficStatsTask;
     private Task? _configurationWatchTask;
 
-    public RelayService(Action<string> log, bool detailedLogging = false, Action<TrafficSnapshot>? trafficSink = null, TimeProvider? timeProvider = null)
+    public RelayService(
+        Action<string> log,
+        bool detailedLogging = false,
+        Action<TrafficSnapshot>? trafficSink = null,
+        TimeProvider? timeProvider = null)
     {
         _log = log;
         _trafficSink = trafficSink;
         _detailedLogging = detailedLogging;
         _timeProvider = timeProvider ?? TimeProvider.System;
+        _processLookup = new ProcessLookup(log, _timeProvider);
     }
 
-    public bool IsRunning => _filterTask is { IsCompleted: false };
+    public bool IsRunning => _routerTask is { IsCompleted: false };
 
-    public Task Completion => _filterTask ?? Task.CompletedTask;
+    public Task Completion => _routerTask ?? Task.CompletedTask;
 
     public bool Reload(AppConfiguration configuration)
     {
@@ -43,81 +44,100 @@ internal sealed class RelayService : IDisposable, IAsyncDisposable
         }
 
         _configuration.Update(configuration);
-        _log($"Configuration reloaded: coreProcessName={configuration.CoreProcessName}, apps={configuration.Apps.Count}");
+        _router?.ApplyConfiguration();
+        _log(
+            $"Configuration reloaded: coreProcessName={configuration.CoreProcessName}, apps={configuration.Apps.Count}");
         return true;
     }
 
-    public void Start(AppConfiguration configuration, string? configurationPath = null, CancellationToken externalCancellationToken = default)
+    public void Start(
+        AppConfiguration configuration,
+        string? configurationPath = null,
+        CancellationToken externalCancellationToken = default,
+        string? nativeDirectory = null,
+        nint networkHandle = 0,
+        nint flowHandle = 0)
     {
-        if (IsRunning)
+        _lifecycleGate.Wait();
+        try
+        {
+            StartCore(
+                configuration,
+                configurationPath,
+                externalCancellationToken,
+                nativeDirectory,
+                networkHandle,
+                flowHandle);
+        }
+        catch
+        {
+            StopCoreAsync().GetAwaiter().GetResult();
+            throw;
+        }
+        finally
+        {
+            _lifecycleGate.Release();
+        }
+    }
+
+    private void StartCore(
+        AppConfiguration configuration,
+        string? configurationPath,
+        CancellationToken externalCancellationToken,
+        string? nativeDirectory,
+        nint networkHandle,
+        nint flowHandle)
+    {
+        if (IsRunning || _router is not null || _cts is not null)
         {
             return;
         }
 
         _log($"Configured core process name: {configuration.CoreProcessName}");
         _log($"Configured apps: {string.Join(", ", configuration.Apps)}");
-        _log($"Relay socket owner process: {Process.GetCurrentProcess().ProcessName}.exe pid={Environment.ProcessId}");
+        _log($"WinDivert relay process: {Environment.ProcessPath} pid={Environment.ProcessId}");
         _log($"Detailed packet logging: {(_detailedLogging ? "enabled" : "disabled")}");
+
         _cts = CancellationTokenSource.CreateLinkedTokenSource(externalCancellationToken);
         _configuration = new DynamicAppConfiguration(configuration);
-        _tcpRelay = new TcpDirectRelay(_log, _detailedLogging, _trafficCounter, _packetWakeSignal, _timeProvider);
-        _udpRelay = new UdpDirectRelay(_log, _detailedLogging, _trafficCounter, _packetWakeSignal, _timeProvider);
-        _tcpRelay.Start(_cts.Token);
-        _udpRelay.Start(_cts.Token);
-        _ = WfpFlowClassifier.TryOpen(_log, out _wfpClassifier);
-        _filter = new PacketFilterLoop(
+        _router = new WinDivertPacketRouter(
             _configuration,
-            _tcpRelay,
-            _udpRelay,
-            _packetWakeSignal,
+            _processLookup,
             _log,
-            _detailedLogging,
+            _trafficCounter,
+            _packetWakeSignal,
             _timeProvider,
-            useWfpClassifier: _wfpClassifier is not null);
-        _filterTask = _filter.RunAsync(_cts.Token);
-        if (_wfpClassifier is not null)
-        {
-            var classifier = _wfpClassifier;
-            var filter = _filter;
-            _wfpClassifierTask = Task.Run(async () =>
-            {
-                await filter.Started.WaitAsync(_cts.Token).ConfigureAwait(false);
-                if (!filter.WfpModeActive)
-                {
-                    _wfpClassifierFallback = true;
-                    classifier.Dispose();
-                    _wfpClassifier = null;
-                    return;
-                }
+            _detailedLogging);
+        _router.Start(
+            nativeDirectory,
+            _cts.Token,
+            networkHandle != 0 ? new WinDivertHandle(networkHandle) : null,
+            flowHandle != 0 ? new WinDivertHandle(flowHandle) : null);
+        _routerTask = _router.Completion;
 
-                classifier.Start(filter.HandleWfpFlow, _cts.Token);
-                await classifier.Completion.ConfigureAwait(false);
-            }, _cts.Token);
-            _ = WatchWfpClassifierAsync(_wfpClassifierTask, _cts);
-        }
-        _trafficStatsTask = Task.Run(() => ReportTrafficStatsAsync(_cts.Token), _cts.Token);
+        _trafficStatsTask = Task.Run(
+            () => ReportTrafficStatsAsync(_cts.Token),
+            CancellationToken.None);
         if (!string.IsNullOrWhiteSpace(configurationPath))
         {
-            _configurationWatchTask = Task.Run(() => WatchConfigurationAsync(Path.GetFullPath(configurationPath), _cts.Token), _cts.Token);
+            _configurationWatchTask = Task.Run(
+                () => WatchConfigurationAsync(Path.GetFullPath(configurationPath), _cts.Token),
+                CancellationToken.None);
         }
 
-        _ = WatchFilterTaskAsync(_filterTask, _cts);
+        _ = WatchRouterTaskAsync(_routerTask, _cts);
     }
 
-    private async Task WatchWfpClassifierAsync(Task classifierTask, CancellationTokenSource cts)
+    private async Task WatchRouterTaskAsync(Task routerTask, CancellationTokenSource cts)
     {
+        var unexpectedStop = false;
         try
         {
-            await classifierTask.ConfigureAwait(false);
+            await routerTask.ConfigureAwait(false);
             if (!cts.IsCancellationRequested)
             {
-                if (_wfpClassifierFallback)
-                {
-                    return;
-                }
-
-                _log("WFP classifier stopped unexpectedly.");
-                cts.Cancel();
+                _log("WinDivert packet router stopped unexpectedly.");
+                unexpectedStop = true;
             }
         }
         catch (OperationCanceledException) when (cts.IsCancellationRequested)
@@ -125,10 +145,22 @@ internal sealed class RelayService : IDisposable, IAsyncDisposable
         }
         catch (Exception ex)
         {
-            _log($"WFP classifier failed: {ex}");
-            _wfpClassifier?.Dispose();
-            _wfpClassifier = null;
-            cts.Cancel();
+            _log($"WinDivert relay failed: {ex}");
+            unexpectedStop = true;
+        }
+        finally
+        {
+            if (unexpectedStop)
+            {
+                try
+                {
+                    await StopAsync().ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _log($"WinDivert relay cleanup after data-plane failure failed: {ex.Message}");
+                }
+            }
         }
     }
 
@@ -157,9 +189,8 @@ internal sealed class RelayService : IDisposable, IAsyncDisposable
                     continue;
                 }
 
-                _configuration?.Update(configuration);
+                Reload(configuration);
                 lastKey = key;
-                _log($"Configuration hot reloaded: coreProcessName={configuration.CoreProcessName}, apps={configuration.Apps.Count}");
             }
             catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
             {
@@ -204,92 +235,72 @@ internal sealed class RelayService : IDisposable, IAsyncDisposable
         }
     }
 
-    private async Task WatchFilterTaskAsync(Task filterTask, CancellationTokenSource cts)
+    public async Task StopAsync()
     {
+        await _lifecycleGate.WaitAsync().ConfigureAwait(false);
         try
         {
-            await filterTask.ConfigureAwait(false);
-            if (!cts.IsCancellationRequested)
-            {
-                _log("Packet filter stopped unexpectedly.");
-                cts.Cancel();
-            }
+            await StopCoreAsync().ConfigureAwait(false);
         }
-        catch (OperationCanceledException) when (cts.IsCancellationRequested)
+        finally
         {
-        }
-        catch (Exception ex)
-        {
-            _log($"Packet filter failed: {ex}");
-            _wfpClassifier?.Dispose();
-            _wfpClassifier = null;
-            cts.Cancel();
+            _lifecycleGate.Release();
         }
     }
 
-    public async Task StopAsync()
+    private async Task StopCoreAsync()
     {
+        if (_cts is null && _router is null)
+        {
+            return;
+        }
+
         _cts?.Cancel();
-        if (_trafficStatsTask is not null)
+        var stopped =
+            await WaitForTaskAsync(_trafficStatsTask, "traffic stats").ConfigureAwait(false)
+            && await WaitForTaskAsync(_configurationWatchTask, "configuration watcher").ConfigureAwait(false)
+            && await WaitForTaskAsync(_routerTask, "WinDivert router").ConfigureAwait(false);
+        if (!stopped)
         {
-            try
-            {
-                await _trafficStatsTask.WaitAsync(TimeSpan.FromSeconds(2));
-            }
-            catch
-            {
-            }
+            throw new TimeoutException("WinDivert relay tasks did not stop before the shutdown deadline.");
         }
 
-        if (_configurationWatchTask is not null)
+        if (_router is not null)
         {
-            try
-            {
-                await _configurationWatchTask.WaitAsync(TimeSpan.FromSeconds(2));
-            }
-            catch
-            {
-            }
+            await _router.DisposeAsync().ConfigureAwait(false);
         }
 
-        if (_filterTask is not null)
-        {
-            try
-            {
-                await _filterTask.WaitAsync(TimeSpan.FromSeconds(3));
-            }
-            catch
-            {
-            }
-        }
-
-        if (_wfpClassifierTask is not null)
-        {
-            try
-            {
-                await _wfpClassifierTask.WaitAsync(TimeSpan.FromSeconds(2));
-            }
-            catch
-            {
-            }
-        }
-
-        _filter?.Dispose();
-        _wfpClassifier?.Dispose();
-        _udpRelay?.Dispose();
-        _tcpRelay?.Dispose();
         _cts?.Dispose();
-        _filter = null;
-        _udpRelay = null;
-        _tcpRelay = null;
-        _configuration = null;
-        _cts = null;
-        _filterTask = null;
-        _wfpClassifier = null;
-        _wfpClassifierTask = null;
+        _routerTask = null;
         _trafficStatsTask = null;
         _configurationWatchTask = null;
+        _router = null;
+        _configuration = null;
+        _cts = null;
         _log("Stopped.");
+    }
+
+    private async Task<bool> WaitForTaskAsync(Task? task, string name)
+    {
+        if (task is null)
+        {
+            return true;
+        }
+
+        try
+        {
+            await task.WaitAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
+            return true;
+        }
+        catch (TimeoutException)
+        {
+            _log($"WinDivert relay shutdown timed out waiting for the {name}.");
+            return false;
+        }
+        catch
+        {
+            return true;
+        }
     }
 
     public void Stop()
@@ -305,7 +316,7 @@ internal sealed class RelayService : IDisposable, IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        await StopAsync();
+        await StopAsync().ConfigureAwait(false);
         _packetWakeSignal.Dispose();
     }
 }

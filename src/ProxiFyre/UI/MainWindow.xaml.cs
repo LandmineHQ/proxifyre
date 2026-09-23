@@ -29,7 +29,6 @@ public partial class MainWindow : Window
         Interval = TimeSpan.FromSeconds(3)
     };
     private readonly SemaphoreSlim _uuPatchOperationGate = new(1, 1);
-    private readonly WinpkFilterManager _winpkFilterManager;
     private readonly AotModuleController _moduleController;
     private readonly Forms.NotifyIcon _trayIcon;
     private readonly string _uiLogPath = Path.Combine(AppContext.BaseDirectory, "proxifyre-ui.log");
@@ -69,7 +68,6 @@ public partial class MainWindow : Window
         Tabs.ToggleEnabledRequested += Tabs_ToggleEnabledRequested;
         Tabs.RemoveAppRequested += Tabs_RemoveAppRequested;
         Tabs.ReloadRequested += (_, _) => ReloadConfigFromUi();
-        Tabs.WinpkFilterActionRequested += Tabs_WinpkFilterActionRequested;
         Tabs.UuPatchToggleRequested += Tabs_UuPatchToggleRequested;
         Header.OpenSourceRequested += (_, _) => OpenSource();
         Header.StartStopRequested += Header_StartStopRequested;
@@ -79,9 +77,7 @@ public partial class MainWindow : Window
         RuleEntry.BrowseDirectoryRequested += (_, _) => BrowseDirectory();
         RuleEntry.CoreProcessNameChanged += (_, _) => SaveCoreProcessName();
         RuleEntry.CoreProcessName = AppConfiguration.DefaultCoreProcessName;
-        _winpkFilterManager = new WinpkFilterManager(AppendLog);
-        _winpkFilterManager.StatusChanged += WinpkFilterManager_StatusChanged;
-        _moduleController = new AotModuleController(_configurationStore, _winpkFilterManager, AppendLog, moduleEvent =>
+        _moduleController = new AotModuleController(_configurationStore, AppendLog, moduleEvent =>
         {
             Dispatcher.InvokeAsync(() => ApplyModuleEvent(moduleEvent));
         },
@@ -380,13 +376,7 @@ public partial class MainWindow : Window
     private void RefreshSettingsInfo()
     {
         Tabs.SetLicenseKey(GetSavedLicenseKey());
-        _settingsViewModel.ApplyWinpkFilterStatus(_winpkFilterManager.RefreshStatus());
         RefreshUuPatchStatus();
-    }
-
-    private void WinpkFilterManager_StatusChanged(object? sender, WinpkFilterStatus status)
-    {
-        Dispatcher.InvokeAsync(() => _settingsViewModel.ApplyWinpkFilterStatus(status));
     }
 
     private void RefreshUuPatchStatus()
@@ -982,53 +972,6 @@ public partial class MainWindow : Window
         if (e.Item is ConfiguredApplication selected)
         {
             RemoveApplication(selected);
-        }
-    }
-
-    private async void Tabs_WinpkFilterActionRequested(object? sender, EventArgs e)
-    {
-        if (_moduleController.IsRunning)
-        {
-            MessageBox.Show(this, "请先停止模组转发，再修改 WinpkFilter 安装状态。", "ProxiFyre", MessageBoxButton.OK, MessageBoxImage.Information);
-            return;
-        }
-
-        var status = _winpkFilterManager.RefreshStatus();
-        if (status.IsInstalled)
-        {
-            var result = MessageBox.Show(
-                this,
-                "确定要卸载 WinpkFilter 吗？卸载后需要重新安装才能启用 relay。",
-                "卸载 WinpkFilter",
-                MessageBoxButton.YesNo,
-                MessageBoxImage.Warning);
-            if (result != MessageBoxResult.Yes)
-            {
-                return;
-            }
-        }
-
-        try
-        {
-            _settingsViewModel.SetWinpkFilterBusy(status.IsInstalled ? "正在卸载 WinpkFilter..." : "正在安装 WinpkFilter...");
-            if (status.IsInstalled)
-            {
-                await _winpkFilterManager.UninstallAsync();
-            }
-            else
-            {
-                await _winpkFilterManager.EnsureInstalledAsync();
-            }
-        }
-        catch (Exception ex)
-        {
-            AppendLog($"WinpkFilter action failed: {ex.Message}");
-            MessageBox.Show(this, ex.Message, "WinpkFilter", MessageBoxButton.OK, MessageBoxImage.Error);
-        }
-        finally
-        {
-            _settingsViewModel.ApplyWinpkFilterStatus(_winpkFilterManager.RefreshStatus());
-            _settingsViewModel.SetWinpkFilterIdle();
         }
     }
 

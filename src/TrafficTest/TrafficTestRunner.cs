@@ -46,14 +46,39 @@ internal static class TrafficTestRunner
                 return PacketSelfTest.Run();
             }
 
+            if (args.Length > 0 && args[0].Equals("udp-selftest", StringComparison.OrdinalIgnoreCase))
+            {
+                return await UdpRelaySelfTest.RunAsync();
+            }
+
             if (args.Length > 0 && args[0].Equals("tcp-selftest", StringComparison.OrdinalIgnoreCase))
             {
                 return await TcpRelaySelfTest.RunAsync();
             }
 
-            if (args.Length > 0 && args[0].Equals("udp-selftest", StringComparison.OrdinalIgnoreCase))
+            if (args.Length > 0 && args[0].Equals("windivert-probe", StringComparison.OrdinalIgnoreCase))
             {
-                return await UdpRelaySelfTest.RunAsync();
+                return WinDivertDiagnostic.Run();
+            }
+
+            if (args.Length > 0 && args[0].Equals("windivert-tcp-probe", StringComparison.OrdinalIgnoreCase))
+            {
+                return await WinDivertTcpProbe.RunAsync();
+            }
+
+            if (args.Length > 0 && args[0].Equals("windivert-tcp-probe-cross", StringComparison.OrdinalIgnoreCase))
+            {
+                return await WinDivertTcpProbe.RunCrossProcessAsync();
+            }
+
+            if (args.Length > 0 && args[0].Equals("windivert-tcp-probe-client", StringComparison.OrdinalIgnoreCase))
+            {
+                return await WinDivertTcpProbe.RunClientAsync();
+            }
+
+            if (args.Length > 0 && args[0].Equals("windivert-bypass-probe", StringComparison.OrdinalIgnoreCase))
+            {
+                return await WinDivertBypassDiagnostic.RunAsync();
             }
 
             if (args.Length > 0 && args[0].Equals("run-leigod-demo", StringComparison.OrdinalIgnoreCase))
@@ -149,7 +174,11 @@ internal static class TrafficTestRunner
             await WaitForMainWindowAsync(testHost, cts.Token);
             Console.WriteLine($"AOT test host: {Path.GetFileName(testHostExe)} pid={testHost.Id}");
 
-            using var module = new AotModuleTestController(configPath, logPath, Console.WriteLine);
+            using var module = new AotModuleTestController(
+                configPath,
+                logPath,
+                Console.WriteLine,
+                options.Detailed);
             await module.LoadAndRunAsync(
                 testHost.Id,
                 Path.GetFileName(testHostExe),
@@ -225,7 +254,7 @@ internal static class TrafficTestRunner
 
     private static async Task WaitForCoreReadyAsync(string logPath, CancellationToken cancellationToken)
     {
-        await CoreLogReporter.WaitForLogLineAsync(logPath, "Packet filter started.", TimeSpan.FromSeconds(15), cancellationToken);
+        await CoreLogReporter.WaitForLogLineAsync(logPath, "WinDivert packet router started.", TimeSpan.FromSeconds(15), cancellationToken);
         await Task.Delay(TimeSpan.FromMilliseconds(500), cancellationToken);
     }
 

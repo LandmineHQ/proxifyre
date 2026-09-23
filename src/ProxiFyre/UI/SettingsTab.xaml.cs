@@ -10,14 +10,7 @@ public partial class SettingsTab : UserControl
         InitializeComponent();
     }
 
-    public event EventHandler? WinpkFilterActionRequested;
-
     public event EventHandler<UuPatchToggleRequestedEventArgs>? UuPatchToggleRequested;
-
-    private void WinpkFilterActionButton_Click(object sender, RoutedEventArgs e)
-    {
-        WinpkFilterActionRequested?.Invoke(this, EventArgs.Empty);
-    }
 
     private void UuPatchToggleButton_Click(object sender, RoutedEventArgs e)
     {

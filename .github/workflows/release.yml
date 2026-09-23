@@ -53,10 +53,16 @@ jobs:
           STATUS="$(gh run view "$BUILD_ID" --repo "$GITHUB_REPOSITORY" --json status --jq '.status')"
           CONCLUSION="$(gh run view "$BUILD_ID" --repo "$GITHUB_REPOSITORY" --json conclusion --jq '.conclusion')"
           HEAD_SHA="$(gh run view "$BUILD_ID" --repo "$GITHUB_REPOSITORY" --json headSha --jq '.headSha')"
+          HEAD_BRANCH="$(gh run view "$BUILD_ID" --repo "$GITHUB_REPOSITORY" --json headBranch --jq '.headBranch')"
 
           if [[ "$STATUS" != "completed" || "$CONCLUSION" != "success" ]]; then
             echo "Build run $BUILD_ID is not a successful completed run." >&2
             echo "status=$STATUS conclusion=$CONCLUSION" >&2
+            exit 1
+          fi
+
+          if [[ "$HEAD_BRANCH" != "main" && ! "$HEAD_BRANCH" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "Build run $BUILD_ID is not from main or a version tag: $HEAD_BRANCH" >&2
             exit 1
           fi
 
@@ -82,6 +88,14 @@ jobs:
           SOURCE="$(find release-assets -type f -name 'proxifyre-win-x64.zip' -print -quit)"
           test -n "$SOURCE"
           test -f "$SOURCE"
+
+          MANIFEST_VERSION="$(unzip -p "$SOURCE" manifest.json | jq -r '.version')"
+          NORMALIZED_VERSION="${VERSION#v}"
+          NORMALIZED_MANIFEST_VERSION="${MANIFEST_VERSION#v}"
+          if [[ "$NORMALIZED_MANIFEST_VERSION" != "$NORMALIZED_VERSION" ]]; then
+            echo "Release version $VERSION does not match package manifest version $MANIFEST_VERSION." >&2
+            exit 1
+          fi
 
           ASSET="release-assets/proxifyre-${VERSION}-build-${BUILD_ID}-${SHORT_SHA}.zip"
           mv "$SOURCE" "$ASSET"

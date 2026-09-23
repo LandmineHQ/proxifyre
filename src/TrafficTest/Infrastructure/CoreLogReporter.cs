@@ -33,14 +33,12 @@ internal static class CoreLogReporter
 
         var errorPatterns = new[]
         {
-            "DIRECT TCP connect failed",
-            "DIRECT TCP send failed",
-            "DIRECT TCP remote receive failed",
-            "copy failed",
+            "WinDivert TCP relay",
+            "WinDivert UDP relay",
+            "WinDivert receive failed",
             "DIRECT UDP send failed",
             "UDP relay remote receive failed",
-            "No direct target",
-            "SendPacket"
+            "failed"
         };
         PrintNonZeroCounts(lines, errorPatterns);
 
@@ -53,6 +51,8 @@ internal static class CoreLogReporter
             "DIRECT TCP SEND",
             "DIRECT TCP RECV",
             "RESTORE TCP RECV",
+            "APP TCP CONNECT",
+            "APP UDP CONNECT",
             "UDP APP MATCH",
             "DIRECT UDP CAPTURE",
             "DIRECT UDP SEND",
@@ -98,6 +98,7 @@ internal static class CoreLogReporter
             || line.Contains("RESTORE TCP", StringComparison.Ordinal)
             || line.Contains("PASS RELAY TCP", StringComparison.Ordinal)
             || line.Contains("DIRECT TCP", StringComparison.Ordinal)
+            || line.Contains("WinDivert", StringComparison.Ordinal)
             || line.Contains("UDP APP MATCH", StringComparison.Ordinal)
             || line.Contains("RESTORE UDP", StringComparison.Ordinal)
             || line.Contains("DIRECT UDP", StringComparison.Ordinal)

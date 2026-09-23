@@ -39,26 +39,7 @@ internal static class Cli
             return 0;
         }
 
-        Console.WriteLine("ProxiFyre C# direct relay");
-
-        if (args.Any(a => string.Equals(a, "--reset-filter", StringComparison.OrdinalIgnoreCase)))
-        {
-            try
-            {
-                using var logger = CoreLogger.CreateForCurrentProcess();
-                PacketFilterReset.Reset(message =>
-                {
-                    Console.WriteLine(message);
-                    logger.Info(message);
-                });
-                return 0;
-            }
-            catch (Exception ex)
-            {
-                Console.Error.WriteLine(ex.Message);
-                return 1;
-            }
-        }
+        Console.WriteLine("ProxiFyre WinDivert relay");
 
         var configPath = GetConfigPath(args);
 
@@ -93,8 +74,6 @@ internal static class Cli
             logger.Info($"Configuration path: {configPath}");
             logger.Info($"Relay network activity process: {System.Diagnostics.Process.GetCurrentProcess().ProcessName}.exe");
             logger.Info($"Detailed logging: {(detailedLogging ? "enabled" : "disabled")}");
-            var winpkFilterManager = new WinpkFilterManager(logger.Info);
-            await winpkFilterManager.EnsureInstalledAsync().ConfigureAwait(false);
             using var cts = new CancellationTokenSource();
             Console.CancelKeyPress += (_, e) =>
             {
@@ -163,7 +142,6 @@ internal static class Cli
         Console.WriteLine("Usage:");
         Console.WriteLine("  ProxiFyre.exe");
         Console.WriteLine("  ProxiFyre.exe --run [--config <path>] [--detailed]");
-        Console.WriteLine("  ProxiFyre.exe --reset-filter");
         Console.WriteLine("  ProxiFyre.exe --license-device");
         Console.WriteLine("  ProxiFyre.exe --license-key <device-id>");
         Console.WriteLine("  ProxiFyre.exe --add-app <exe-or-path> [--config <path>]");

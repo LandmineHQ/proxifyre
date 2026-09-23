@@ -17,7 +17,7 @@ The UI also provides optional runtime compatibility patching for UU's
 - .NET 10 SDK.
 - Visual Studio Build Tools with the C++ desktop workload for NativeAOT.
 - PowerShell.
-- WDK only when building the optional WFP driver.
+- Administrator privileges for the signed WinDivert driver.
 
 ### Commands
 
@@ -27,14 +27,16 @@ From the repository root, build Debug:
 .\scripts\proxifyre.ps1 build
 ```
 
-Build Release:
+Build and package Release:
 
 ```powershell
 .\scripts\proxifyre.ps1 build -Configuration Release
+.\scripts\proxifyre.ps1 package -Configuration Release
 ```
 
-The wrapper publishes the NativeAOT module, probe, and test host before
-building the managed solution. Main outputs are written to:
+The wrapper publishes the NativeAOT module, probe, and test host, then builds
+the managed solution. Main outputs are written to:
 
 - `artifacts/bin/ProxiFyre/<debug|release>_win-x64/`
 - `artifacts/native/<Debug|Release>/`
+- `release/proxifyre-win-x64.zip`

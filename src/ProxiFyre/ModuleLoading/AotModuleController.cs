@@ -13,7 +13,6 @@ internal sealed class AotModuleController : IDisposable
     private static readonly TimeSpan HeartbeatSendTimeout = TimeSpan.FromSeconds(1);
 
     private readonly ConfigurationStore _configurationStore;
-    private readonly WinpkFilterManager _winpkFilterManager;
     private readonly Action<string> _log;
     private readonly Action<ModuleEvent> _moduleEvent;
     private readonly object _heartbeatLock = new();
@@ -24,6 +23,9 @@ internal sealed class AotModuleController : IDisposable
     private ModuleTargetProcess? _targetProcess;
     private readonly string? _moduleLogPath;
     private readonly string? _telemetryPipeName;
+    private readonly bool _detailedLogging;
+    private readonly string _sessionToken = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
+    private string? _nativeDirectory;
     private bool _relayRunning;
     private bool _disposed;
     private bool _heartbeatInProgress;
@@ -32,18 +34,18 @@ internal sealed class AotModuleController : IDisposable
 
     public AotModuleController(
         ConfigurationStore configurationStore,
-        WinpkFilterManager winpkFilterManager,
         Action<string> log,
         Action<ModuleEvent> moduleEvent,
         string? moduleLogPath = null,
-        string? telemetryPipeName = null)
+        string? telemetryPipeName = null,
+        bool detailedLogging = false)
     {
         _configurationStore = configurationStore;
-        _winpkFilterManager = winpkFilterManager;
         _log = log;
         _moduleEvent = moduleEvent;
         _moduleLogPath = moduleLogPath;
         _telemetryPipeName = telemetryPipeName;
+        _detailedLogging = detailedLogging;
     }
 
     public bool IsRunning => _relayRunning;
@@ -117,8 +119,6 @@ internal sealed class AotModuleController : IDisposable
             _log("License key saved.");
         }
 
-        await _winpkFilterManager.EnsureInstalledAsync().ConfigureAwait(false);
-
         _targetProcess = target;
         _log($"Selected module target: {target.ProcessName} pid={target.ProcessId}");
         if (!string.IsNullOrWhiteSpace(target.ProcessPath))
@@ -127,10 +127,11 @@ internal sealed class AotModuleController : IDisposable
         }
 
         EnsureMessageClient();
+        var runtimeDllPath = PrepareRuntimeModuleDll(configuration.ModuleDllName);
+        _nativeDirectory = PrepareNativeRuntime(Path.GetDirectoryName(runtimeDllPath)!);
         var moduleWindow = TryFindModuleWindow(target.ProcessId);
         if (moduleWindow == nint.Zero)
         {
-            var runtimeDllPath = PrepareRuntimeModuleDll(configuration.ModuleDllName);
             _log($"Prepared runtime AOT module: {runtimeDllPath}");
             ClearHookHandles();
             moduleWindow = await InstallGetMessageHooksAndWaitAsync(target.ProcessId, runtimeDllPath).ConfigureAwait(false);
@@ -147,7 +148,7 @@ internal sealed class AotModuleController : IDisposable
         }
 
         _moduleWindow = moduleWindow;
-        if (!SendCommand("RUN"))
+        if (!SendRunCommand())
         {
             throw new InvalidOperationException("模组收到 RUN 命令后返回失败，relay 未启动。请查看 proxifyre-core.log。");
         }
@@ -212,7 +213,7 @@ internal sealed class AotModuleController : IDisposable
 
     private void EnsureMessageClient()
     {
-        _messageClient ??= new ModuleMessageClient(ApplyModuleEvent);
+        _messageClient ??= new ModuleMessageClient(ApplyModuleEvent, _sessionToken);
     }
 
     private ModuleAttachResult TryAttachExisting(string targetProcessName)
@@ -301,10 +302,52 @@ internal sealed class AotModuleController : IDisposable
 
     private bool SendCommand(string command)
     {
-        return SendCommand(command, null);
+        return SendCommand(command, null, 0, 0);
     }
 
-    private bool SendCommand(string command, TimeSpan? timeout)
+    private bool SendRunCommand()
+    {
+        if (_relayRunning || _targetProcess is null)
+        {
+            return SendCommand("RUN");
+        }
+
+        BrokeredWinDivertHandles handles;
+        try
+        {
+            handles = WinDivertHandleBroker.OpenForTarget(_targetProcess.ProcessId);
+            _log(
+                $"Prepared WinDivert handles for target pid={_targetProcess.ProcessId}: network=0x{handles.Network.ToInt64():X}, flow=0x{handles.Flow.ToInt64():X}.");
+        }
+        catch (Exception ex)
+        {
+            _log(
+                $"WinDivert handle brokering failed; attempting direct open in the target process: {ex.Message}");
+            return SendCommand("RUN");
+        }
+
+        try
+        {
+            if (SendCommand("RUN", null, handles.Network, handles.Flow))
+            {
+                return true;
+            }
+        }
+        catch
+        {
+            WinDivertHandleBroker.CloseForTarget(_targetProcess.ProcessId, handles);
+            throw;
+        }
+
+        WinDivertHandleBroker.CloseForTarget(_targetProcess.ProcessId, handles);
+        return false;
+    }
+
+    private bool SendCommand(
+        string command,
+        TimeSpan? timeout,
+        nint networkHandle = 0,
+        nint flowHandle = 0)
     {
         if (_moduleWindow == nint.Zero || _messageClient is null)
         {
@@ -316,7 +359,12 @@ internal sealed class AotModuleController : IDisposable
             Path.GetFullPath(_configurationStore.Path),
             _moduleLogPath ?? Path.Combine(AppContext.BaseDirectory, "proxifyre-core.log"),
             _messageClient.WindowHandle,
-            telemetryPipeName: _telemetryPipeName);
+            detailed: _detailedLogging,
+            telemetryPipeName: _telemetryPipeName,
+            nativeDirectory: _nativeDirectory,
+            networkHandle: networkHandle,
+            flowHandle: flowHandle,
+            sessionToken: _sessionToken);
 
         return timeout is { } value
             ? _messageClient.SendCommand(_moduleWindow, payload, value)
@@ -467,6 +515,33 @@ internal sealed class AotModuleController : IDisposable
         var configuration = GetConfigurationName(nativeDll);
         var runtimeDirectory = Path.Combine(AppContext.BaseDirectory, "runtime", configuration);
         return PrepareRuntimeCopy(nativeDll, runtimeDirectory, dllName);
+    }
+
+    private static string PrepareNativeRuntime(string runtimeDirectory)
+    {
+        Directory.CreateDirectory(runtimeDirectory);
+        foreach (var fileName in new[] { "WinDivert.dll", "WinDivert64.sys" })
+        {
+            var source = Path.Combine(AppContext.BaseDirectory, fileName);
+            if (!File.Exists(source))
+            {
+                throw new FileNotFoundException(
+                    $"Required WinDivert runtime file was not published: {fileName}",
+                    source);
+            }
+
+            var destination = Path.Combine(runtimeDirectory, fileName);
+            var sourceInfo = new FileInfo(source);
+            var destinationInfo = new FileInfo(destination);
+            if (!destinationInfo.Exists
+                || destinationInfo.Length != sourceInfo.Length
+                || destinationInfo.LastWriteTimeUtc != sourceInfo.LastWriteTimeUtc)
+            {
+                File.Copy(source, destination, overwrite: true);
+            }
+        }
+
+        return runtimeDirectory;
     }
 
     internal static string PrepareRuntimeCopy(string sourceDll, string runtimeDirectory, string dllName)

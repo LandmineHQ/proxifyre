@@ -16,7 +16,11 @@ internal static class ModuleMessageProtocol
         string? logPath = null,
         nint replyHwnd = 0,
         bool detailed = false,
-        string? telemetryPipeName = null)
+        string? telemetryPipeName = null,
+        string? nativeDirectory = null,
+        nint networkHandle = 0,
+        nint flowHandle = 0,
+        string? sessionToken = null)
     {
         var values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
@@ -39,6 +43,26 @@ internal static class ModuleMessageProtocol
             values["telemetryPipeName"] = telemetryPipeName;
         }
 
+        if (!string.IsNullOrWhiteSpace(nativeDirectory))
+        {
+            values["nativeDirectory"] = nativeDirectory;
+        }
+
+        if (networkHandle != 0)
+        {
+            values["networkHandle"] = networkHandle.ToInt64().ToString(System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        if (flowHandle != 0)
+        {
+            values["flowHandle"] = flowHandle.ToInt64().ToString(System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        if (!string.IsNullOrWhiteSpace(sessionToken))
+        {
+            values["sessionToken"] = sessionToken;
+        }
+
         if (replyHwnd != 0)
         {
             values["replyHwnd"] = replyHwnd.ToInt64().ToString(System.Globalization.CultureInfo.InvariantCulture);
@@ -47,7 +71,12 @@ internal static class ModuleMessageProtocol
         return Serialize(values);
     }
 
-    public static string BuildEvent(string eventName, string text, bool? running = null, int? pid = null)
+    public static string BuildEvent(
+        string eventName,
+        string text,
+        bool? running = null,
+        int? pid = null,
+        string? sessionToken = null)
     {
         var values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
@@ -63,6 +92,11 @@ internal static class ModuleMessageProtocol
         if (pid is not null)
         {
             values["pid"] = pid.Value.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        if (!string.IsNullOrWhiteSpace(sessionToken))
+        {
+            values["sessionToken"] = sessionToken;
         }
 
         return Serialize(values);
@@ -112,8 +146,17 @@ internal static class ModuleMessageProtocol
 
     public static nint GetReplyHwnd(Dictionary<string, string> values)
     {
-        return values.TryGetValue("replyHwnd", out var raw)
-            && long.TryParse(raw, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var handle)
+        return GetHandle(values, "replyHwnd");
+    }
+
+    public static nint GetHandle(Dictionary<string, string> values, string key)
+    {
+        return values.TryGetValue(key, out var raw)
+            && long.TryParse(
+                raw,
+                System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out var handle)
             ? new nint(handle)
             : 0;
     }

@@ -18,29 +18,30 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="Native.WinDivert" Version="2.2.2" GeneratePathProperty="true" />
+  </ItemGroup>
+
+  <ItemGroup>
     <Compile Include="..\Shared\LicenseKey.cs" Link="Shared\LicenseKey.cs" />
     <Compile Include="..\Shared\ModuleMessageProtocol.cs" Link="Shared\ModuleMessageProtocol.cs" />
     <Compile Include="..\Shared\TrafficTelemetry.cs" Link="Shared\TrafficTelemetry.cs" />
     <Compile Include="..\ProxiFyre\Configuration\AppConfiguration.cs" Link="Configuration\AppConfiguration.cs" />
     <Compile Include="..\ProxiFyre\Configuration\DynamicAppConfiguration.cs" Link="Configuration\DynamicAppConfiguration.cs" />
     <Compile Include="..\ProxiFyre\Logging\CoreLogger.cs" Link="Logging\CoreLogger.cs" />
-    <Compile Include="..\ProxiFyre\Native\NdisApi.cs" Link="Native\NdisApi.cs" />
     <Compile Include="..\ProxiFyre\Network\NetworkEndpointResolver.cs" Link="Network\NetworkEndpointResolver.cs" />
     <Compile Include="..\ProxiFyre\Network\NetworkInterfaceIndexResolver.cs" Link="Network\NetworkInterfaceIndexResolver.cs" />
     <Compile Include="..\ProxiFyre\Network\NetworkKeys.cs" Link="Network\NetworkKeys.cs" />
     <Compile Include="..\ProxiFyre\Network\TlsSniParser.cs" Link="Network\TlsSniParser.cs" />
-    <Compile Include="..\ProxiFyre\Network\WfpFlowClassifier.cs" Link="Network\WfpFlowClassifier.cs" />
-    <Compile Include="..\ProxiFyre\Network\WfpProtocol.cs" Link="Network\WfpProtocol.cs" />
-    <Compile Include="..\ProxiFyre\PacketFiltering\AdapterPipeline.cs" Link="PacketFiltering\AdapterPipeline.cs" />
-    <Compile Include="..\ProxiFyre\PacketFiltering\AdapterPipelineSet.cs" Link="PacketFiltering\AdapterPipelineSet.cs" />
-    <Compile Include="..\ProxiFyre\PacketFiltering\DnsSpoofHandler.cs" Link="PacketFiltering\DnsSpoofHandler.cs" />
-    <Compile Include="..\ProxiFyre\PacketFiltering\OutboundFilterController.cs" Link="PacketFiltering\OutboundFilterController.cs" />
-    <Compile Include="..\ProxiFyre\PacketFiltering\PacketInjector.cs" Link="PacketFiltering\PacketInjector.cs" />
-    <Compile Include="..\ProxiFyre\PacketFiltering\PacketFilterLoop.cs" Link="PacketFiltering\PacketFilterLoop.cs" />
+    <Compile Include="..\ProxiFyre\Network\WinDivertAddress.cs" Link="Network\WinDivertAddress.cs" />
+    <Compile Include="..\ProxiFyre\Network\WinDivertDnsSpoofHandler.cs" Link="Network\WinDivertDnsSpoofHandler.cs" />
+    <Compile Include="..\ProxiFyre\Network\WinDivertFlowTracker.cs" Link="Network\WinDivertFlowTracker.cs" />
+    <Compile Include="..\ProxiFyre\Network\WinDivertNative.cs" Link="Network\WinDivertNative.cs" />
+    <Compile Include="..\ProxiFyre\Network\WinDivertPacketBuilder.cs" Link="Network\WinDivertPacketBuilder.cs" />
+    <Compile Include="..\ProxiFyre\Network\WinDivertPacketInjector.cs" Link="Network\WinDivertPacketInjector.cs" />
+    <Compile Include="..\ProxiFyre\Network\WinDivertPacketRouter.cs" Link="Network\WinDivertPacketRouter.cs" />
+    <Compile Include="..\ProxiFyre\Network\WinDivertUdpRelay.cs" Link="Network\WinDivertUdpRelay.cs" />
     <Compile Include="..\ProxiFyre\PacketFiltering\PacketView.cs" Link="PacketFiltering\PacketView.cs" />
     <Compile Include="..\ProxiFyre\PacketFiltering\PacketWakeSignal.cs" Link="PacketFiltering\PacketWakeSignal.cs" />
-    <Compile Include="..\ProxiFyre\PacketFiltering\IpFragmentReassembler.cs" Link="PacketFiltering\IpFragmentReassembler.cs" />
-    <Compile Include="..\ProxiFyre\PacketFiltering\OutboundPassFlowRegistry.cs" Link="PacketFiltering\OutboundPassFlowRegistry.cs" />
     <Compile Include="..\ProxiFyre\Process\ProcessLookup.cs" Link="Process\ProcessLookup.cs" />
     <Compile Include="..\ProxiFyre\Process\ProcessMatcher.cs" Link="Process\ProcessMatcher.cs" />
     <Compile Include="..\ProxiFyre\Relay\RelayService.cs" Link="Relay\RelayService.cs" />

@@ -16,7 +16,7 @@ internal static class LeigodRedirectDemo
 {
     public static async Task<int> RunAsync(string[] args)
     {
-        Console.WriteLine("=== Leigod WFP Redirection Demo (Parent) ===");
+        Console.WriteLine("=== Leigod WinDivert Redirection Demo (Parent) ===");
         
         string targetUrl = "https://store.steampowered.com/";
         for (int i = 0; i < args.Length - 1; i++)
@@ -108,7 +108,7 @@ internal static class LeigodRedirectDemo
                 return 1;
             }
 
-            // Wait a moment for ProxiFyre to initialize the NDIS filter table
+            // Wait a moment for ProxiFyre to initialize the WinDivert router.
             await Task.Delay(1500);
 
             // Flush DNS cache to ensure Windows DNS Client queries the network instead of using cached results
@@ -171,7 +171,7 @@ internal static class LeigodRedirectDemo
             Console.WriteLine($"Child process started. PID={child.Id}");
 
             // Monitor connections for the child process
-            Console.WriteLine("Monitoring child TCP connections for WFP redirection...");
+            Console.WriteLine("Monitoring child TCP connections for WinDivert redirection...");
             bool redirectionCaptured = false;
             for (int i = 0; i < 80; i++)
             {
@@ -204,12 +204,12 @@ internal static class LeigodRedirectDemo
 
             if (redirectionCaptured)
             {
-                Console.WriteLine("\n[SUCCESS] WFP Redirection captured! Traffic was successfully redirected to Leigod.");
+                Console.WriteLine("\n[SUCCESS] WinDivert redirection captured! Traffic was successfully redirected to Leigod.");
                 return 0;
             }
             else
             {
-                Console.WriteLine("\n[FAILED] WFP Redirection was not captured. Is Leigod running and configured to accelerate Steam?");
+                Console.WriteLine("\n[FAILED] WinDivert redirection was not captured. Is Leigod running and configured to accelerate Steam?");
                 return 1;
             }
         }

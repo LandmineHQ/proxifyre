@@ -15,13 +15,15 @@ internal sealed unsafe class ModuleMessageClient : IDisposable
     private readonly AutoResetEvent _windowReady = new(false);
     private readonly WndProcDelegate _wndProc;
     private readonly Thread _thread;
+    private readonly string _sessionToken;
     private bool _disposed;
     private nint _windowHandle;
     private uint _threadId;
 
-    public ModuleMessageClient(Action<ModuleEvent> eventHandler)
+    public ModuleMessageClient(Action<ModuleEvent> eventHandler, string sessionToken)
     {
         EventHandler = eventHandler;
+        _sessionToken = sessionToken;
         _wndProc = WindowProc;
         _thread = new Thread(MessageThreadMain)
         {
@@ -146,6 +148,12 @@ internal sealed unsafe class ModuleMessageClient : IDisposable
 
         var payload = Marshal.PtrToStringUni(copyData.lpData, (copyData.cbData / 2) - 1);
         if (string.IsNullOrWhiteSpace(payload) || !ModuleMessageProtocol.TryParse(payload, out var values))
+        {
+            return false;
+        }
+
+        if (!values.TryGetValue("sessionToken", out var eventToken)
+            || !eventToken.Equals(_sessionToken, StringComparison.Ordinal))
         {
             return false;
         }

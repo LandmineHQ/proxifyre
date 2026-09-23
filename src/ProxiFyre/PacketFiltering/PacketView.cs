@@ -188,14 +188,37 @@ internal ref struct PacketView
         };
     }
 
+    public static bool TryParseIp(Span<byte> packetBytes, int packetLength, out PacketView packet)
+    {
+        packet = default;
+        if (packetLength < 20 || packetBytes.Length < packetLength)
+        {
+            return false;
+        }
+
+        return (packetBytes[0] >> 4) switch
+        {
+            4 => TryParseIpv4(packetBytes, packetLength, ipOffset: 0, out packet),
+            6 => TryParseIpv6(packetBytes, packetLength, ipOffset: 0, out packet),
+            _ => false
+        };
+    }
+
     public byte[] GetLinkHeader()
     {
         return _frame.Slice(0, _linkHeaderLength).ToArray();
     }
 
+    public byte[] GetCapturedFrame()
+    {
+        return _frame.Slice(0, PacketLength).ToArray();
+    }
+
     public bool IsLinkLayerBroadcastOrMulticast()
     {
-        return _frame.Length >= 1 && (_frame[0] & 0x01) != 0;
+        return _linkHeaderLength > 0
+            && _frame.Length >= 1
+            && (_frame[0] & 0x01) != 0;
     }
 
     public bool IsNetworkLayerBroadcastOrMulticast()

@@ -68,7 +68,12 @@ internal readonly record struct UdpRelayKey
         IPAddress clientAddress,
         ushort clientPort,
         IPAddress remoteAddress,
-        ushort remotePort)
+        ushort remotePort,
+        uint subInterfaceIndex = 0,
+        uint compartmentId = 0,
+        ushort wireAddressFamily = 0,
+        uint processId = 0,
+        ulong flowId = 0)
     {
         AdapterHandle = adapterHandle;
         Dot1q = dot1q;
@@ -76,6 +81,13 @@ internal readonly record struct UdpRelayKey
         ClientPort = clientPort;
         RemoteAddress = NetworkAddress.Normalize(remoteAddress);
         RemotePort = remotePort;
+        SubInterfaceIndex = subInterfaceIndex;
+        CompartmentId = compartmentId;
+        WireAddressFamily = wireAddressFamily != 0
+            ? wireAddressFamily
+            : (ushort)(ClientAddress.AddressFamily == AddressFamily.InterNetwork ? 2 : 23);
+        ProcessId = processId;
+        FlowId = flowId;
     }
 
     public IntPtr AdapterHandle { get; }
@@ -89,6 +101,80 @@ internal readonly record struct UdpRelayKey
     public IPAddress RemoteAddress { get; }
 
     public ushort RemotePort { get; }
+
+    public uint SubInterfaceIndex { get; }
+
+    public uint CompartmentId { get; }
+
+    public ushort WireAddressFamily { get; }
+
+    public uint ProcessId { get; }
+
+    public ulong FlowId { get; }
+
+}
+
+internal readonly record struct UdpRelaySessionKey
+{
+    public UdpRelaySessionKey(
+        IntPtr adapterHandle,
+        uint dot1q,
+        IPAddress clientAddress,
+        ushort clientPort,
+        uint subInterfaceIndex = 0,
+        uint compartmentId = 0,
+        ushort wireAddressFamily = 0,
+        uint processId = 0,
+        ulong flowId = 0)
+    {
+        AdapterHandle = adapterHandle;
+        Dot1q = dot1q;
+        ClientAddress = NetworkAddress.Normalize(clientAddress);
+        ClientPort = clientPort;
+        SubInterfaceIndex = subInterfaceIndex;
+        CompartmentId = compartmentId;
+        WireAddressFamily = wireAddressFamily != 0
+            ? wireAddressFamily
+            : (ushort)(ClientAddress.AddressFamily == AddressFamily.InterNetwork ? 2 : 23);
+        ProcessId = processId;
+        FlowId = flowId;
+    }
+
+    public IntPtr AdapterHandle { get; }
+
+    public uint Dot1q { get; }
+
+    public IPAddress ClientAddress { get; }
+
+    public ushort ClientPort { get; }
+
+    public uint SubInterfaceIndex { get; }
+
+    public uint CompartmentId { get; }
+
+    public ushort WireAddressFamily { get; }
+
+    public uint ProcessId { get; }
+
+    public ulong FlowId { get; }
+
+    public static UdpRelaySessionKey FromRelayKey(UdpRelayKey key)
+    {
+        return new UdpRelaySessionKey(
+            key.AdapterHandle,
+            key.Dot1q,
+            key.ClientAddress,
+            key.ClientPort,
+            key.SubInterfaceIndex,
+            key.CompartmentId,
+            key.WireAddressFamily,
+            key.ProcessId);
+    }
+
+    public override string ToString()
+    {
+        return $"{ClientAddress}:{ClientPort} adapter=0x{AdapterHandle.ToInt64():X}";
+    }
 }
 
 internal readonly record struct TcpClientKey
@@ -149,7 +235,12 @@ internal readonly record struct RelayOutboundFlow
         IPAddress remoteAddress,
         ushort localPort,
         ushort remotePort,
-        uint dot1q = 0)
+        uint dot1q = 0,
+        uint subInterfaceIndex = 0,
+        uint compartmentId = 0,
+        ushort wireAddressFamily = 0,
+        uint processId = 0,
+        ulong flowId = 0)
     {
         AdapterHandle = adapterHandle;
         Protocol = protocol;
@@ -158,6 +249,11 @@ internal readonly record struct RelayOutboundFlow
         LocalPort = localPort;
         RemotePort = remotePort;
         Dot1q = dot1q;
+        SubInterfaceIndex = subInterfaceIndex;
+        CompartmentId = compartmentId;
+        WireAddressFamily = wireAddressFamily;
+        ProcessId = processId;
+        FlowId = flowId;
     }
 
     public IntPtr AdapterHandle { get; }
@@ -173,6 +269,16 @@ internal readonly record struct RelayOutboundFlow
     public ushort RemotePort { get; }
 
     public uint Dot1q { get; }
+
+    public uint SubInterfaceIndex { get; }
+
+    public uint CompartmentId { get; }
+
+    public ushort WireAddressFamily { get; }
+
+    public uint ProcessId { get; }
+
+    public ulong FlowId { get; }
 
     public override string ToString()
     {
@@ -199,7 +305,11 @@ internal sealed record DirectRelayTarget(
     byte[]? InboundEthernetDestination = null,
     int AdapterMtu = 1500,
     uint Dot1q = 0,
-    int InterfaceIndex = 0)
+    int InterfaceIndex = 0,
+    uint CompartmentId = 0,
+    uint SubInterfaceIndex = 0,
+    ushort WireAddressFamily = 0,
+    long ProcessStartTimeUtcTicks = 0)
 {
     public string AppLabel => ProcessId > 0
         ? $"{ProcessName} pid={ProcessId} pattern={MatchedPattern}"

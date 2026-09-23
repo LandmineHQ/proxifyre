@@ -56,43 +56,10 @@
     <Grid Margin="12">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
-            <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
         </Grid.RowDefinitions>
 
         <Grid Margin="0,0,0,16">
-            <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="*" />
-                <ColumnDefinition Width="Auto" />
-            </Grid.ColumnDefinitions>
-            <StackPanel>
-                <TextBlock Text="WinpkFilter" FontSize="15" FontWeight="SemiBold" />
-                <TextBlock Text="{Binding WinpkFilterDetailText}"
-                           Foreground="{StaticResource MutedTextBrush}"
-                           TextWrapping="Wrap"
-                           Margin="0,4,0,0" />
-            </StackPanel>
-            <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Top" Margin="14,0,0,0">
-                <Border Padding="9,4"
-                        CornerRadius="12"
-                        Background="{Binding WinpkFilterBadgeBackground}"
-                        VerticalAlignment="Center"
-                        Margin="0,0,8,0">
-                    <TextBlock Text="{Binding WinpkFilterStatusText}"
-                               FontSize="12"
-                               FontWeight="SemiBold"
-                               Foreground="{Binding WinpkFilterStatusForeground}" />
-                </Border>
-                <Button Content="{Binding WinpkFilterActionText}"
-                        IsEnabled="{Binding IsWinpkFilterActionEnabled}"
-                        Click="WinpkFilterActionButton_Click"
-                        MinWidth="76"
-                        Background="{Binding WinpkFilterActionBackground}"
-                        Foreground="{Binding WinpkFilterActionForeground}" />
-            </StackPanel>
-        </Grid>
-
-        <Grid Grid.Row="1" Margin="0,0,0,16">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*" />
                 <ColumnDefinition Width="Auto" />

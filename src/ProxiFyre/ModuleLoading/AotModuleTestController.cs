@@ -6,12 +6,20 @@ public sealed class AotModuleTestController : IDisposable
     private readonly AotModuleController _controller;
     private readonly Action<string> _log;
 
-    public AotModuleTestController(string configPath, string moduleLogPath, Action<string> log)
+    public AotModuleTestController(
+        string configPath,
+        string moduleLogPath,
+        Action<string> log,
+        bool detailedLogging = false)
     {
         _log = log;
         var configurationStore = new ConfigurationStore(configPath);
-        var winpkFilterManager = new WinpkFilterManager(log);
-        _controller = new AotModuleController(configurationStore, winpkFilterManager, log, ApplyModuleEvent, moduleLogPath);
+        _controller = new AotModuleController(
+            configurationStore,
+            log,
+            ApplyModuleEvent,
+            moduleLogPath,
+            detailedLogging: detailedLogging);
     }
 
     public async Task LoadAndRunAsync(

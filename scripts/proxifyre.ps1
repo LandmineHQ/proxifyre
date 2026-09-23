@@ -1,6 +1,6 @@
 param(
     [Parameter(Position = 0)]
-    [ValidateSet("build", "run", "ui", "test", "add-app", "init-config", "reset-filter", "license-device", "license-key", "module-publish", "patch-uu", "clean", "help")]
+    [ValidateSet("build", "package", "run", "ui", "test", "add-app", "init-config", "license-device", "license-key", "module-publish", "patch-uu", "clean", "help")]
     [string]$Command = "help",
 
     [Parameter(Position = 1)]
@@ -32,14 +32,15 @@ $ModuleProject = Join-Path $Root "src\ProxiFyre.Module\ProxiFyre.Module.csproj"
 $ProbeProject = Join-Path $Root "src\ProxiFyre.Probe\ProxiFyre.Probe.csproj"
 $TrafficTestHostProject = Join-Path $Root "src\TrafficTestHost\TrafficTestHost.csproj"
 $Artifacts = Join-Path $Root "artifacts"
+$PackageScript = Join-Path $PSScriptRoot "package-release.ps1"
 
 function Show-Usage {
     Write-Host "Usage:"
     Write-Host "  .\scripts\proxifyre.ps1 build [-Configuration Debug|Release]"
+    Write-Host "  .\scripts\proxifyre.ps1 package [-Configuration Release]"
     Write-Host "  .\scripts\proxifyre.ps1 ui"
-    Write-Host "  .\scripts\proxifyre.ps1 test <tcp|udp|uu|steam|traffic-telemetry|packet-selftest|tcp-selftest|udp-selftest> [-Detailed] [-- <test args>]"
+    Write-Host "  .\scripts\proxifyre.ps1 test <tcp|udp|uu|steam|traffic-telemetry|packet-selftest|tcp-selftest|udp-selftest|windivert-probe|windivert-tcp-probe|windivert-bypass-probe> [-Detailed] [-- <test args>]"
     Write-Host "  .\scripts\proxifyre.ps1 run [-Config .\app-config.json] [-Detailed]"
-    Write-Host "  .\scripts\proxifyre.ps1 reset-filter"
     Write-Host "  .\scripts\proxifyre.ps1 license-device"
     Write-Host "  .\scripts\proxifyre.ps1 license-key <device-id>"
     Write-Host "  .\scripts\proxifyre.ps1 module-publish [-Configuration Debug|Release]"
@@ -104,6 +105,10 @@ switch ($Command) {
         dotnet run --project $Project
         exit $LASTEXITCODE
     }
+    "package" {
+        & $PackageScript -Configuration $Configuration
+        exit $LASTEXITCODE
+    }
     "test" {
         $testArgs = @()
         if (-not [string]::IsNullOrWhiteSpace($App)) {
@@ -141,10 +146,6 @@ switch ($Command) {
         }
 
         Invoke-ProxiFyreCli @runArgs
-        exit $LASTEXITCODE
-    }
-    "reset-filter" {
-        Invoke-ProxiFyreCli --reset-filter
         exit $LASTEXITCODE
     }
     "license-device" {
@@ -202,6 +203,7 @@ switch ($Command) {
         dotnet clean $Solution --configuration $Configuration
         $paths = @(
             $Artifacts,
+            (Join-Path $Root "release"),
             (Join-Path $Root "src\ProxiFyre\bin"),
             (Join-Path $Root "src\ProxiFyre\obj"),
             (Join-Path $Root "src\ProxiFyre.Module\bin"),

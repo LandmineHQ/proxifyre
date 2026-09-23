@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Security.Cryptography;
@@ -25,15 +26,20 @@ internal static class StunClient
         IPEndPoint remoteEndPoint,
         AddressFamily addressFamily,
         int timeoutMilliseconds,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action<string>? trace = null)
     {
+        var stopwatch = Stopwatch.StartNew();
         using var socket = new Socket(addressFamily, SocketType.Dgram, ProtocolType.Udp);
         socket.Bind(addressFamily == AddressFamily.InterNetwork
             ? new IPEndPoint(IPAddress.Any, 0)
             : new IPEndPoint(IPAddress.IPv6Any, 0));
+        trace?.Invoke($"stun trace: bound at {stopwatch.Elapsed.TotalMilliseconds:F2} ms");
 
         var request = CreateStunBindingRequest();
+        trace?.Invoke($"stun trace: send starting at {stopwatch.Elapsed.TotalMilliseconds:F2} ms");
         await socket.SendToAsync(request, SocketFlags.None, remoteEndPoint, cancellationToken);
+        trace?.Invoke($"stun trace: send returned at {stopwatch.Elapsed.TotalMilliseconds:F2} ms");
 
         var buffer = new byte[1500];
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -41,6 +47,7 @@ internal static class StunClient
         try
         {
             var received = await socket.ReceiveFromAsync(buffer, SocketFlags.None, CreateAnyEndPoint(addressFamily), timeout.Token);
+            trace?.Invoke($"stun trace: response received at {stopwatch.Elapsed.TotalMilliseconds:F2} ms");
             if (received.RemoteEndPoint is not IPEndPoint responseEndPoint)
             {
                 return StunResult.Fail("Response endpoint was not an IP endpoint.");

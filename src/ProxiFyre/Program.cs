@@ -10,7 +10,7 @@ internal static class Program
     {
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
         {
-            MessageBox.Show("This program requires Windows and WinpkFilter.", "ProxiFyre", MessageBoxButton.OK, MessageBoxImage.Error);
+            MessageBox.Show("This program requires Windows and the signed WinDivert driver.", "ProxiFyre", MessageBoxButton.OK, MessageBoxImage.Error);
             return 1;
         }
 

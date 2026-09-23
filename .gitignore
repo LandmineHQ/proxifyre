@@ -3,6 +3,7 @@ obj/
 artifacts/
 release/
 .vs/
+.idea/
 
 *.user
 *.suo
@@ -12,11 +13,17 @@ release/
 *.pdb
 *.log
 *.cache
+*.binlog
+*.dmp
+*.etl
 *.nupkg
 *.snupkg
 
 app-config.json
+traffic-test-config.json
 steamwebhelper.exe
+TestResults/
 
 # 临时文件夹
 .tmp
+*.tmp

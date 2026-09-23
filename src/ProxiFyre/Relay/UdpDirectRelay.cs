@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
@@ -9,12 +10,17 @@ internal sealed class UdpDirectRelay : IDisposable
 {
     private static readonly TimeSpan TargetTtl = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan CleanupInterval = TimeSpan.FromSeconds(30);
-    private const int MaxFlows = 4096;
+    private static readonly TimeSpan BypassFlowTtl = TimeSpan.FromSeconds(30);
+    private const int MaxSessions = 4096;
+    private const int MaxTargets = 16384;
+    private const int MaxQueuedSendsPerSession = 2048;
+    private const long MaxQueuedBytesPerSession = 32L * 1024 * 1024;
 
     private readonly ConcurrentDictionary<UdpRelayKey, DirectRelayTarget> _targets = new();
-    private readonly ConcurrentDictionary<UdpRelayKey, UdpRelaySocket> _sockets = new();
+    private readonly ConcurrentDictionary<UdpRelaySessionKey, UdpRelaySocket> _sockets = new();
     private readonly ConcurrentDictionary<UdpRelayKey, long> _targetGenerations = new();
     private readonly ConcurrentDictionary<UdpRelayKey, byte> _relayOutboundFlows = new();
+    private readonly ConcurrentDictionary<UdpRelayKey, DateTimeOffset> _bypassedFlows = new();
     private readonly object _socketCreationSync = new();
     private readonly Action<string> _log;
     private readonly bool _detailedLogging;
@@ -79,7 +85,8 @@ internal sealed class UdpDirectRelay : IDisposable
     {
         _cancellationToken = cancellationToken;
         _ = Task.Run(() => CleanupLoopAsync(cancellationToken), cancellationToken);
-        LogDetail("Local direct UDP relay uses packet injection; no local UDP listener is opened.");
+        LogDetail(
+            "Local direct UDP relay uses one stable outbound socket per local endpoint and packet injection; no local UDP listener is opened.");
     }
 
     public long Register(UdpRelayKey key, DirectRelayTarget target)
@@ -87,6 +94,11 @@ internal sealed class UdpDirectRelay : IDisposable
         lock (_socketCreationSync)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
+            if (!_targets.ContainsKey(key) && _targets.Count >= MaxTargets)
+            {
+                throw new InvalidOperationException("UDP relay target limit reached.");
+            }
+
             if (!_targets.TryGetValue(key, out var current)
                 || !TargetMatches(current, target))
             {
@@ -96,6 +108,7 @@ internal sealed class UdpDirectRelay : IDisposable
                 return generation;
             }
 
+            _targets[key] = current with { CreatedAt = _timeProvider.GetUtcNow() };
             return _targetGenerations.TryGetValue(key, out var existingGeneration)
                 ? existingGeneration
                 : 0;
@@ -136,73 +149,119 @@ internal sealed class UdpDirectRelay : IDisposable
             wildcardAddress,
             key.ClientPort,
             key.RemoteAddress,
-            key.RemotePort));
+            key.RemotePort,
+            key.SubInterfaceIndex,
+            key.CompartmentId,
+            key.WireAddressFamily,
+            key.ProcessId));
     }
 
-    public void Remove(UdpRelayKey key)
+    public void MarkBypassedFlow(UdpRelayKey key)
     {
-        _ = Remove(key, expectedSocket: null);
+        _bypassedFlows[key] = _timeProvider.GetUtcNow();
     }
 
-    private bool Remove(UdpRelayKey key, UdpRelaySocket? expectedSocket)
+    public bool IsBypassedFlow(UdpRelayKey key)
     {
-        UdpRelaySocket? socket;
-        var removed = false;
-        lock (_socketCreationSync)
+        if (!_bypassedFlows.TryGetValue(key, out var markedAt))
         {
-            _sockets.TryGetValue(key, out socket);
-            if (expectedSocket is not null
-                && !ReferenceEquals(socket, expectedSocket))
-            {
-                return false;
-            }
-
-            if (socket is not null)
-            {
-                _sockets.TryRemove(key, out _);
-                removed = true;
-            }
-
-            if (_targets.TryRemove(key, out _))
-            {
-                _targetGenerations.TryRemove(key, out _);
-                removed = true;
-            }
+            return false;
         }
 
-        socket?.Dispose();
-        if (removed)
+        if (_timeProvider.GetUtcNow() - markedAt <= BypassFlowTtl)
         {
-            _targetRedirectUnregister?.Invoke(ToRelayFlow(key));
+            _bypassedFlows[key] = _timeProvider.GetUtcNow();
+            return true;
         }
 
-        return removed;
+        _bypassedFlows.TryRemove(key, out _);
+        return false;
     }
 
-    private void RemoveIfNoSocket(UdpRelayKey key, DirectRelayTarget target, long generation)
+    public bool TrySubmit(
+        UdpRelayKey key,
+        DirectRelayTarget target,
+        ReadOnlyMemory<byte> payload,
+        IPAddress remoteAddress,
+        ushort remotePort,
+        out string? failureReason)
     {
-        var removed = false;
-        lock (_socketCreationSync)
+        return TrySubmit(key, target, payload, remoteAddress, remotePort, out failureReason, out _);
+    }
+
+    public bool TrySubmit(
+        UdpRelayKey key,
+        DirectRelayTarget target,
+        ReadOnlyMemory<byte> payload,
+        IPAddress remoteAddress,
+        ushort remotePort,
+        out string? failureReason,
+        out bool retryable)
+    {
+        // Reuse the socket and external port for every destination reached by
+        // the same captured local UDP endpoint.
+        failureReason = null;
+        retryable = false;
+        var payloadCopy = payload.ToArray();
+        var submittedTimestamp = Stopwatch.GetTimestamp();
+        var targetRegistered = false;
+        try
         {
-            if (_sockets.ContainsKey(key))
+            lock (_socketCreationSync)
             {
-                return;
+                ObjectDisposedException.ThrowIf(_disposed, this);
+                if (!_targets.ContainsKey(key) && _targets.Count >= MaxTargets)
+                {
+                    failureReason = "UDP relay target limit reached.";
+                    return false;
+                }
+
+                var generation = Register(key, target);
+                targetRegistered = true;
+
+                var sessionKey = UdpRelaySessionKey.FromRelayKey(key);
+                var relaySocket = GetOrCreateSocketLocked(sessionKey, target);
+                var remoteEndPoint = NetworkEndpointResolver.CreateRemoteEndPoint(
+                    target,
+                    remoteAddress,
+                    remotePort);
+                if (relaySocket.TargetCount == 0)
+                {
+                    relaySocket.SendInitial(
+                        key,
+                        target,
+                        generation,
+                        payloadCopy,
+                        remoteEndPoint,
+                        submittedTimestamp);
+                }
+                else
+                {
+                    relaySocket.Enqueue(
+                        key,
+                        target,
+                        generation,
+                        payloadCopy,
+                        remoteEndPoint,
+                        submittedTimestamp);
+                }
             }
 
-            if (_targets.TryGetValue(key, out var current)
-                && TargetMatches(current, target)
-                && _targetGenerations.TryGetValue(key, out var currentGeneration)
-                && currentGeneration == generation
-                && _targets.TryRemove(key, out _))
-            {
-                _targetGenerations.TryRemove(key, out _);
-                removed = true;
-            }
+            return true;
         }
-
-        if (removed)
+        catch (Exception ex)
         {
-            _targetRedirectUnregister?.Invoke(ToRelayFlow(key));
+            failureReason = ex.Message;
+            retryable = ex is UdpQueueFullException;
+            if (targetRegistered)
+            {
+                if (!retryable)
+                {
+                    Remove(key);
+                }
+            }
+
+            return false;
         }
     }
 
@@ -213,180 +272,227 @@ internal sealed class UdpDirectRelay : IDisposable
         IPAddress remoteAddress,
         ushort remotePort)
     {
-        long generation = 0;
-        var registered = false;
-        try
+        if (!TrySubmit(key, target, payload, remoteAddress, remotePort, out var failureReason))
         {
-            ObjectDisposedException.ThrowIf(_disposed, this);
-            generation = Register(key, target);
-            registered = true;
-            if (!_sockets.ContainsKey(key) && _sockets.Count >= MaxFlows)
-            {
-                throw new InvalidOperationException("UDP relay flow limit reached.");
-            }
+            throw new IOException(failureReason ?? "UDP relay submission failed.");
+        }
 
-            var relaySocket = GetOrCreateSocket(key, target);
-            var remoteEndPoint = NetworkEndpointResolver.CreateRemoteEndPoint(
-                target,
-                remoteAddress,
-                remotePort);
-            try
+        await Task.Yield();
+    }
+
+    public void ApplyConfiguration(AppConfiguration configuration)
+    {
+        foreach (var pair in _targets.ToArray())
+        {
+            var process = new ProcessInfo(
+                pair.Value.ProcessId,
+                pair.Value.ProcessName,
+                pair.Value.ProcessPath);
+            if (!configuration.TryGetMatchingPattern(process, out _, out _))
             {
-                await relaySocket.SendToRemoteAsync(
-                    payload,
-                    remoteEndPoint,
-                    _cancellationToken).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                throw;
-            }
-            catch
-            {
-                _ = Remove(key, relaySocket);
-                throw;
+                Remove(pair.Key);
             }
         }
-        catch (Exception)
+
+        _bypassedFlows.Clear();
+    }
+
+    public void RemoveTargetsWithMissingAdapters(IReadOnlySet<IntPtr> adapterHandles)
+    {
+        foreach (var key in _targets.Keys)
         {
-            if (registered)
+            if (!adapterHandles.Contains(key.AdapterHandle))
             {
-                RemoveIfNoSocket(key, target, generation);
+                Remove(key);
             }
-            throw;
+        }
+
+        foreach (var key in _bypassedFlows.Keys)
+        {
+            if (!adapterHandles.Contains(key.AdapterHandle))
+            {
+                _bypassedFlows.TryRemove(key, out _);
+            }
         }
     }
 
-    private UdpRelaySocket GetOrCreateSocket(UdpRelayKey key, DirectRelayTarget target)
+    public void Remove(UdpRelayKey key)
     {
+        RemoveCore(key, notifyDriver: true);
+    }
+
+    public void RemoveOwnedTarget(UdpRelayKey key)
+    {
+        RemoveCore(key, notifyDriver: false);
+    }
+
+    private void RemoveCore(UdpRelayKey key, bool notifyDriver)
+    {
+        UdpRelaySocket? emptySocket = null;
+        var removed = false;
         lock (_socketCreationSync)
         {
-            ObjectDisposedException.ThrowIf(_disposed, this);
-            if (_sockets.TryGetValue(key, out var existing) && existing.Matches(target))
+            if (_targets.TryRemove(key, out _))
+            {
+                _targetGenerations.TryRemove(key, out _);
+                removed = true;
+            }
+
+            var sessionKey = UdpRelaySessionKey.FromRelayKey(key);
+            if (_sockets.TryGetValue(sessionKey, out var socket))
+            {
+                socket.RemoveTarget(key);
+                if (socket.TargetCount == 0)
+                {
+                    _sockets.TryRemove(sessionKey, out _);
+                    emptySocket = socket;
+                }
+            }
+        }
+
+        emptySocket?.Dispose();
+        if (removed && notifyDriver)
+        {
+            _targetRedirectUnregister?.Invoke(ToRelayFlow(key));
+        }
+    }
+
+    private UdpRelaySocket GetOrCreateSocketLocked(
+        UdpRelaySessionKey sessionKey,
+        DirectRelayTarget target)
+    {
+        if (_sockets.TryGetValue(sessionKey, out var existing))
+        {
+            if (existing.MatchesSession(target))
             {
                 return existing;
             }
 
-            if (existing is not null)
-            {
-                _sockets.TryRemove(key, out _);
-                existing.Dispose();
-            }
+            RemoveSession(sessionKey, existing);
+        }
 
-            if (_sockets.Count >= MaxFlows)
-            {
-                throw new InvalidOperationException("UDP relay flow limit reached.");
-            }
+        if (_sockets.Count >= MaxSessions)
+        {
+            throw new InvalidOperationException("UDP relay session limit reached.");
+        }
 
-            var socket = CreateSocket(key, target);
-            _sockets[key] = socket;
+        var socket = CreateSocket(sessionKey, target);
+        try
+        {
+            _sockets[sessionKey] = socket;
+            socket.Start(_cancellationToken);
             return socket;
+        }
+        catch
+        {
+            _sockets.TryRemove(sessionKey, out _);
+            socket.Dispose();
+            throw;
         }
     }
 
-    private UdpRelaySocket CreateSocket(UdpRelayKey key, DirectRelayTarget target)
+    private UdpRelaySocket CreateSocket(
+        UdpRelaySessionKey sessionKey,
+        DirectRelayTarget target)
     {
         var remoteEndPoint = NetworkEndpointResolver.CreateRemoteEndPoint(target);
-        var socket = CreateUdpSocket(remoteEndPoint.AddressFamily);
-
+        var socket = CreateUdpSocket(remoteEndPoint.AddressFamily, target.CompartmentId);
         var bindEndPoint = NetworkEndpointResolver.CreateBindEndPoint(target);
         try
         {
-            TrySetOutboundInterface(socket, target, remoteEndPoint.AddressFamily);
+            ApplyOutboundInterface(socket, target, remoteEndPoint.AddressFamily);
             socket.Bind(
                 bindEndPoint is not null && bindEndPoint.AddressFamily == remoteEndPoint.AddressFamily
                     ? bindEndPoint
                     : NetworkEndpointResolver.CreateAnyEndPoint(remoteEndPoint.AddressFamily));
+
+            UdpRelaySocket? relaySocket = null;
+            try
+            {
+                relaySocket = new UdpRelaySocket(
+                    socket,
+                    sessionKey,
+                    target,
+                    _relayOutboundFlows,
+                    key => _targets.TryGetValue(key, out var currentTarget) ? currentTarget : null,
+                    key => _targetGenerations.TryGetValue(key, out var generation) ? generation : null,
+                    key => _ = Refresh(key),
+                    Remove,
+                    RemoveSession,
+                    _outboundBypassRegister,
+                    _outboundBypassUnregister,
+                    _trafficCounter,
+                    _packetWakeSignal,
+                    _responseInjector,
+                    _responseValidator,
+                    _errorInjector,
+                    _detailedLogging ? LogDetail : null,
+                    _log,
+                    _timeProvider,
+                    MaxQueuedSendsPerSession);
+                return relaySocket;
+            }
+            catch
+            {
+                relaySocket?.Dispose();
+                throw;
+            }
         }
-        catch (SocketException ex)
+        catch
         {
-            _log($"DIRECT UDP bind failed, retrying any app={target.AppLabel} appLocal={target.ClientEndpoint} target={target.RemoteEndpoint} bind={bindEndPoint}: {ex.Message}");
             socket.Dispose();
-            socket = CreateUdpSocket(remoteEndPoint.AddressFamily);
-            TrySetOutboundInterface(socket, target, remoteEndPoint.AddressFamily);
-            socket.Bind(NetworkEndpointResolver.CreateAnyEndPoint(remoteEndPoint.AddressFamily));
+            throw;
         }
-
-        var outboundFlows = new List<RelayOutboundFlow>();
-        if (socket.LocalEndPoint is IPEndPoint localEndPoint)
-        {
-            var localPort = (ushort)localEndPoint.Port;
-            var localAddress = NetworkAddress.Normalize(localEndPoint.Address);
-            var wildcardAddress = localAddress.AddressFamily == AddressFamily.InterNetwork
-                ? IPAddress.Any
-                : IPAddress.IPv6Any;
-
-            var exact = new RelayOutboundFlow(
-                target.AdapterHandle,
-                PacketView.ProtocolUdp,
-                localAddress,
-                remoteEndPoint.Address,
-                localPort,
-                (ushort)remoteEndPoint.Port,
-                target.Dot1q);
-            outboundFlows.Add(exact);
-            _relayOutboundFlows[new UdpRelayKey(
-                target.AdapterHandle,
-                target.Dot1q,
-                localAddress,
-                localPort,
-                remoteEndPoint.Address,
-                (ushort)remoteEndPoint.Port)] = 0;
-
-            if (!localAddress.Equals(wildcardAddress))
-            {
-                var wildcard = new RelayOutboundFlow(
-                    target.AdapterHandle,
-                    PacketView.ProtocolUdp,
-                    wildcardAddress,
-                    remoteEndPoint.Address,
-                    localPort,
-                    (ushort)remoteEndPoint.Port,
-                    target.Dot1q);
-                outboundFlows.Add(wildcard);
-                _relayOutboundFlows[new UdpRelayKey(
-                    target.AdapterHandle,
-                    target.Dot1q,
-                    wildcardAddress,
-                    localPort,
-                    remoteEndPoint.Address,
-                    (ushort)remoteEndPoint.Port)] = 0;
-            }
-
-            foreach (var flow in outboundFlows)
-            {
-                _outboundBypassRegister?.Invoke(flow);
-            }
-        }
-
-        UdpRelaySocket? relaySocket = null;
-        relaySocket = new UdpRelaySocket(
-            socket,
-            key,
-            target,
-            remoteEndPoint,
-            outboundFlows,
-            () => Refresh(key),
-            key => Remove(key, relaySocket),
-            _relayOutboundFlows,
-            _outboundBypassUnregister,
-            _trafficCounter,
-            _packetWakeSignal,
-            _responseInjector,
-            _responseValidator,
-            _errorInjector,
-            _detailedLogging ? LogDetail : null,
-            _log,
-            _timeProvider);
-        relaySocket.Start(_cancellationToken);
-        return relaySocket;
     }
 
-    private void TrySetOutboundInterface(Socket socket, DirectRelayTarget target, AddressFamily remoteFamily)
+    private void RemoveSession(UdpRelaySessionKey sessionKey, UdpRelaySocket socket)
     {
-        if (target.InterfaceIndex <= 0)
+        List<UdpRelayKey> removedTargets = [];
+        lock (_socketCreationSync)
+        {
+            if (!_sockets.TryGetValue(sessionKey, out var current)
+                || !ReferenceEquals(current, socket))
+            {
+                return;
+            }
+
+            _sockets.TryRemove(sessionKey, out _);
+            foreach (var pair in _targets)
+            {
+                if (UdpRelaySessionKey.FromRelayKey(pair.Key) == sessionKey)
+                {
+                    removedTargets.Add(pair.Key);
+                }
+            }
+
+            foreach (var key in removedTargets)
+            {
+                _targets.TryRemove(key, out _);
+                _targetGenerations.TryRemove(key, out _);
+            }
+        }
+
+        socket.Dispose();
+        foreach (var key in removedTargets)
+        {
+            _targetRedirectUnregister?.Invoke(ToRelayFlow(key));
+        }
+    }
+
+    private void ApplyOutboundInterface(
+        Socket socket,
+        DirectRelayTarget target,
+        AddressFamily remoteFamily)
+    {
+        if (target.AdapterHandle == IntPtr.Zero)
         {
             return;
+        }
+
+        if (target.InterfaceIndex <= 0)
+        {
+            throw new InvalidOperationException(
+                $"UDP relay cannot pin interface for {target.ClientEndpoint} -> {target.RemoteEndpoint}: the interface index is unavailable.");
         }
 
         try
@@ -401,15 +507,11 @@ internal sealed class UdpDirectRelay : IDisposable
                 (SocketOptionName)31,
                 optionValue);
         }
-        catch (SocketException ex)
+        catch (Exception ex) when (ex is SocketException or PlatformNotSupportedException or ArgumentException)
         {
-            _log(
-                $"DIRECT UDP could not pin interfaceIndex={target.InterfaceIndex} app={target.AppLabel} appLocal={target.ClientEndpoint} target={target.RemoteEndpoint}: {ex.Message}");
-        }
-        catch (PlatformNotSupportedException ex)
-        {
-            _log(
-                $"DIRECT UDP interface pinning is unavailable app={target.AppLabel} appLocal={target.ClientEndpoint} target={target.RemoteEndpoint}: {ex.Message}");
+            throw new InvalidOperationException(
+                $"UDP relay could not pin interfaceIndex={target.InterfaceIndex} for {target.ClientEndpoint} -> {target.RemoteEndpoint}: {ex.Message}",
+                ex);
         }
     }
 
@@ -421,15 +523,59 @@ internal sealed class UdpDirectRelay : IDisposable
         }
     }
 
-    private static Socket CreateUdpSocket(AddressFamily addressFamily)
+    private Socket CreateUdpSocket(AddressFamily addressFamily, uint compartmentId)
     {
-        var socket = new Socket(addressFamily, SocketType.Dgram, ProtocolType.Udp);
-        if (addressFamily == AddressFamily.InterNetworkV6)
+        Socket? socket = null;
+        var previousCompartment = 0u;
+        var compartmentChanged = false;
+        if (compartmentId != 0)
         {
-            socket.DualMode = true;
+            try
+            {
+                previousCompartment = GetCurrentThreadCompartmentId();
+                if (previousCompartment != compartmentId)
+                {
+                    var status = SetCurrentThreadCompartmentId(compartmentId);
+                    if (status != 0)
+                    {
+                        throw new InvalidOperationException(
+                            $"Could not enter network compartment {compartmentId}: {new System.ComponentModel.Win32Exception((int)status).Message}");
+                    }
+
+                    compartmentChanged = true;
+                }
+            }
+            catch (EntryPointNotFoundException ex)
+            {
+                throw new InvalidOperationException(
+                    "The current Windows version cannot reproduce the captured UDP network compartment.",
+                    ex);
+            }
         }
 
-        return socket;
+        try
+        {
+            socket = new Socket(addressFamily, SocketType.Dgram, ProtocolType.Udp);
+            if (addressFamily == AddressFamily.InterNetworkV6)
+            {
+                socket.DualMode = true;
+            }
+
+            return socket;
+        }
+        finally
+        {
+            if (compartmentChanged)
+            {
+                var restoreStatus = SetCurrentThreadCompartmentId(previousCompartment);
+                if (restoreStatus != 0)
+                {
+                    socket?.Dispose();
+                    throw new InvalidOperationException(
+                        $"Could not restore the previous UDP network compartment {previousCompartment}.");
+                }
+            }
+        }
     }
 
     private async Task CleanupLoopAsync(CancellationToken cancellationToken)
@@ -445,12 +591,21 @@ internal sealed class UdpDirectRelay : IDisposable
                     Remove(pair.Key);
                 }
             }
+
+            foreach (var pair in _bypassedFlows)
+            {
+                if (now - pair.Value > BypassFlowTtl)
+                {
+                    _bypassedFlows.TryRemove(pair.Key, out _);
+                }
+            }
         }
     }
 
     public void Dispose()
     {
         UdpRelaySocket[] sockets;
+        KeyValuePair<UdpRelayKey, DirectRelayTarget>[] targets;
         lock (_socketCreationSync)
         {
             if (_disposed)
@@ -460,44 +615,36 @@ internal sealed class UdpDirectRelay : IDisposable
 
             _disposed = true;
             sockets = _sockets.Values.ToArray();
-            foreach (var pair in _targets)
-            {
-                _targetRedirectUnregister?.Invoke(new RelayOutboundFlow(
-                    pair.Key.AdapterHandle,
-                    PacketView.ProtocolUdp,
-                    pair.Key.ClientAddress,
-                    pair.Key.RemoteAddress,
-                    pair.Key.ClientPort,
-                    pair.Key.RemotePort,
-                    pair.Key.Dot1q));
-            }
+            targets = _targets.ToArray();
             _sockets.Clear();
+            _targets.Clear();
+            _targetGenerations.Clear();
+            _relayOutboundFlows.Clear();
+            _bypassedFlows.Clear();
         }
 
         foreach (var socket in sockets)
         {
-            try
-            {
-                socket.Dispose();
-            }
-            catch
-            {
-            }
+            socket.Dispose();
         }
 
-        _targets.Clear();
-        _targetGenerations.Clear();
-        _relayOutboundFlows.Clear();
+        foreach (var pair in targets)
+        {
+            _targetRedirectUnregister?.Invoke(ToRelayFlow(pair.Key));
+        }
     }
 
-    private sealed class UdpRelaySocket : IDisposable
+    internal sealed class UdpRelaySocket : IDisposable
     {
         private readonly Socket _socket;
-        private readonly UdpRelayKey _key;
-        private readonly DirectRelayTarget _target;
-        private readonly Action _refreshTarget;
-        private readonly Action<UdpRelayKey> _remove;
+        private readonly UdpRelaySessionKey _sessionKey;
+        private readonly Func<UdpRelayKey, DirectRelayTarget?> _getTarget;
+        private readonly Func<UdpRelayKey, long?> _getGeneration;
+        private readonly Action<UdpRelayKey> _refreshTarget;
+        private readonly Action<UdpRelayKey> _removeTarget;
+        private readonly Action<UdpRelaySessionKey, UdpRelaySocket> _removeSession;
         private readonly ConcurrentDictionary<UdpRelayKey, byte> _relayOutboundFlows;
+        private readonly Action<RelayOutboundFlow>? _outboundBypassRegister;
         private readonly Action<RelayOutboundFlow>? _outboundBypassUnregister;
         private readonly TrafficCounter _trafficCounter;
         private readonly PacketWakeSignal? _packetWakeSignal;
@@ -507,26 +654,35 @@ internal sealed class UdpDirectRelay : IDisposable
         private readonly Action<string>? _detailLog;
         private readonly Action<string> _errorLog;
         private readonly TimeProvider _timeProvider;
-        private readonly IReadOnlyList<RelayOutboundFlow> _outboundFlows;
-        private IPEndPoint _remoteEndPoint;
-        private DateTimeOffset _lastActivity;
+        private CancellationTokenSource? _runCts;
+        private readonly object _sync = new();
+        private readonly Queue<UdpSendItem> _sendQueue = [];
+        private readonly SemaphoreSlim _sendSignal = new(0);
+        private readonly Dictionary<UdpRelayKey, RelayOutboundFlow[]> _outboundFlows = [];
+        private readonly int _maxQueuedSends;
+        private long _queuedBytes;
+        private DirectRelayTarget _sessionTarget;
         private DateTimeOffset _lastSendStatsLog;
         private DateTimeOffset _lastReceiveStatsLog;
+        private DateTimeOffset _lastUnregisteredResponseLog;
         private long _upBytes;
         private long _downBytes;
-        private byte[] _lastSentPayload = [];
+        private long _firstSendTimestamp;
+        private long _firstResponseTimestamp;
         private bool _sniProbeFinished;
         private int _disposed;
 
         public UdpRelaySocket(
             Socket socket,
-            UdpRelayKey key,
+            UdpRelaySessionKey sessionKey,
             DirectRelayTarget target,
-            IPEndPoint remoteEndPoint,
-            IReadOnlyList<RelayOutboundFlow> outboundFlows,
-            Action refreshTarget,
-            Action<UdpRelayKey> remove,
             ConcurrentDictionary<UdpRelayKey, byte> relayOutboundFlows,
+            Func<UdpRelayKey, DirectRelayTarget?> getTarget,
+            Func<UdpRelayKey, long?> getGeneration,
+            Action<UdpRelayKey> refreshTarget,
+            Action<UdpRelayKey> removeTarget,
+            Action<UdpRelaySessionKey, UdpRelaySocket> removeSession,
+            Action<RelayOutboundFlow>? outboundBypassRegister,
             Action<RelayOutboundFlow>? outboundBypassUnregister,
             TrafficCounter trafficCounter,
             PacketWakeSignal? packetWakeSignal,
@@ -535,16 +691,19 @@ internal sealed class UdpDirectRelay : IDisposable
             Action<DirectRelayTarget, IPEndPoint, ReadOnlyMemory<byte>, SocketError>? errorInjector,
             Action<string>? detailLog,
             Action<string> errorLog,
-            TimeProvider timeProvider)
+            TimeProvider timeProvider,
+            int maxQueuedSends)
         {
             _socket = socket;
-            _key = key;
-            _target = target;
-            _remoteEndPoint = remoteEndPoint;
-            _outboundFlows = outboundFlows;
+            _sessionKey = sessionKey;
+            _sessionTarget = target;
+            _getTarget = getTarget;
+            _getGeneration = getGeneration;
             _refreshTarget = refreshTarget;
-            _remove = remove;
+            _removeTarget = removeTarget;
+            _removeSession = removeSession;
             _relayOutboundFlows = relayOutboundFlows;
+            _outboundBypassRegister = outboundBypassRegister;
             _outboundBypassUnregister = outboundBypassUnregister;
             _trafficCounter = trafficCounter;
             _packetWakeSignal = packetWakeSignal;
@@ -554,57 +713,362 @@ internal sealed class UdpDirectRelay : IDisposable
             _detailLog = detailLog;
             _errorLog = errorLog;
             _timeProvider = timeProvider;
-            _lastActivity = _timeProvider.GetUtcNow();
+            _maxQueuedSends = maxQueuedSends;
         }
 
-        public bool Matches(DirectRelayTarget target)
+        public int TargetCount
         {
-            return TargetMatches(target, _target);
+            get
+            {
+                lock (_sync)
+                {
+                    return _outboundFlows.Count;
+                }
+            }
+        }
+
+        public bool MatchesSession(DirectRelayTarget target)
+        {
+            return target.AdapterHandle == _sessionKey.AdapterHandle
+                && target.Dot1q == _sessionKey.Dot1q
+                && target.SubInterfaceIndex == _sessionKey.SubInterfaceIndex
+                && target.CompartmentId == _sessionKey.CompartmentId
+                && (target.WireAddressFamily == 0
+                    || _sessionKey.WireAddressFamily == 0
+                    || target.WireAddressFamily == _sessionKey.WireAddressFamily)
+                && (target.ProcessId == 0
+                    || _sessionKey.ProcessId == 0
+                    || (uint)target.ProcessId == _sessionKey.ProcessId)
+                && Equals(target.ClientAddress, _sessionKey.ClientAddress)
+                && target.ClientPort == _sessionKey.ClientPort;
         }
 
         public void Start(CancellationToken cancellationToken)
         {
-            _ = Task.Run(() => ReceiveRemoteLoopAsync(cancellationToken), cancellationToken);
+            if (_runCts is not null)
+            {
+                throw new InvalidOperationException("UDP relay socket is already running.");
+            }
+
+            var runCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            _runCts = runCts;
+            var token = runCts.Token;
+            _ = Task.Run(() => SendLoopAsync(token), CancellationToken.None);
+            _ = Task.Run(() => ReceiveRemoteLoopAsync(token), CancellationToken.None);
         }
 
-        public async Task SendToRemoteAsync(
-            ReadOnlyMemory<byte> payload,
+        public void Enqueue(
+            UdpRelayKey key,
+            DirectRelayTarget target,
+            long generation,
+            byte[] payload,
             IPEndPoint remoteEndPoint,
-            CancellationToken cancellationToken)
+            long submittedTimestamp)
         {
-            _remoteEndPoint = remoteEndPoint;
-            _lastActivity = _timeProvider.GetUtcNow();
-            _refreshTarget();
-            ProbeClientSni(payload.Span);
-            _lastSentPayload = payload.ToArray();
-            int sent;
+            lock (_sync)
+            {
+                ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+                if (_sendQueue.Count >= _maxQueuedSends
+                    || payload.Length > MaxQueuedBytesPerSession - _queuedBytes)
+                {
+                    throw new UdpQueueFullException(
+                        $"UDP relay send queue is full for {_sessionKey}.");
+                }
+
+                _sessionTarget = target;
+                RegisterOutboundFlowsLocked(key, remoteEndPoint);
+                _sendQueue.Enqueue(new UdpSendItem(
+                    key,
+                    target,
+                    generation,
+                    payload,
+                    remoteEndPoint,
+                    submittedTimestamp));
+                _queuedBytes += payload.Length;
+            }
+
+            Pulse(_sendSignal);
+        }
+
+        public void SendInitial(
+            UdpRelayKey key,
+            DirectRelayTarget target,
+            long generation,
+            byte[] payload,
+            IPEndPoint remoteEndPoint,
+            long submittedTimestamp)
+        {
+            var item = new UdpSendItem(
+                key,
+                target,
+                generation,
+                payload,
+                remoteEndPoint,
+                submittedTimestamp);
+            lock (_sync)
+            {
+                ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+                _sessionTarget = target;
+                RegisterOutboundFlowsLocked(key, remoteEndPoint);
+            }
+
             try
             {
-                sent = await _socket.SendToAsync(
-                    payload,
-                    SocketFlags.None,
-                    remoteEndPoint,
-                    cancellationToken).ConfigureAwait(false);
+                SendItemCore(item, CancellationToken.None);
+            }
+            catch
+            {
+                RemoveTarget(key);
+                throw;
+            }
+        }
+
+        public void RemoveTarget(UdpRelayKey key)
+        {
+            RelayOutboundFlow[]? flows;
+            List<UdpSendItem>? kept = null;
+            lock (_sync)
+            {
+                if (!_outboundFlows.Remove(key, out flows))
+                {
+                    return;
+                }
+
+                if (_sendQueue.Count > 0)
+                {
+                    kept = [];
+                    while (_sendQueue.Count > 0)
+                    {
+                        var item = _sendQueue.Dequeue();
+                        if (item.Key.Equals(key))
+                        {
+                            _queuedBytes -= item.Payload.Length;
+                        }
+                        else
+                        {
+                            kept.Add(item);
+                        }
+                    }
+
+                    foreach (var item in kept)
+                    {
+                        _sendQueue.Enqueue(item);
+                    }
+                }
+            }
+
+            UnregisterOutboundFlows(flows);
+        }
+
+        private void RegisterOutboundFlowsLocked(UdpRelayKey key, IPEndPoint remoteEndPoint)
+        {
+            if (_outboundFlows.ContainsKey(key))
+            {
+                return;
+            }
+
+            if (_socket.LocalEndPoint is not IPEndPoint localEndPoint)
+            {
+                throw new InvalidOperationException("UDP relay socket has no local endpoint.");
+            }
+
+            var localAddress = NetworkAddress.Normalize(localEndPoint.Address);
+            var wildcardAddress = localAddress.AddressFamily == AddressFamily.InterNetwork
+                ? IPAddress.Any
+                : IPAddress.IPv6Any;
+            List<RelayOutboundFlow> flows =
+            [
+                new RelayOutboundFlow(
+                    key.AdapterHandle,
+                    PacketView.ProtocolUdp,
+                    localAddress,
+                    remoteEndPoint.Address,
+                    (ushort)localEndPoint.Port,
+                    (ushort)remoteEndPoint.Port,
+                    key.Dot1q,
+                    key.SubInterfaceIndex,
+                    key.CompartmentId,
+                    key.WireAddressFamily,
+                    processId: key.ProcessId,
+                    flowId: key.FlowId)
+            ];
+
+            if (!localAddress.Equals(wildcardAddress))
+            {
+                flows.Add(new RelayOutboundFlow(
+                    key.AdapterHandle,
+                    PacketView.ProtocolUdp,
+                    wildcardAddress,
+                    remoteEndPoint.Address,
+                    (ushort)localEndPoint.Port,
+                    (ushort)remoteEndPoint.Port,
+                    key.Dot1q,
+                    key.SubInterfaceIndex,
+                    key.CompartmentId,
+                    key.WireAddressFamily,
+                    processId: key.ProcessId,
+                    flowId: key.FlowId));
+            }
+
+            _outboundFlows[key] = flows.ToArray();
+            foreach (var flow in _outboundFlows[key])
+            {
+                _relayOutboundFlows[new UdpRelayKey(
+                    flow.AdapterHandle,
+                    flow.Dot1q,
+                    flow.LocalAddress,
+                    flow.LocalPort,
+                    flow.RemoteAddress,
+                    flow.RemotePort,
+                    flow.SubInterfaceIndex,
+                    flow.CompartmentId,
+                    flow.WireAddressFamily,
+                    flow.ProcessId)] = 0;
+                _outboundBypassRegister?.Invoke(flow);
+            }
+        }
+
+        private void UnregisterOutboundFlows(IReadOnlyList<RelayOutboundFlow> flows)
+        {
+            foreach (var flow in flows)
+            {
+                _relayOutboundFlows.TryRemove(
+                    new UdpRelayKey(
+                        flow.AdapterHandle,
+                        flow.Dot1q,
+                        flow.LocalAddress,
+                        flow.LocalPort,
+                        flow.RemoteAddress,
+                        flow.RemotePort,
+                        flow.SubInterfaceIndex,
+                        flow.CompartmentId,
+                        flow.WireAddressFamily,
+                        flow.ProcessId),
+                    out _);
+                try
+                {
+                    _outboundBypassUnregister?.Invoke(flow);
+                }
+                catch (Exception ex)
+                {
+                    _errorLog($"UDP relay outbound bypass cleanup failed flow={flow}: {ex.Message}");
+                }
+            }
+        }
+
+        private async Task SendLoopAsync(CancellationToken cancellationToken)
+        {
+            try
+            {
+                while (!cancellationToken.IsCancellationRequested)
+                {
+                    await _sendSignal.WaitAsync(cancellationToken).ConfigureAwait(false);
+                    UdpSendItem? item;
+                    lock (_sync)
+                    {
+                        if (Volatile.Read(ref _disposed) != 0)
+                        {
+                            return;
+                        }
+
+                        item = _sendQueue.Count > 0 ? _sendQueue.Dequeue() : null;
+                        if (item is not null)
+                        {
+                            _queuedBytes -= item.Payload.Length;
+                        }
+                    }
+
+                    if (item is null)
+                    {
+                        continue;
+                    }
+
+                    if (_getGeneration(item.Key) != item.Generation)
+                    {
+                        continue;
+                    }
+
+                    await SendItemAsync(item, cancellationToken).ConfigureAwait(false);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+        }
+
+        private async Task SendItemAsync(UdpSendItem item, CancellationToken cancellationToken)
+        {
+            try
+            {
+                SendItemCore(item, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
             }
             catch (SocketException ex)
             {
-                _errorInjector?.Invoke(_target, remoteEndPoint, _lastSentPayload, ex.SocketErrorCode);
-                throw;
+                _errorInjector?.Invoke(item.Target, item.RemoteEndPoint, item.Payload, ex.SocketErrorCode);
+                _errorLog(
+                    $"UDP relay send failed for {item.Key.ClientAddress}:{item.Key.ClientPort} -> {item.Key.RemoteAddress}:{item.Key.RemotePort}: {ex.Message}");
+                if (_getGeneration(item.Key) == item.Generation)
+                {
+                    _removeTarget(item.Key);
+                }
             }
-
-            if (sent != payload.Length)
+            catch (Exception ex)
             {
-                _errorInjector?.Invoke(_target, remoteEndPoint, _lastSentPayload, SocketError.MessageSize);
-                throw new IOException($"UDP relay sent {sent} of {payload.Length} bytes.");
+                _errorLog(
+                    $"UDP relay send failed for {item.Key.ClientAddress}:{item.Key.ClientPort} -> {item.Key.RemoteAddress}:{item.Key.RemotePort}: {ex.Message}");
+                if (_getGeneration(item.Key) == item.Generation)
+                {
+                    _removeTarget(item.Key);
+                }
             }
-
-            _upBytes += sent;
-            _trafficCounter.AddUdpUpload(sent);
-            _packetWakeSignal?.Pulse();
-            LogStats("SEND");
         }
 
-        private void ProbeClientSni(ReadOnlySpan<byte> payload)
+        private int SendItemCore(UdpSendItem item, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            ProbeClientSni(item.Target, item.Payload);
+            var sent = _socket.SendTo(
+                item.Payload,
+                SocketFlags.None,
+                item.RemoteEndPoint);
+            if (sent != item.Payload.Length)
+            {
+                throw new IOException($"UDP relay sent {sent} of {item.Payload.Length} bytes.");
+            }
+
+            try
+            {
+                Interlocked.Add(ref _upBytes, sent);
+                Interlocked.CompareExchange(ref _firstSendTimestamp, Stopwatch.GetTimestamp(), 0);
+                _trafficCounter.AddUdpUpload(sent);
+                _packetWakeSignal?.Pulse();
+                LogStats(
+                    "SEND",
+                    item.Target,
+                    Stopwatch.GetElapsedTime(item.EnqueuedTimestamp).TotalMilliseconds);
+            }
+            catch (Exception ex)
+            {
+                try
+                {
+                    _errorLog($"UDP relay post-send accounting failed: {ex.Message}");
+                }
+                catch
+                {
+                }
+            }
+
+            return sent;
+        }
+
+        private void ProbeClientSni(DirectRelayTarget target, ReadOnlySpan<byte> payload)
         {
             if (_sniProbeFinished || payload.IsEmpty)
             {
@@ -614,7 +1078,8 @@ internal sealed class UdpDirectRelay : IDisposable
             _sniProbeFinished = true;
             if (TlsSniParser.TryGetDtlsServerName(payload, out var serverName))
             {
-                _errorLog($"APP UDP SNI app={_target.AppLabel} appLocal={_target.ClientEndpoint} client={_key.ClientAddress}:{_key.ClientPort} target={_target.RemoteEndpoint} domain={serverName}");
+                _errorLog(
+                    $"APP UDP SNI app={target.AppLabel} appLocal={target.ClientEndpoint} client={_sessionKey.ClientAddress}:{_sessionKey.ClientPort} target={target.RemoteEndpoint} domain={serverName}");
             }
         }
 
@@ -622,7 +1087,7 @@ internal sealed class UdpDirectRelay : IDisposable
         {
             var buffer = new byte[65535];
             EndPoint sourceEndPoint = new IPEndPoint(
-                _remoteEndPoint.AddressFamily == AddressFamily.InterNetwork
+                _socket.AddressFamily == AddressFamily.InterNetwork
                     ? IPAddress.Any
                     : IPAddress.IPv6Any,
                 0);
@@ -653,9 +1118,9 @@ internal sealed class UdpDirectRelay : IDisposable
                         return;
                     }
 
-                    _errorInjector?.Invoke(_target, _remoteEndPoint, _lastSentPayload, ex.SocketErrorCode);
-                    _errorLog($"UDP relay remote receive failed for {_key.ClientAddress}:{_key.ClientPort} -> {_key.RemoteAddress}:{_key.RemotePort}: {ex.Message}");
-                    _remove(_key);
+                    _errorLog(
+                        $"UDP relay remote receive failed for {_sessionKey.ClientAddress}:{_sessionKey.ClientPort}: {ex.Message}");
+                    _removeSession(_sessionKey, this);
                     return;
                 }
                 catch (Exception ex)
@@ -665,77 +1130,157 @@ internal sealed class UdpDirectRelay : IDisposable
                         return;
                     }
 
-                    _errorLog($"UDP relay remote receive failed for {_key.ClientAddress}:{_key.ClientPort} -> {_key.RemoteAddress}:{_key.RemotePort}: {ex.Message}");
-                    _remove(_key);
+                    _errorLog(
+                        $"UDP relay remote receive failed for {_sessionKey.ClientAddress}:{_sessionKey.ClientPort}: {ex.Message}");
+                    _removeSession(_sessionKey, this);
                     return;
                 }
 
-                if (result.RemoteEndPoint is not IPEndPoint remoteEndPoint)
+                if (result.RemoteEndPoint is not IPEndPoint remoteEndPoint
+                    || remoteEndPoint.Port == 0
+                    || remoteEndPoint.AddressFamily != _socket.AddressFamily)
                 {
                     continue;
                 }
 
-                if (!IsAllowedResponseSource(remoteEndPoint))
+                var responseKey = new UdpRelayKey(
+                    _sessionKey.AdapterHandle,
+                    _sessionKey.Dot1q,
+                    _sessionKey.ClientAddress,
+                    _sessionKey.ClientPort,
+                    remoteEndPoint.Address,
+                    (ushort)remoteEndPoint.Port,
+                    _sessionKey.SubInterfaceIndex,
+                    _sessionKey.CompartmentId,
+                    _sessionKey.WireAddressFamily,
+                    _sessionKey.ProcessId);
+                var knownTarget = _getTarget(responseKey);
+                var responseTarget = knownTarget;
+                UdpRelayKey? alternateSourceKey = null;
+                var responseOwnerKey = responseKey;
+                var responseGeneration = knownTarget is null
+                    ? null
+                    : _getGeneration(responseKey);
+                if (knownTarget is null)
                 {
-                    _detailLog?.Invoke(
-                        $"DIRECT UDP ignored response from unexpected endpoint app={_target.AppLabel} expected={_remoteEndPoint} actual={remoteEndPoint}");
+                    var normalizedRemoteAddress = NetworkAddress.Normalize(remoteEndPoint.Address);
+                    lock (_sync)
+                    {
+                        foreach (var key in _outboundFlows.Keys)
+                        {
+                            if (!key.RemoteAddress.Equals(normalizedRemoteAddress))
+                            {
+                                continue;
+                            }
+
+                            var sameAddressTarget = _getTarget(key);
+                            if (sameAddressTarget is null)
+                            {
+                                continue;
+                            }
+
+                            responseTarget = sameAddressTarget with
+                            {
+                                RemoteAddress = normalizedRemoteAddress,
+                                RemotePort = (ushort)remoteEndPoint.Port,
+                                CreatedAt = _timeProvider.GetUtcNow()
+                            };
+                            alternateSourceKey = key;
+                            responseOwnerKey = key;
+                            responseGeneration = _getGeneration(key);
+                            break;
+                        }
+                    }
+                }
+
+                if (responseTarget is null)
+                {
+                    var now = _timeProvider.GetUtcNow();
+                    if (now - _lastUnregisteredResponseLog >= TimeSpan.FromSeconds(5))
+                    {
+                        _lastUnregisteredResponseLog = now;
+                        _errorLog(
+                            $"UDP relay dropped response from unregistered endpoint {remoteEndPoint} for {_sessionKey}.");
+                    }
                     continue;
                 }
 
-                _lastActivity = _timeProvider.GetUtcNow();
-                _refreshTarget();
-                _remoteEndPoint = remoteEndPoint;
-                _downBytes += result.ReceivedBytes;
+                if (responseGeneration is null
+                    || _getGeneration(responseOwnerKey) != responseGeneration)
+                {
+                    continue;
+                }
+
+                responseTarget = responseTarget with { CreatedAt = _timeProvider.GetUtcNow() };
+                if (knownTarget is not null)
+                {
+                    _refreshTarget(responseKey);
+                }
+                else if (alternateSourceKey is { } alternativeKey)
+                {
+                    _refreshTarget(alternativeKey);
+                }
+
+                Interlocked.Add(ref _downBytes, result.ReceivedBytes);
                 _trafficCounter.AddUdpDownload(result.ReceivedBytes);
 
                 if (_responseInjector is null)
                 {
-                    _errorLog($"UDP relay has no response injector for app={_target.AppLabel} appLocal={_target.ClientEndpoint} from={remoteEndPoint}.");
-                    _remove(_key);
+                    _errorLog(
+                        $"UDP relay has no response injector for app={responseTarget.AppLabel} appLocal={responseTarget.ClientEndpoint} from={remoteEndPoint}.");
+                    _removeSession(_sessionKey, this);
                     return;
                 }
 
                 try
                 {
-                    if (_responseValidator is not null && !_responseValidator(_target))
+                    if (_responseValidator is not null && !_responseValidator(responseTarget))
                     {
-                        _errorLog($"UDP relay response owner is no longer valid for app={_target.AppLabel} appLocal={_target.ClientEndpoint} from={remoteEndPoint}.");
-                        _remove(_key);
+                        _errorLog(
+                            $"UDP relay response owner is no longer valid for app={responseTarget.AppLabel} appLocal={responseTarget.ClientEndpoint} from={remoteEndPoint}.");
+                        _removeSession(_sessionKey, this);
                         return;
                     }
 
                     var payload = buffer.AsMemory(0, result.ReceivedBytes).ToArray();
-                    if (!_responseInjector(_target, remoteEndPoint, payload))
+                    if (!_responseInjector(responseTarget, remoteEndPoint, payload))
                     {
-                        _errorLog($"UDP relay response injection failed for app={_target.AppLabel} appLocal={_target.ClientEndpoint} from={remoteEndPoint}.");
-                        _remove(_key);
-                        return;
+                        _errorLog(
+                            $"UDP relay response injection failed for app={responseTarget.AppLabel} appLocal={responseTarget.ClientEndpoint} from={remoteEndPoint}.");
+                        if (knownTarget is not null
+                            && _getGeneration(responseKey) == responseGeneration)
+                        {
+                            _removeTarget(responseKey);
+                        }
+
+                        continue;
                     }
                 }
                 catch (Exception ex)
                 {
-                    _errorLog($"UDP relay response handling failed for app={_target.AppLabel} appLocal={_target.ClientEndpoint} from={remoteEndPoint}: {ex.Message}");
-                    _remove(_key);
-                    return;
+                    _errorLog(
+                        $"UDP relay response handling failed for app={responseTarget.AppLabel} appLocal={responseTarget.ClientEndpoint} from={remoteEndPoint}: {ex.Message}");
+                    if (knownTarget is not null
+                        && _getGeneration(responseKey) == responseGeneration)
+                    {
+                        _removeTarget(responseKey);
+                    }
+
+                    continue;
                 }
 
                 _packetWakeSignal?.Pulse();
-                LogStats("RECV");
+                var receivedAt = Stopwatch.GetTimestamp();
+                Interlocked.CompareExchange(ref _firstResponseTimestamp, receivedAt, 0);
+                var firstSendAt = Interlocked.Read(ref _firstSendTimestamp);
+                var responseLatencyMs = firstSendAt == 0
+                    ? 0
+                    : Stopwatch.GetElapsedTime(firstSendAt, receivedAt).TotalMilliseconds;
+                LogStats("RECV", responseTarget, responseLatencyMs);
             }
         }
 
-        private bool IsAllowedResponseSource(IPEndPoint remoteEndPoint)
-        {
-            if (remoteEndPoint.Equals(_remoteEndPoint))
-            {
-                return true;
-            }
-
-            return remoteEndPoint.Address.Equals(_remoteEndPoint.Address)
-                && remoteEndPoint.Port != 0;
-        }
-
-        private void LogStats(string direction)
+        private void LogStats(string direction, DirectRelayTarget target, double latencyMs)
         {
             var now = _timeProvider.GetUtcNow();
             if (_detailLog is null)
@@ -750,7 +1295,8 @@ internal sealed class UdpDirectRelay : IDisposable
             }
 
             lastStatsLog = now;
-            _detailLog($"DIRECT UDP {direction} app={_target.AppLabel} appLocal={_target.ClientEndpoint} client={_key.ClientAddress}:{_key.ClientPort} target={_target.RemoteEndpoint} relayProcess={Environment.ProcessId} up={_upBytes} down={_downBytes}");
+            _detailLog(
+                $"DIRECT UDP {direction} app={target.AppLabel} appLocal={target.ClientEndpoint} client={_sessionKey.ClientAddress}:{_sessionKey.ClientPort} target={target.RemoteEndpoint} relayProcess={Environment.ProcessId} latencyMs={latencyMs:F2} up={Interlocked.Read(ref _upBytes)} down={Interlocked.Read(ref _downBytes)}");
         }
 
         public void Dispose()
@@ -760,28 +1306,60 @@ internal sealed class UdpDirectRelay : IDisposable
                 return;
             }
 
+            RelayOutboundFlow[] flows;
+            lock (_sync)
+            {
+                _sendQueue.Clear();
+                _queuedBytes = 0;
+                flows = _outboundFlows.Values.SelectMany(static item => item).ToArray();
+                _outboundFlows.Clear();
+            }
+
+            var runCts = Interlocked.Exchange(ref _runCts, null);
+            runCts?.Cancel();
+            runCts?.Dispose();
+            _socket.Dispose();
+            Pulse(_sendSignal);
+            UnregisterOutboundFlows(flows);
+        }
+
+        private static void Pulse(SemaphoreSlim semaphore)
+        {
             try
             {
-                _socket.Dispose();
+                semaphore.Release();
             }
-            finally
+            catch (SemaphoreFullException)
             {
-                foreach (var flow in _outboundFlows)
-                {
-                    _relayOutboundFlows.TryRemove(
-                        new UdpRelayKey(
-                            flow.AdapterHandle,
-                            _target.Dot1q,
-                            flow.LocalAddress,
-                            flow.LocalPort,
-                            flow.RemoteAddress,
-                            flow.RemotePort),
-                        out _);
-                    _outboundBypassUnregister?.Invoke(flow);
-                }
+            }
+            catch (ObjectDisposedException)
+            {
             }
         }
+
+        private sealed record UdpSendItem(
+            UdpRelayKey Key,
+            DirectRelayTarget Target,
+            long Generation,
+            byte[] Payload,
+            IPEndPoint RemoteEndPoint,
+            long EnqueuedTimestamp);
+
     }
+
+    private sealed class UdpQueueFullException : InvalidOperationException
+    {
+        public UdpQueueFullException(string message)
+            : base(message)
+        {
+        }
+    }
+
+    [System.Runtime.InteropServices.DllImport("iphlpapi.dll")]
+    private static extern uint GetCurrentThreadCompartmentId();
+
+    [System.Runtime.InteropServices.DllImport("iphlpapi.dll")]
+    private static extern uint SetCurrentThreadCompartmentId(uint compartmentId);
 
     private static bool TargetMatches(DirectRelayTarget left, DirectRelayTarget right)
     {
@@ -793,7 +1371,9 @@ internal sealed class UdpDirectRelay : IDisposable
             && Equals(left.ClientAddress, right.ClientAddress)
             && left.ClientPort == right.ClientPort
             && Equals(left.RemoteAddress, right.RemoteAddress)
-            && left.RemotePort == right.RemotePort;
+            && left.RemotePort == right.RemotePort
+            && left.WireAddressFamily == right.WireAddressFamily
+            && left.ProcessStartTimeUtcTicks == right.ProcessStartTimeUtcTicks;
     }
 
     private static RelayOutboundFlow ToRelayFlow(UdpRelayKey key)
@@ -805,6 +1385,11 @@ internal sealed class UdpDirectRelay : IDisposable
             key.RemoteAddress,
             key.ClientPort,
             key.RemotePort,
-            key.Dot1q);
+            key.Dot1q,
+            key.SubInterfaceIndex,
+            key.CompartmentId,
+            key.WireAddressFamily,
+            key.ProcessId,
+            key.FlowId);
     }
 }

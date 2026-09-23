@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.Net;
 using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using ProxiFyre;
@@ -15,20 +16,21 @@ internal static class PacketSelfTest
         {
             TestUdpParsingAndDeclaredLength();
             TestMulticastDetection();
-            TestIpv4UdpFragmentPayloadCopy();
             TestVlanParsing();
             TestTcpOptionsAndUrgentPointer();
-            TestIpv4FragmentReassembly();
-            TestIpv6FragmentReassembly();
-            TestOutboundPassFlowRegistry();
+            TestWinDivertPacketBuilders();
+            TestWinDivertTcpPacketBuilder();
+            TestWinDivertUdpErrorBuilder();
+            TestWinDivertUdpFragmentation();
             TestTrafficCounterBreakdown();
-            TestWfpProtocolLayout();
+            TestWinDivertAddressLayout();
             TestUuPatchProfileCatalog();
             TestUuPatchPersistence();
             TestDisabledApplicationPersistence();
+            TestModuleMessageProtocol();
             TestNetworkInterfaceIndexResolution();
             TestRuntimeModuleCopy();
-            Console.WriteLine("PASS: packet parsing, multicast detection, VLAN, TCP fields, fragment reassembly, TCP/UDP traffic counters, UU patch profiles/config, interface indexes, and runtime module copies.");
+            Console.WriteLine("PASS: packet parsing, multicast detection, VLAN, TCP fields, WinDivert layouts/builders, TCP/UDP traffic counters, UU patch profiles/config, interface indexes, and runtime module copies.");
             return 0;
         }
         catch (Exception ex)
@@ -100,19 +102,6 @@ internal static class PacketSelfTest
         Assert(view.UdpPayload.SequenceEqual(payload), "VLAN UDP payload mismatch.");
     }
 
-    private static void TestIpv4UdpFragmentPayloadCopy()
-    {
-        var frame = new byte[PacketView.EthernetHeaderLength + 20 + 16];
-        var payload = "fragment-payload"u8;
-        PacketInjector.CopyIpv4UdpFragmentPayload(
-            frame,
-            PacketView.EthernetHeaderLength,
-            payload);
-        Assert(
-            frame.AsSpan(PacketView.EthernetHeaderLength + 20, payload.Length).SequenceEqual(payload),
-            "IPv4 UDP fragment payload was copied to the wrong offset.");
-    }
-
     private static void TestMulticastDetection()
     {
         var ipv4Packet = BuildIpv4Packet(
@@ -155,151 +144,121 @@ internal static class PacketSelfTest
         Assert((view.TcpFlags & PacketView.TcpFlagUrg) != 0, "TCP URG flag mismatch.");
     }
 
-    private static void TestIpv4FragmentReassembly()
+    private static void TestWinDivertPacketBuilders()
     {
-        var payload = Enumerable.Range(0, 4000).Select(value => (byte)value).ToArray();
-        var full = BuildIpv4Packet(
-            IPAddress.Parse("192.0.2.13"),
-            IPAddress.Parse("198.51.100.23"),
-            PacketView.ProtocolUdp,
-            4000,
-            5000,
+        var payload = "windivert-udp"u8.ToArray();
+        AssertWinDivertUdpPacket(
+            WinDivertPacketBuilder.BuildUdpResponse(
+                IPAddress.Parse("198.51.100.20"),
+                443,
+                IPAddress.Parse("192.0.2.10"),
+                50000,
+                payload),
             payload);
-        var reassembler = new IpFragmentReassembler();
-        ReassembledIpPacket? result = null;
-
-        foreach (var fragment in FragmentIpv4(full, 1400))
-        {
-            var status = reassembler.Add(
-                fragment,
-                fragment.Length,
-                IntPtr.Zero,
-                1,
-                0,
-                out var candidate,
-                out _);
-            if (status == FragmentAddStatus.Complete)
-            {
-                result = candidate;
-            }
-        }
-
-        Assert(result is not null, "IPv4 fragments were not reassembled.");
-        Assert(PacketView.TryParse(result!.Frame, result.Length, out var view), "Reassembled IPv4 packet did not parse.");
-        Assert(view.UdpPayload.SequenceEqual(payload), "Reassembled IPv4 UDP payload mismatch.");
-
-        var invalidFragment = BuildIpv4Packet(
-            IPAddress.Parse("192.0.2.14"),
-            IPAddress.Parse("198.51.100.24"),
-            PacketView.ProtocolUdp,
-            4100,
-            5100,
-            [0x01]);
-        BinaryPrimitives.WriteUInt16BigEndian(invalidFragment.AsSpan(20, 2), 0x2000);
-        var invalidStatus = reassembler.Add(
-            invalidFragment,
-            invalidFragment.Length,
-            IntPtr.Zero,
-            1,
-            0,
-            out _,
-            out var fragmentsToPass);
-        Assert(invalidStatus == FragmentAddStatus.Invalid, "Invalid IPv4 fragment was not rejected.");
-        Assert(
-            fragmentsToPass is { Count: 1 }
-                && fragmentsToPass[0].Frame.AsSpan(0, fragmentsToPass[0].Length).SequenceEqual(invalidFragment),
-            "Invalid IPv4 fragment was not returned for transparent replay.");
-    }
-
-    private static void TestIpv6FragmentReassembly()
-    {
-        var payload = Enumerable.Range(0, 3000).Select(value => (byte)(value + 17)).ToArray();
-        var full = BuildIpv6Packet(
-            IPAddress.Parse("2001:db8::13"),
-            IPAddress.Parse("2001:db8::23"),
-            PacketView.ProtocolUdp,
-            6000,
-            7000,
+        AssertWinDivertUdpPacket(
+            WinDivertPacketBuilder.BuildUdpResponse(
+                IPAddress.Parse("2001:db8::20"),
+                443,
+                IPAddress.Parse("2001:db8::10"),
+                50000,
+                payload),
             payload);
-        var reassembler = new IpFragmentReassembler();
-        ReassembledIpPacket? result = null;
-
-        foreach (var fragment in FragmentIpv6(full, 1200))
-        {
-            var status = reassembler.Add(
-                fragment,
-                fragment.Length,
-                IntPtr.Zero,
-                1,
-                0,
-                out var candidate,
-                out _);
-            if (status == FragmentAddStatus.Complete)
-            {
-                result = candidate;
-            }
-        }
-
-        Assert(result is not null, "IPv6 fragments were not reassembled.");
-        Assert(PacketView.TryParse(result!.Frame, result.Length, out var view), "Reassembled IPv6 packet did not parse.");
-        Assert(view.UdpPayload.SequenceEqual(payload), "Reassembled IPv6 UDP payload mismatch.");
+        AssertThrows<ArgumentOutOfRangeException>(
+            () => WinDivertPacketBuilder.BuildUdpResponse(
+                IPAddress.Parse("198.51.100.20"),
+                443,
+                IPAddress.Parse("192.0.2.10"),
+                50000,
+                new byte[65508]),
+            "Oversized IPv4 UDP payload was accepted.");
+        AssertThrows<ArgumentOutOfRangeException>(
+            () => WinDivertPacketBuilder.BuildUdpResponse(
+                IPAddress.Parse("2001:db8::20"),
+                443,
+                IPAddress.Parse("2001:db8::10"),
+                50000,
+                new byte[65528]),
+            "Oversized IPv6 UDP payload was accepted.");
     }
 
-    private static void TestOutboundPassFlowRegistry()
+    private static void AssertWinDivertUdpPacket(
+        byte[] ipPacket,
+        byte[] expectedPayload)
     {
-        var registry = new OutboundPassFlowRegistry(maxFlows: 2, ttl: TimeSpan.FromSeconds(10));
-        var first = new RelayOutboundFlow(
-            IntPtr.Zero,
-            PacketView.ProtocolUdp,
-            IPAddress.Loopback,
-            IPAddress.Parse("198.51.100.30"),
-            1000,
-            2000);
-        var second = new RelayOutboundFlow(
-            IntPtr.Zero,
-            PacketView.ProtocolUdp,
-            IPAddress.Loopback,
-            IPAddress.Parse("198.51.100.31"),
-            1001,
-            2001);
-        var third = new RelayOutboundFlow(
-            IntPtr.Zero,
-            PacketView.ProtocolTcp,
-            IPAddress.Loopback,
-            IPAddress.Parse("198.51.100.32"),
-            1002,
-            2002);
-
-        var now = DateTimeOffset.UnixEpoch;
-        registry.Register(first, now);
-        registry.Register(second, now.AddSeconds(1));
-        registry.Register(third, now.AddSeconds(2));
-        registry.Register(second, now.AddSeconds(6));
-        Assert(registry.Count == 2, "Outbound pass flow registry exceeded its capacity.");
-        Assert(
-            registry.Snapshot().All(flow => !flow.Equals(first)),
-            "Outbound pass flow registry did not evict the oldest flow.");
-        Assert(
-            registry.RemoveExpired(now.AddSeconds(13)),
-            "Outbound pass flow registry did not expire stale flows.");
-        Assert(registry.Count == 1, "Outbound pass flow registry removed a refreshed flow.");
-        Assert(
-            registry.Snapshot().Single().Equals(second),
-            "Outbound pass flow registry retained the wrong flow after expiry.");
-        Assert(
-            registry.RemoveExpired(now.AddSeconds(17)),
-            "Outbound pass flow registry did not expire the refreshed flow.");
-        Assert(registry.Count == 0, "Outbound pass flow registry retained expired flows.");
+        Assert(PacketView.TryParseIp(ipPacket, ipPacket.Length, out var view), "WinDivert UDP packet did not parse.");
+        Assert(view.SourcePort == 443 && view.DestinationPort == 50000, "WinDivert UDP packet ports mismatch.");
+        Assert(view.UdpPayload.SequenceEqual(expectedPayload), "WinDivert UDP packet payload mismatch.");
     }
 
-    private static void TestWfpProtocolLayout()
+    private static void TestWinDivertAddressLayout()
     {
+        Assert(Marshal.SizeOf<WinDivertAddress>() == 80, "WinDivert address layout must be 80 bytes.");
+        var address = WinDivertAddress.CreateInbound(
+            interfaceIndex: 17,
+            subInterfaceIndex: 3,
+            ipv6: true);
+        Assert(address.Layer == WinDivertLayer.Network, "WinDivert address layer mismatch.");
+        Assert(address.Event == WinDivertEvent.NetworkPacket, "WinDivert address event mismatch.");
+        Assert(!address.IsOutbound, "WinDivert inbound address was marked outbound.");
+        Assert(address.IsIpv6, "WinDivert IPv6 flag mismatch.");
+        Assert(address.NetworkInterfaceIndex == 17, "WinDivert interface index mismatch.");
+        Assert(address.NetworkSubInterfaceIndex == 3, "WinDivert sub-interface index mismatch.");
+    }
+
+    private static void TestWinDivertTcpPacketBuilder()
+    {
+        var sourceAddress = IPAddress.Parse("202.89.233.101");
+        var destinationAddress = IPAddress.Parse("192.168.31.43");
+        var segment = new TcpSegment(
+            SequenceNumber: 0x8A4B2C1D,
+            AcknowledgmentNumber: 0x27D5F3C8,
+            PacketView.TcpFlagSyn | PacketView.TcpFlagAck,
+            Window: 65535,
+            UrgentPointer: 0,
+            Payload: ReadOnlyMemory<byte>.Empty,
+            Options: new byte[] { 2, 4, 0x05, 0xB4 });
+
+        var packet = WinDivertPacketBuilder.BuildTcpSegment(
+            sourceAddress,
+            sourcePort: 443,
+            destinationAddress,
+            destinationPort: 55544,
+            segment);
+        Assert(PacketView.TryParseIp(packet, packet.Length, out var view), "WinDivert TCP packet did not parse.");
+        Assert(view.SourcePort == 443 && view.DestinationPort == 55544, "WinDivert TCP ports mismatch.");
+        Assert(view.TcpFlags == (PacketView.TcpFlagSyn | PacketView.TcpFlagAck), "WinDivert TCP flags mismatch.");
+        Assert(view.TcpSequenceNumber == segment.SequenceNumber, "WinDivert TCP sequence mismatch.");
+        Assert(view.TcpAcknowledgmentNumber == segment.AcknowledgmentNumber, "WinDivert TCP acknowledgement mismatch.");
+        Assert(ComputeChecksum(packet.AsSpan(0, 20)) == 0, "WinDivert IPv4 header checksum is invalid.");
         Assert(
-            Marshal.SizeOf<WfpFlowEvent>() == 72,
-            "WFP flow event layout does not match the native protocol.");
+            ComputeTransportChecksum(
+                sourceAddress,
+                destinationAddress,
+                PacketView.ProtocolTcp,
+                packet.AsSpan(20)) == 0,
+            "WinDivert TCP checksum is invalid.");
+
+        var sourceV6 = IPAddress.Parse("2001:db8::20");
+        var destinationV6 = IPAddress.Parse("2001:db8::10");
+        var packetV6 = WinDivertPacketBuilder.BuildTcpSegment(
+            sourceV6,
+            sourcePort: 443,
+            destinationV6,
+            destinationPort: 55544,
+            segment);
         Assert(
-            Marshal.SizeOf<WfpVerdict>() == 16,
-            "WFP verdict layout does not match the native protocol.");
+            PacketView.TryParseIp(packetV6, packetV6.Length, out var viewV6),
+            "WinDivert IPv6 TCP packet did not parse.");
+        Assert(
+            viewV6.TcpFlags == (PacketView.TcpFlagSyn | PacketView.TcpFlagAck),
+            "WinDivert IPv6 TCP flags mismatch.");
+        Assert(
+            ComputeTransportChecksum(
+                sourceV6,
+                destinationV6,
+                PacketView.ProtocolTcp,
+                packetV6.AsSpan(40)) == 0,
+            "WinDivert IPv6 TCP checksum is invalid.");
     }
 
     private static void TestUuPatchProfileCatalog()
@@ -342,6 +301,78 @@ internal static class PacketSelfTest
                 resolvedProfile?.Key == "uu-5247" && resolvedTargets.Count == current.Targets.Count,
                 "UU dynamic signature resolution selected the wrong profile or target count.");
         }
+    }
+
+    private static void TestWinDivertUdpErrorBuilder()
+    {
+        var payload = "udp-error"u8.ToArray();
+        var remoteV4 = IPAddress.Parse("198.51.100.20");
+        var clientV4 = IPAddress.Parse("192.0.2.10");
+        var packetV4 = WinDivertPacketBuilder.BuildUdpError(
+            remoteV4,
+            443,
+            clientV4,
+            50000,
+            payload,
+            SocketError.ConnectionRefused);
+        Assert(packetV4[9] == 1, "IPv4 UDP error packet is not ICMP.");
+        Assert(packetV4[20] == 3 && packetV4[21] == 3, "IPv4 UDP error type/code mismatch.");
+        Assert(ComputeChecksum(packetV4.AsSpan(0, 20)) == 0, "IPv4 UDP error header checksum is invalid.");
+        Assert(ComputeChecksum(packetV4.AsSpan(20)) == 0, "IPv4 UDP error ICMP checksum is invalid.");
+
+        var remoteV6 = IPAddress.Parse("2001:db8::20");
+        var clientV6 = IPAddress.Parse("2001:db8::10");
+        var packetV6 = WinDivertPacketBuilder.BuildUdpError(
+            remoteV6,
+            443,
+            clientV6,
+            50000,
+            payload,
+            SocketError.ConnectionRefused);
+        Assert(packetV6[6] == 58, "IPv6 UDP error packet is not ICMPv6.");
+        Assert(packetV6[40] == 1 && packetV6[41] == 4, "IPv6 UDP error type/code mismatch.");
+        Assert(
+            ComputeTransportChecksum(
+                remoteV6,
+                clientV6,
+                protocol: 58,
+                packetV6.AsSpan(40)) == 0,
+            "IPv6 UDP error ICMP checksum is invalid.");
+    }
+
+    private static void TestWinDivertUdpFragmentation()
+    {
+        var payload = new byte[4000];
+        Random.Shared.NextBytes(payload);
+        var fragmentsV4 = WinDivertPacketBuilder.BuildUdpFragments(
+            IPAddress.Parse("198.51.100.20"),
+            443,
+            IPAddress.Parse("192.0.2.10"),
+            50000,
+            payload,
+            mtu: 1500);
+        Assert(fragmentsV4.Count > 1, "IPv4 UDP response was not fragmented.");
+        Assert(fragmentsV4.All(packet => packet.Length <= 1500), "IPv4 UDP fragment exceeds MTU.");
+        Assert(
+            (BinaryPrimitives.ReadUInt16BigEndian(fragmentsV4[0].AsSpan(6, 2)) & 0x2000) != 0,
+            "IPv4 first UDP fragment does not set MF.");
+        Assert(
+            (BinaryPrimitives.ReadUInt16BigEndian(fragmentsV4[^1].AsSpan(6, 2)) & 0x2000) == 0,
+            "IPv4 last UDP fragment unexpectedly sets MF.");
+
+        var fragmentsV6 = WinDivertPacketBuilder.BuildUdpFragments(
+            IPAddress.Parse("2001:db8::20"),
+            443,
+            IPAddress.Parse("2001:db8::10"),
+            50000,
+            payload,
+            mtu: 1500);
+        Assert(fragmentsV6.Count > 1, "IPv6 UDP response was not fragmented.");
+        Assert(fragmentsV6.All(packet => packet.Length <= 1500), "IPv6 UDP fragment exceeds MTU.");
+        Assert(fragmentsV6.All(packet => packet[6] == 44), "IPv6 UDP fragment header is missing.");
+        Assert(
+            (BinaryPrimitives.ReadUInt16BigEndian(fragmentsV6[^1].AsSpan(42, 2)) & 1) == 0,
+            "IPv6 last UDP fragment unexpectedly sets more-fragments.");
     }
 
     private static void TestUuPatchPersistence()
@@ -401,6 +432,29 @@ internal static class PacketSelfTest
         }
     }
 
+    private static void TestModuleMessageProtocol()
+    {
+        var payload = ModuleMessageProtocol.BuildCommand(
+            "RUN",
+            configPath: @"C:\config.json",
+            logPath: @"C:\core.log",
+            replyHwnd: 123,
+            detailed: true,
+            telemetryPipeName: "telemetry",
+            nativeDirectory: @"C:\native",
+            networkHandle: 456,
+            flowHandle: 789,
+            sessionToken: "A1B2C3");
+        Assert(
+            ModuleMessageProtocol.TryParse(payload, out var values),
+            "Module command payload did not parse.");
+        Assert(values["command"] == "RUN", "Module command name mismatch.");
+        Assert(values["sessionToken"] == "A1B2C3", "Module session token mismatch.");
+        Assert(ModuleMessageProtocol.GetHandle(values, "networkHandle") == new nint(456), "Module network handle mismatch.");
+        Assert(ModuleMessageProtocol.GetHandle(values, "flowHandle") == new nint(789), "Module flow handle mismatch.");
+        Assert(values["nativeDirectory"] == @"C:\native", "Module native directory mismatch.");
+    }
+
     private static void TestNetworkInterfaceIndexResolution()
     {
         var resolved = 0;
@@ -415,8 +469,23 @@ internal static class PacketSelfTest
             Assert(index > 0, $"Network interface '{networkInterface.Name}' returned an invalid index.");
             resolved++;
 
-            var winpkFilterName = $@"\DEVICE\{networkInterface.Id}";
-            var resolvedIndex = NetworkInterfaceIndexResolver.FindAdapterIndex(winpkFilterName, Array.Empty<byte>());
+            foreach (var unicast in networkInterface.GetIPProperties().UnicastAddresses)
+            {
+                if (unicast.Address.Equals(IPAddress.Any)
+                    || unicast.Address.Equals(IPAddress.IPv6Any)
+                    || unicast.Address.IsIPv6LinkLocal
+                    || IsAutomaticPrivateAddress(unicast.Address))
+                {
+                    continue;
+                }
+
+                Assert(
+                    NetworkInterfaceIndexResolver.FindInterfaceIndexForLocalAddress(unicast.Address) == index,
+                    $"Local address '{unicast.Address}' for '{networkInterface.Name}' resolved to the wrong interface.");
+            }
+
+            var adapterDeviceName = $@"\DEVICE\{networkInterface.Id}";
+            var resolvedIndex = NetworkInterfaceIndexResolver.FindAdapterIndex(adapterDeviceName, Array.Empty<byte>());
             if (resolvedIndex <= 0)
             {
                 continue;
@@ -424,12 +493,12 @@ internal static class PacketSelfTest
 
             Assert(
                 resolvedIndex == index,
-                $"WinpkFilter device ID for '{networkInterface.Name}' resolved to the wrong interface index.");
+                $"Network adapter device ID for '{networkInterface.Name}' resolved to the wrong interface index.");
             resolvedByDeviceId++;
         }
 
         Assert(resolved > 0, "No Windows network interface index could be resolved.");
-        Assert(resolvedByDeviceId > 0, "No WinpkFilter device ID could be resolved through NetworkInterface.Id.");
+        Assert(resolvedByDeviceId > 0, "No network adapter device ID could be resolved through NetworkInterface.Id.");
     }
 
     private static void TestRuntimeModuleCopy()
@@ -567,63 +636,6 @@ internal static class PacketSelfTest
         return packet;
     }
 
-    private static IEnumerable<byte[]> FragmentIpv4(byte[] packet, int maxPayload)
-    {
-        const int ipOffset = 14;
-        const int ipHeaderLength = 20;
-        var ipPayload = packet.AsSpan(ipOffset + ipHeaderLength).ToArray();
-        var identification = BinaryPrimitives.ReadUInt16BigEndian(packet.AsSpan(ipOffset + 4, 2));
-        for (var offset = 0; offset < ipPayload.Length; offset += maxPayload)
-        {
-            var length = Math.Min(maxPayload, ipPayload.Length - offset);
-            var more = offset + length < ipPayload.Length;
-            var fragment = new byte[ipOffset + ipHeaderLength + length];
-            packet.AsSpan(0, ipOffset).CopyTo(fragment);
-            var ip = fragment.AsSpan(ipOffset, ipHeaderLength);
-            ip[0] = 0x45;
-            BinaryPrimitives.WriteUInt16BigEndian(ip.Slice(2, 2), (ushort)(ipHeaderLength + length));
-            BinaryPrimitives.WriteUInt16BigEndian(ip.Slice(4, 2), identification);
-            BinaryPrimitives.WriteUInt16BigEndian(
-                ip.Slice(6, 2),
-                (ushort)((offset / 8) | (more ? 0x2000 : 0)));
-            ip[8] = 64;
-            ip[9] = packet[ipOffset + 9];
-            packet.AsSpan(ipOffset + 12, 8).CopyTo(ip.Slice(12, 8));
-            BinaryPrimitives.WriteUInt16BigEndian(ip.Slice(10, 2), ComputeChecksum(ip));
-            ipPayload.AsSpan(offset, length).CopyTo(fragment.AsSpan(ipOffset + ipHeaderLength));
-            yield return fragment;
-        }
-    }
-
-    private static IEnumerable<byte[]> FragmentIpv6(byte[] packet, int maxPayload)
-    {
-        const int ipOffset = 14;
-        const int ipHeaderLength = 40;
-        var ipPayload = packet.AsSpan(ipOffset + ipHeaderLength).ToArray();
-        var identification = 0x11223344u;
-        for (var offset = 0; offset < ipPayload.Length; offset += maxPayload)
-        {
-            var length = Math.Min(maxPayload, ipPayload.Length - offset);
-            var more = offset + length < ipPayload.Length;
-            var fragment = new byte[ipOffset + ipHeaderLength + 8 + length];
-            packet.AsSpan(0, ipOffset).CopyTo(fragment);
-            var ip = fragment.AsSpan(ipOffset, ipHeaderLength);
-            ip[0] = 0x60;
-            BinaryPrimitives.WriteUInt16BigEndian(ip.Slice(4, 2), (ushort)(8 + length));
-            ip[6] = 44;
-            ip[7] = 64;
-            packet.AsSpan(ipOffset + 8, 32).CopyTo(ip.Slice(8, 32));
-            var fragmentHeader = fragment.AsSpan(ipOffset + 40, 8);
-            fragmentHeader[0] = packet[ipOffset + 6];
-            BinaryPrimitives.WriteUInt16BigEndian(
-                fragmentHeader.Slice(2, 2),
-                (ushort)(((offset / 8) << 3) | (more ? 1 : 0)));
-            BinaryPrimitives.WriteUInt32BigEndian(fragmentHeader.Slice(4, 4), identification);
-            ipPayload.AsSpan(offset, length).CopyTo(fragment.AsSpan(ipOffset + 48));
-            yield return fragment;
-        }
-    }
-
     private static ushort ComputeChecksum(ReadOnlySpan<byte> data)
     {
         uint sum = 0;
@@ -645,11 +657,61 @@ internal static class PacketSelfTest
         return (ushort)~sum;
     }
 
+    private static ushort ComputeTransportChecksum(
+        IPAddress sourceAddress,
+        IPAddress destinationAddress,
+        byte protocol,
+        ReadOnlySpan<byte> transport)
+    {
+        var pseudoHeader = new byte[
+            sourceAddress.GetAddressBytes().Length
+            + destinationAddress.GetAddressBytes().Length
+            + 4
+            + transport.Length];
+        var offset = 0;
+        sourceAddress.GetAddressBytes().CopyTo(pseudoHeader, offset);
+        offset += sourceAddress.GetAddressBytes().Length;
+        destinationAddress.GetAddressBytes().CopyTo(pseudoHeader, offset);
+        offset += destinationAddress.GetAddressBytes().Length;
+        pseudoHeader[offset + 1] = protocol;
+        BinaryPrimitives.WriteUInt16BigEndian(
+            pseudoHeader.AsSpan(offset + 2, 2),
+            (ushort)transport.Length);
+        transport.CopyTo(pseudoHeader.AsSpan(offset + 4));
+        return ComputeChecksum(pseudoHeader);
+    }
+
     private static void Assert(bool condition, string message)
     {
         if (!condition)
         {
             throw new InvalidOperationException(message);
         }
+    }
+
+    private static bool IsAutomaticPrivateAddress(IPAddress address)
+    {
+        if (address.AddressFamily != AddressFamily.InterNetwork)
+        {
+            return false;
+        }
+
+        var bytes = address.GetAddressBytes();
+        return bytes[0] == 169 && bytes[1] == 254;
+    }
+
+    private static void AssertThrows<TException>(Action action, string message)
+        where TException : Exception
+    {
+        try
+        {
+            action();
+        }
+        catch (TException)
+        {
+            return;
+        }
+
+        throw new InvalidOperationException(message);
     }
 }

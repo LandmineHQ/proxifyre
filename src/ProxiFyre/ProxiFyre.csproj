@@ -15,10 +15,11 @@
     <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <ApplicationIcon>Assets\AppIcon.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
     <AssemblyName>ProxiFyre</AssemblyName>
     <RootNamespace>ProxiFyre</RootNamespace>
     <AssemblyTitle>ProxiFyre</AssemblyTitle>
-    <Description>Pure C# direct traffic relay for selected Windows applications.</Description>
+    <Description>WinDivert TCP and UDP relay for selected Windows applications.</Description>
     <Company>NT KERNEL</Company>
     <Product>ProxiFyre</Product>
     <Version>3.0.3</Version>
@@ -33,20 +34,21 @@
     <Compile Include="..\Shared\TrafficTelemetry.cs" Link="Shared\TrafficTelemetry.cs" />
     <Content Include="..\..\manifest.json" Link="manifest.json" CopyToOutputDirectory="PreserveNewest" />
     <Content Include="..\Shared\UuPatchProfiles.json" Link="UuPatchProfiles.json" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\LICENSE" Link="LICENSE" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\licenses\WinDivert-LICENSE.txt" Link="WinDivert-LICENSE.txt" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\THIRD_PARTY_NOTICES.md" Link="THIRD_PARTY_NOTICES.md" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Native.WinDivert" Version="2.2.2" GeneratePathProperty="true" />
   </ItemGroup>
   <Target Name="CopyNativeAotModule" AfterTargets="Build">
     <PropertyGroup>
       <NativeAotModulePath>$(ArtifactsPath)\native\$(Configuration)\ProxiFyre.Module.dll</NativeAotModulePath>
-      <NativeAotProbePath>$(ArtifactsPath)\native\$(Configuration)\ProxiFyre.Probe.dll</NativeAotProbePath>
     </PropertyGroup>
     <Copy SourceFiles="$(NativeAotModulePath)"
           DestinationFolder="$(OutDir)"
           SkipUnchangedFiles="true"
           Condition="Exists('$(NativeAotModulePath)')" />
-    <Copy SourceFiles="$(NativeAotProbePath)"
-          DestinationFolder="$(OutDir)"
-          SkipUnchangedFiles="true"
-          Condition="Exists('$(NativeAotProbePath)')" />
   </Target>
 </Project>
 

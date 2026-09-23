@@ -12,7 +12,8 @@ internal sealed record TestOptions(
     AddressFamily StunAddressFamily,
     int StunTimeoutMilliseconds,
     string? CurlUrl = null,
-    string[]? CurlOptions = null)
+    string[]? CurlOptions = null,
+    int StunIterations = 1)
 {
     public static TestOptions Parse(string[] args)
     {
@@ -100,6 +101,7 @@ internal sealed record TestOptions(
         var stunHost = "stun.l.google.com";
         var stunPort = 19302;
         var timeoutMilliseconds = 1500;
+        var iterations = 1;
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -139,6 +141,12 @@ internal sealed record TestOptions(
                 continue;
             }
 
+            if (CliOptions.TryReadValue(args, ref i, "--iterations", out var iterationsValue))
+            {
+                iterations = CliOptions.ParsePositiveInt("--iterations", iterationsValue);
+                continue;
+            }
+
             throw new ArgumentException($"Unknown udp test option '{args[i]}'.");
         }
 
@@ -150,7 +158,8 @@ internal sealed record TestOptions(
             stunHost,
             stunPort,
             addressFamily,
-            timeoutMilliseconds);
+            timeoutMilliseconds,
+            StunIterations: iterations);
     }
 
     private static bool IsDetailed(string value)

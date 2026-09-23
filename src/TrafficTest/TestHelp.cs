@@ -42,17 +42,12 @@ internal static class TestHelp
             case "packet-selftest":
                 Console.WriteLine("Packet self-test:");
                 Console.WriteLine("  proxifyre.ps1 test packet-selftest");
-                Console.WriteLine("  Verifies packet parsing, VLAN, TCP options/URG, and IPv4/IPv6 fragment reassembly.");
-                break;
-            case "tcp-selftest":
-                Console.WriteLine("TCP relay self-test:");
-                Console.WriteLine("  proxifyre.ps1 test tcp-selftest");
-                Console.WriteLine("  Verifies TCP relay handshake, bidirectional data, ACK, and FIN state transitions on loopback.");
+                Console.WriteLine("  Verifies packet parsing, VLAN, TCP options/URG, WinDivert layout, and packet builders.");
                 break;
             case "udp-selftest":
                 Console.WriteLine("UDP relay self-test:");
                 Console.WriteLine("  proxifyre.ps1 test udp-selftest");
-                Console.WriteLine("  Verifies UDP flow forwarding and alternate response endpoint handling on loopback.");
+                Console.WriteLine("  Verifies UDP flow forwarding, same-address alternate ports, and source rejection on loopback.");
                 break;
             case "leigod-redirect":
                 Console.WriteLine("Leigod redirect demo help.");
@@ -72,18 +67,22 @@ internal static class TestHelp
     private static void PrintOverview()
     {
         Console.WriteLine("TrafficTest usage:");
-        Console.WriteLine("  proxifyre.ps1 test <tcp|udp|uu|steam|leigod-redirect|traffic-telemetry|packet-selftest|tcp-selftest|udp-selftest> [-Detailed] [-- <test args>]");
+        Console.WriteLine("  proxifyre.ps1 test <tcp|udp|uu|steam|leigod-redirect|traffic-telemetry|packet-selftest|udp-selftest> [-Detailed] [-- <test args>]");
         Console.WriteLine();
         Console.WriteLine("Modes:");
         Console.WriteLine("  tcp              HTTPS curl relay diagnostic");
         Console.WriteLine("  udp              UDP STUN relay diagnostic");
         Console.WriteLine("  uu               UU process ports and connections");
         Console.WriteLine("  steam            Steam WebHelper process ports and connections");
-        Console.WriteLine("  leigod-redirect  Leigod WFP redirect test and demo");
+        Console.WriteLine("  leigod-redirect  Leigod WinDivert redirect test and demo");
         Console.WriteLine("  traffic-telemetry  Verify the telemetry named-pipe channel (no driver required)");
-        Console.WriteLine("  packet-selftest  Verify packet parsing and fragment reassembly (no driver required)");
-        Console.WriteLine("  tcp-selftest     Verify TCP relay state transitions on loopback (no driver required)");
-        Console.WriteLine("  udp-selftest     Verify UDP forwarding and alternate response endpoints on loopback (no driver required)");
+        Console.WriteLine("  packet-selftest  Verify packet parsing, WinDivert layout, and packet builders (no driver required)");
+        Console.WriteLine("  tcp-selftest  Verify TCP relay handshake, payload, ACK, retransmission, and close state (no driver required)");
+        Console.WriteLine("  windivert-probe  Open the signed WinDivert network/flow handles (Administrator required)");
+        Console.WriteLine("  windivert-tcp-probe  Verify synthetic TCP SYN-ACK injection with a real socket (Administrator required)");
+        Console.WriteLine("  windivert-tcp-probe-cross  Verify synthetic SYN-ACK injection into a separate client process (Administrator required)");
+        Console.WriteLine("  windivert-bypass-probe  Verify non-target HTTP/UDP pass-through while WinDivert is active (Administrator required)");
+        Console.WriteLine("  udp-selftest     Verify UDP forwarding, same-address alternate ports, and source rejection (no driver required)");
         Console.WriteLine();
         Console.WriteLine("More help:");
         Console.WriteLine("  proxifyre.ps1 test help tcp");
@@ -108,13 +107,14 @@ internal static class TestHelp
     private static void PrintUdp()
     {
         Console.WriteLine("UDP test:");
-        Console.WriteLine("  proxifyre.ps1 test udp [-Detailed] [-- --stun-host <host> --stun-port <port> --ipv4|--ipv6]");
+        Console.WriteLine("  proxifyre.ps1 test udp [-Detailed] [-- --stun-host <host> --stun-port <port> --iterations <n> --ipv4|--ipv6]");
         Console.WriteLine("  Starts a WPF test host renamed to steamwebhelper.exe and injects the AOT module into that PID.");
         Console.WriteLine();
         Console.WriteLine("Args:");
         Console.WriteLine("  --stun-host <host>   STUN host. Defaults to stun.l.google.com.");
         Console.WriteLine("  --stun-port <port>   STUN port. Defaults to 19302.");
         Console.WriteLine("  --timeout-ms <ms>    STUN response timeout. Defaults to 1500.");
+        Console.WriteLine("  --iterations <n>     Number of separate UDP flows to measure. Defaults to 1.");
         Console.WriteLine("  --ipv4               Force IPv4. Default.");
         Console.WriteLine("  --ipv6               Force IPv6.");
     }

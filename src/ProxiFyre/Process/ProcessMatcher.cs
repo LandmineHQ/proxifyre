@@ -121,4 +121,8 @@ internal static class ProcessMatcher
     }
 }
 
-internal sealed record ProcessInfo(int ProcessId, string Name, string Path);
+internal sealed record ProcessInfo(
+    int ProcessId,
+    string Name,
+    string Path,
+    long StartTimeUtcTicks = 0);

@@ -91,12 +91,6 @@ public static unsafe class ModuleExports
     [DllImport("user32.dll", ExactSpelling = true)]
     private static extern nint DefWindowProcW(nint hWnd, uint msg, nint wParam, nint lParam);
 
-    [DllImport("user32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool ChangeWindowMessageFilter(uint message, uint dwFlag);
-
-    private const uint MsgfltAdd = 1;
-
     [DllImport("user32.dll", ExactSpelling = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool DestroyWindow(nint hWnd);
@@ -145,12 +139,15 @@ public static unsafe class ModuleExports
     private static class ModuleRuntime
     {
         private static readonly object Sync = new();
+        private static readonly SemaphoreSlim RelayLifecycleGate = new(1, 1);
         private static readonly WndProcDelegate WndProc = WindowProc;
+        private static volatile bool RelayStopInProgress;
         private static nint _windowHandle;
         private static uint _windowThreadId;
         private static RelayService? _relayService;
         private static CoreLogger? _logger;
         private static nint _replyHwnd;
+        private static string? _sessionToken;
         private static string? _configPath;
         private static Timer? _heartbeatTimer;
         private static long _lastUiHeartbeatMs;
@@ -250,8 +247,6 @@ public static unsafe class ModuleExports
                     throw new InvalidOperationException($"Failed to create module message window. Win32={Marshal.GetLastWin32Error()}");
                 }
 
-                _ = ChangeWindowMessageFilter(ModuleMessageProtocol.WmCopyData, MsgfltAdd);
-
                 return handle;
             }
         }
@@ -313,6 +308,11 @@ public static unsafe class ModuleExports
                 return false;
             }
 
+            if (!IsCommandAuthorized(command, values))
+            {
+                return false;
+            }
+
             MarkUiHeartbeat();
 
             switch (command.ToUpperInvariant())
@@ -337,47 +337,107 @@ public static unsafe class ModuleExports
             }
         }
 
+        private static bool IsCommandAuthorized(
+            string command,
+            Dictionary<string, string> values)
+        {
+            var normalized = command.ToUpperInvariant();
+            if (normalized is "HEARTBEAT" or "PING")
+            {
+                return true;
+            }
+
+            if (!values.TryGetValue("sessionToken", out var token)
+                || string.IsNullOrWhiteSpace(token))
+            {
+                return false;
+            }
+
+            if (string.IsNullOrEmpty(_sessionToken))
+            {
+                if (normalized != "RUN")
+                {
+                    return false;
+                }
+
+                _sessionToken = token;
+                return true;
+            }
+
+            if (token.Equals(_sessionToken, StringComparison.Ordinal))
+            {
+                return true;
+            }
+
+            if (normalized == "RUN" && !IsRelayRunning())
+            {
+                _sessionToken = token;
+                return true;
+            }
+
+            return false;
+        }
+
         private static void RunRelay(Dictionary<string, string> values)
         {
             var configPath = RequireValue(values, "configPath");
             _configPath = configPath;
             _detailedLogging = ModuleMessageProtocol.GetBool(values, "detailed");
             values.TryGetValue("telemetryPipeName", out var telemetryPipeName);
+            values.TryGetValue("nativeDirectory", out var nativeDirectory);
+            var networkHandle = ModuleMessageProtocol.GetHandle(values, "networkHandle");
+            var flowHandle = ModuleMessageProtocol.GetHandle(values, "flowHandle");
 
             if (values.TryGetValue("logPath", out var logPath) && !string.IsNullOrWhiteSpace(logPath))
             {
                 Environment.SetEnvironmentVariable("PROXIFYRE_MODULE_LOG", logPath);
             }
 
-            lock (Sync)
+            RelayLifecycleGate.Wait();
+            try
             {
-                EnsureLogger(logPath);
-
-                var configuration = NormalizeForCurrentProcess(AppConfiguration.Load(configPath));
-                if (_relayService is { IsRunning: true } relay)
+                if (RelayStopInProgress)
                 {
-                    relay.Reload(configuration);
-                    SendEvent("running", "Relay was already running; configuration reloaded.", running: true);
+                    SendEvent("error", "Relay is still stopping; retry RUN.", running: false);
                     return;
                 }
 
-                var previousRelay = _relayService;
-                _relayService = null;
-                if (previousRelay is not null)
+                lock (Sync)
                 {
-                    QueueRelayStop(previousRelay, "Replacing stale relay before RUN.", sendStoppedEvent: false);
-                }
+                    EnsureLogger(logPath);
 
-                StopTelemetry();
-                if (!string.IsNullOrWhiteSpace(telemetryPipeName))
-                {
-                    _telemetryClient = new TrafficTelemetryClient(telemetryPipeName, LogLocal);
-                    _telemetryClient.Start();
-                }
+                    var configuration = NormalizeForCurrentProcess(AppConfiguration.Load(configPath));
+                    if (_relayService is { IsRunning: true } relay)
+                    {
+                        relay.Reload(configuration);
+                        SendEvent("running", "Relay was already running; configuration reloaded.", running: true);
+                        return;
+                    }
 
-                Action<TrafficSnapshot>? trafficSink = _telemetryClient is null ? null : _telemetryClient.TryPublish;
-                _relayService = new RelayService(LogRelay, _detailedLogging, trafficSink);
-                _relayService.Start(configuration, configPath);
+                    var previousRelay = _relayService;
+                    _relayService = null;
+                    previousRelay?.Dispose();
+
+                    StopTelemetry();
+                    if (!string.IsNullOrWhiteSpace(telemetryPipeName))
+                    {
+                        _telemetryClient = new TrafficTelemetryClient(telemetryPipeName, LogLocal);
+                        _telemetryClient.Start();
+                    }
+
+                    Action<TrafficSnapshot>? trafficSink = _telemetryClient is null ? null : _telemetryClient.TryPublish;
+                    _relayService = new RelayService(LogRelay, _detailedLogging, trafficSink);
+                    _relayService.Start(
+                        configuration,
+                        configPath,
+                        nativeDirectory: nativeDirectory,
+                        networkHandle: networkHandle,
+                        flowHandle: flowHandle);
+                }
+            }
+            finally
+            {
+                RelayLifecycleGate.Release();
             }
 
             SendEvent("running", $"Relay running in target process pid={Environment.ProcessId}.", running: true, pid: Environment.ProcessId);
@@ -395,16 +455,30 @@ public static unsafe class ModuleExports
                 return;
             }
 
-            var configuration = NormalizeForCurrentProcess(AppConfiguration.Load(configPath));
-            lock (Sync)
+            RelayLifecycleGate.Wait();
+            try
             {
-                if (_relayService is not { IsRunning: true } relay)
+                if (RelayStopInProgress)
                 {
-                    SendEvent("stopped", "Configuration loaded, but relay is not running.", running: false);
+                    SendEvent("error", "Relay is still stopping; retry RELOAD.", running: false);
                     return;
                 }
 
-                relay.Reload(configuration);
+                var configuration = NormalizeForCurrentProcess(AppConfiguration.Load(configPath));
+                lock (Sync)
+                {
+                    if (_relayService is not { IsRunning: true } relay)
+                    {
+                        SendEvent("stopped", "Configuration loaded, but relay is not running.", running: false);
+                        return;
+                    }
+
+                    relay.Reload(configuration);
+                }
+            }
+            finally
+            {
+                RelayLifecycleGate.Release();
             }
 
             SendEvent("reloaded", $"Configuration reloaded from {configPath}.", running: true);
@@ -412,6 +486,7 @@ public static unsafe class ModuleExports
 
         private static void StopRelay(string reason, bool sendStoppedEvent = true)
         {
+            RelayLifecycleGate.Wait();
             RelayService? relay;
             lock (Sync)
             {
@@ -419,6 +494,7 @@ public static unsafe class ModuleExports
                 _relayService = null;
             }
 
+            RelayStopInProgress = relay is not null || RelayStopInProgress;
             StopTelemetry();
 
             if (relay is null)
@@ -428,6 +504,7 @@ public static unsafe class ModuleExports
                     SendEvent("stopped", "Relay is already stopped. AOT module remains loaded.", running: false);
                 }
 
+                RelayLifecycleGate.Release();
                 return;
             }
 
@@ -452,6 +529,11 @@ public static unsafe class ModuleExports
                 {
                     LogLocal($"Stop failed: {ex}");
                     SendEvent("error", $"Stop failed: {ex.Message}", running: false);
+                }
+                finally
+                {
+                    RelayStopInProgress = false;
+                    RelayLifecycleGate.Release();
                 }
             });
         }
@@ -596,7 +678,12 @@ public static unsafe class ModuleExports
                 return;
             }
 
-            var payload = ModuleMessageProtocol.BuildEvent(eventName, text, running, pid);
+            var payload = ModuleMessageProtocol.BuildEvent(
+                eventName,
+                text,
+                running,
+                pid,
+                _sessionToken);
             SendCopyData(target, ModuleMessageProtocol.EventDataId, payload);
         }
 

@@ -47,68 +47,17 @@ jobs:
         shell: pwsh
         run: .\scripts\proxifyre.ps1 test packet-selftest -Configuration Release
 
-      - name: Stage release files
+      - name: Run protocol self-tests
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
+          .\scripts\proxifyre.ps1 test tcp-selftest -Configuration Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\scripts\proxifyre.ps1 test udp-selftest -Configuration Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          $source = "artifacts/bin/ProxiFyre/release_win-x64"
-          $native = "artifacts/native/Release"
-          $stage = "release/ProxiFyre"
-
-          Remove-Item -LiteralPath "release" -Recurse -Force -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Path $stage -Force | Out-Null
-          Copy-Item -Path "$source/*" -Destination $stage -Recurse -Force
-
-          Remove-Item -LiteralPath `
-            "$stage/app-config.json", `
-            "$stage/traffic-test-config.json", `
-            "$stage/proxifyre-core.log", `
-            "$stage/proxifyre-ui.log" `
-            -Force -ErrorAction SilentlyContinue
-          Get-ChildItem -LiteralPath $stage -Filter "*.pdb" -File | Remove-Item -Force
-
-          Copy-Item -LiteralPath `
-            "$native/ProxiFyre.Module.dll", `
-            "$native/ProxiFyre.Probe.dll" `
-            -Destination $stage -Force
-
-          if (Test-Path -LiteralPath "$native/ProxiFyre.Wfp.sys") {
-            Copy-Item -LiteralPath "$native/ProxiFyre.Wfp.sys" -Destination $stage -Force
-          }
-          if (Test-Path -LiteralPath "$native/ProxiFyre.Wfp.inf") {
-            Copy-Item -LiteralPath "$native/ProxiFyre.Wfp.inf" -Destination $stage -Force
-          }
-
-          $required = @(
-            "ProxiFyre.exe",
-            "ProxiFyre.dll",
-            "ProxiFyre.deps.json",
-            "ProxiFyre.runtimeconfig.json",
-            "ProxiFyre.Module.dll",
-            "ProxiFyre.Probe.dll",
-            "manifest.json",
-            "UuPatchProfiles.json"
-          )
-          $missing = @($required | Where-Object {
-            -not (Test-Path -LiteralPath (Join-Path $stage $_))
-          })
-          if ($missing.Count -gt 0) {
-            throw "Release staging is missing: $($missing -join ', ')"
-          }
-
-          $forbidden = @(
-            "README.md",
-            "UU_ACCELERATOR.md"
-          )
-          $unexpected = @($forbidden | Where-Object {
-            Test-Path -LiteralPath (Join-Path $stage $_)
-          })
-          if ($unexpected.Count -gt 0) {
-            throw "Release staging contains excluded files: $($unexpected -join ', ')"
-          }
-
-          Compress-Archive -Path "$stage/*" -DestinationPath "release/proxifyre-win-x64.zip" -Force
+      - name: Package Windows release
+        shell: pwsh
+        run: .\scripts\proxifyre.ps1 package -Configuration Release
 
       - name: Upload Windows release
         uses: actions/upload-artifact@v7

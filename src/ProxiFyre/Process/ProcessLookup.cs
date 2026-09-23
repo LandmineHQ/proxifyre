@@ -16,12 +16,16 @@ internal sealed class ProcessLookup
     private const int ErrorInsufficientBuffer = 122;
     private const int NoError = 0;
     private const uint ProcessQueryLimitedInformation = 0x1000;
+    private static readonly TimeSpan ForcedRefreshInterval = TimeSpan.FromMilliseconds(100);
 
     private readonly TimeSpan _refreshInterval = TimeSpan.FromMilliseconds(250);
     private readonly TimeSpan _processCacheTtl = TimeSpan.FromSeconds(1);
+    private readonly TimeSpan _processIdentityCacheTtl = TimeSpan.FromMilliseconds(250);
     private readonly ConcurrentDictionary<int, CachedProcessInfo> _processCache = new();
+    private readonly ConcurrentDictionary<int, ProcessIdentityCheck> _processIdentityChecks = new();
     private readonly Action<string> _log;
     private readonly TimeProvider _timeProvider;
+    private readonly bool _logRefreshes;
     private readonly object _sync = new();
     private Dictionary<TcpSessionKey, int> _tcpOwners = new();
     private Dictionary<UdpEndpointKey, int> _tcpLocalOwners = new();
@@ -30,14 +34,30 @@ internal sealed class ProcessLookup
     private Dictionary<UdpEndpointKey, int> _udpOwners = new();
     private DateTimeOffset _lastTcpRefresh = DateTimeOffset.MinValue;
     private DateTimeOffset _lastUdpRefresh = DateTimeOffset.MinValue;
+    private DateTimeOffset _nextTcpForcedRefresh = DateTimeOffset.MinValue;
+    private DateTimeOffset _nextUdpForcedRefresh = DateTimeOffset.MinValue;
 
-    public ProcessLookup(Action<string>? log = null, TimeProvider? timeProvider = null)
+    public ProcessLookup(
+        Action<string>? log = null,
+        TimeProvider? timeProvider = null,
+        bool logRefreshes = false)
     {
         _log = log ?? (_ => { });
         _timeProvider = timeProvider ?? TimeProvider.System;
+        _logRefreshes = logRefreshes;
     }
 
     public ProcessInfo? LookupTcpOwner(TcpSessionKey session, bool forceRefresh = false)
+    {
+        return TryGetTcpOwnerPid(session, forceRefresh, out var pid)
+            ? GetProcessInfo(pid)
+            : null;
+    }
+
+    public bool TryGetTcpOwnerPid(
+        TcpSessionKey session,
+        bool forceRefresh,
+        out int pid)
     {
         if (forceRefresh)
         {
@@ -48,29 +68,39 @@ internal sealed class ProcessLookup
             EnsureTcpFresh();
         }
 
-        if (_tcpOwners.TryGetValue(session, out var pid))
+        if (_tcpOwners.TryGetValue(session, out var ownerPid) && ownerPid > 0)
         {
-            return GetProcessInfo(pid);
+            pid = ownerPid;
+            return true;
         }
 
         if (TryLookupTcpLocalPid(session.LocalAddress, session.LocalPort, out pid))
         {
-            return GetProcessInfo(pid);
+            return true;
         }
 
         RefreshTcp(force: true);
 
-        if (_tcpOwners.TryGetValue(session, out pid))
+        if (_tcpOwners.TryGetValue(session, out ownerPid) && ownerPid > 0)
         {
-            return GetProcessInfo(pid);
+            pid = ownerPid;
+            return true;
         }
 
-        return TryLookupTcpLocalPid(session.LocalAddress, session.LocalPort, out pid)
+        return TryLookupTcpLocalPid(session.LocalAddress, session.LocalPort, out pid);
+    }
+
+    public ProcessInfo? LookupUdpOwner(UdpEndpointKey endpoint, bool forceRefresh = false)
+    {
+        return TryGetUdpOwnerPid(endpoint, forceRefresh, out var pid)
             ? GetProcessInfo(pid)
             : null;
     }
 
-    public ProcessInfo? LookupUdpOwner(UdpEndpointKey endpoint, bool forceRefresh = false)
+    public bool TryGetUdpOwnerPid(
+        UdpEndpointKey endpoint,
+        bool forceRefresh,
+        out int pid)
     {
         if (forceRefresh)
         {
@@ -81,30 +111,35 @@ internal sealed class ProcessLookup
             EnsureUdpFresh();
         }
 
-        if (TryLookupUdpPid(endpoint, out var pid))
+        if (TryLookupUdpPid(endpoint, out var ownerPid) && ownerPid > 0)
         {
-            return GetProcessInfo(pid);
+            pid = ownerPid;
+            return true;
         }
 
         RefreshUdp(force: true);
 
-        return TryLookupUdpPid(endpoint, out pid)
-            ? GetProcessInfo(pid)
-            : null;
+        return TryLookupUdpPid(endpoint, out pid);
     }
 
     private bool TryLookupUdpPid(UdpEndpointKey endpoint, out int pid)
     {
         if (_udpOwners.TryGetValue(endpoint, out pid))
         {
-            return true;
+            return pid > 0;
         }
 
         var wildcard = endpoint.LocalAddress.AddressFamily == AddressFamily.InterNetwork
             ? IPAddress.Any
             : IPAddress.IPv6Any;
 
-        return _udpOwners.TryGetValue(new UdpEndpointKey(wildcard, endpoint.LocalPort), out pid);
+        if (_udpOwners.TryGetValue(new UdpEndpointKey(wildcard, endpoint.LocalPort), out pid))
+        {
+            return pid > 0;
+        }
+
+        pid = 0;
+        return false;
     }
 
     private bool TryLookupTcpLocalPid(IPAddress localAddress, ushort localPort, out int pid)
@@ -112,12 +147,12 @@ internal sealed class ProcessLookup
         var endpoint = new UdpEndpointKey(localAddress, localPort);
         if (_tcpLocalOwners.TryGetValue(endpoint, out pid))
         {
-            return true;
+            return pid > 0;
         }
 
         if (_tcpListeners.TryGetValue(endpoint, out pid))
         {
-            return true;
+            return pid > 0;
         }
 
         var wildcard = localAddress.AddressFamily == AddressFamily.InterNetwork
@@ -126,17 +161,17 @@ internal sealed class ProcessLookup
 
         if (_tcpLocalOwners.TryGetValue(new UdpEndpointKey(wildcard, localPort), out pid))
         {
-            return true;
+            return pid > 0;
         }
 
         if (_tcpListeners.TryGetValue(new UdpEndpointKey(wildcard, localPort), out pid))
         {
-            return true;
+            return pid > 0;
         }
 
-        if (_tcpPortOwners.TryGetValue(localPort, out pid) && pid > 0)
+        if (_tcpPortOwners.TryGetValue(localPort, out pid))
         {
-            return true;
+            return pid > 0;
         }
 
         pid = 0;
@@ -164,9 +199,19 @@ internal sealed class ProcessLookup
         lock (_sync)
         {
             var now = _timeProvider.GetUtcNow();
+            if (force && now < _nextTcpForcedRefresh)
+            {
+                return;
+            }
+
             if (!force && now - _lastTcpRefresh <= _refreshInterval)
             {
                 return;
+            }
+
+            if (force)
+            {
+                _nextTcpForcedRefresh = now + ForcedRefreshInterval;
             }
 
             var owners = new Dictionary<TcpSessionKey, int>();
@@ -180,7 +225,10 @@ internal sealed class ProcessLookup
             _tcpPortOwners = portOwners;
             _tcpListeners = listeners;
             _lastTcpRefresh = now;
-            _log($"Process lookup TCP table refreshed: sessions={owners.Count}, listeners={listeners.Count}");
+            if (_logRefreshes)
+            {
+                _log($"Process lookup TCP table refreshed: sessions={owners.Count}, listeners={listeners.Count}");
+            }
         }
     }
 
@@ -189,9 +237,19 @@ internal sealed class ProcessLookup
         lock (_sync)
         {
             var now = _timeProvider.GetUtcNow();
+            if (force && now < _nextUdpForcedRefresh)
+            {
+                return;
+            }
+
             if (!force && now - _lastUdpRefresh <= _refreshInterval)
             {
                 return;
+            }
+
+            if (force)
+            {
+                _nextUdpForcedRefresh = now + ForcedRefreshInterval;
             }
 
             var owners = new Dictionary<UdpEndpointKey, int>();
@@ -199,7 +257,10 @@ internal sealed class ProcessLookup
             AddUdp6(owners);
             _udpOwners = owners;
             _lastUdpRefresh = now;
-            _log($"Process lookup UDP table refreshed: endpoints={owners.Count}");
+            if (_logRefreshes)
+            {
+                _log($"Process lookup UDP table refreshed: endpoints={owners.Count}");
+            }
         }
     }
 
@@ -233,7 +294,10 @@ internal sealed class ProcessLookup
                     AddTcpLocalOwner(localOwners, portOwners, localAddress, localPort, row.OwningPid);
                     if (remotePort == 0)
                     {
-                        listeners[new UdpEndpointKey(localAddress, localPort)] = row.OwningPid;
+                        AddOwner(
+                            listeners,
+                            new UdpEndpointKey(localAddress, localPort),
+                            row.OwningPid);
                         continue;
                     }
 
@@ -272,7 +336,10 @@ internal sealed class ProcessLookup
                     AddTcpLocalOwner(localOwners, portOwners, localAddress, localPort, row.OwningPid);
                     if (remotePort == 0)
                     {
-                        listeners[new UdpEndpointKey(localAddress, localPort)] = row.OwningPid;
+                        AddOwner(
+                            listeners,
+                            new UdpEndpointKey(localAddress, localPort),
+                            row.OwningPid);
                         continue;
                     }
 
@@ -288,7 +355,10 @@ internal sealed class ProcessLookup
         ushort localPort,
         int pid)
     {
-        localOwners[new UdpEndpointKey(localAddress, localPort)] = pid;
+        AddOwner(
+            localOwners,
+            new UdpEndpointKey(localAddress, localPort),
+            pid);
 
         if (portOwners.TryGetValue(localPort, out var existingPid))
         {
@@ -301,6 +371,20 @@ internal sealed class ProcessLookup
         }
 
         portOwners[localPort] = pid;
+    }
+
+    private static void AddOwner(
+        Dictionary<UdpEndpointKey, int> owners,
+        UdpEndpointKey key,
+        int pid)
+    {
+        if (owners.TryGetValue(key, out var existingPid) && existingPid != pid)
+        {
+            owners[key] = -1;
+            return;
+        }
+
+        owners[key] = pid;
     }
 
     private static void AddUdp4(Dictionary<UdpEndpointKey, int> owners)
@@ -324,7 +408,10 @@ internal sealed class ProcessLookup
                         continue;
                     }
 
-                    owners[new UdpEndpointKey(FromIpv4RowAddress(row.LocalAddr), localPort)] = row.OwningPid;
+                    AddOwner(
+                        owners,
+                        new UdpEndpointKey(FromIpv4RowAddress(row.LocalAddr), localPort),
+                        row.OwningPid);
                 }
             });
     }
@@ -350,7 +437,10 @@ internal sealed class ProcessLookup
                         continue;
                     }
 
-                    owners[new UdpEndpointKey(new IPAddress(row.LocalAddr, row.LocalScopeId), localPort)] = row.OwningPid;
+                    AddOwner(
+                        owners,
+                        new UdpEndpointKey(new IPAddress(row.LocalAddr, row.LocalScopeId), localPort),
+                        row.OwningPid);
                 }
             });
     }
@@ -379,11 +469,16 @@ internal sealed class ProcessLookup
         }
     }
 
-    public ProcessInfo? GetProcessInfo(int pid)
+    public ProcessInfo? GetProcessInfo(int pid, bool forceRefresh = false)
     {
         if (pid == Environment.ProcessId || pid is 0 or 4)
         {
             return null;
+        }
+
+        if (forceRefresh)
+        {
+            _processCache.TryRemove(pid, out _);
         }
 
         var now = _timeProvider.GetUtcNow();
@@ -407,14 +502,57 @@ internal sealed class ProcessLookup
             var path = TryGetProcessImagePath(pid)
                 ?? TryGetMainModulePath(process)
                 ?? name;
+            long startTimeUtcTicks = 0;
+            try
+            {
+                startTimeUtcTicks = process.StartTime.ToUniversalTime().Ticks;
+            }
+            catch
+            {
+            }
 
-            var processInfo = new ProcessInfo(pid, name, path);
+            var processInfo = new ProcessInfo(pid, name, path, startTimeUtcTicks);
             _processCache[pid] = new CachedProcessInfo(processInfo, now + _processCacheTtl);
             return processInfo;
         }
         catch
         {
             return null;
+        }
+    }
+
+    public bool ValidateProcessIdentity(int pid, long expectedStartTimeUtcTicks)
+    {
+        if (expectedStartTimeUtcTicks == 0)
+        {
+            return GetProcessInfo(pid) is not null;
+        }
+
+        if (pid == Environment.ProcessId || pid is 0 or 4)
+        {
+            return false;
+        }
+
+        var now = _timeProvider.GetUtcNow();
+        if (_processIdentityChecks.TryGetValue(pid, out var cached)
+            && now <= cached.ExpiresAt)
+        {
+            return cached.StartTimeUtcTicks == expectedStartTimeUtcTicks;
+        }
+
+        try
+        {
+            using var process = Process.GetProcessById(pid);
+            var startTimeUtcTicks = process.StartTime.ToUniversalTime().Ticks;
+            _processIdentityChecks[pid] = new ProcessIdentityCheck(
+                startTimeUtcTicks,
+                now + _processIdentityCacheTtl);
+            return startTimeUtcTicks == expectedStartTimeUtcTicks;
+        }
+        catch
+        {
+            _processIdentityChecks.TryRemove(pid, out _);
+            return false;
         }
     }
 
@@ -550,4 +688,8 @@ internal sealed class ProcessLookup
     }
 
     private sealed record CachedProcessInfo(ProcessInfo Process, DateTimeOffset ExpiresAt);
+
+    private sealed record ProcessIdentityCheck(
+        long StartTimeUtcTicks,
+        DateTimeOffset ExpiresAt);
 }
