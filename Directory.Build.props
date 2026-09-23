@@ -2,6 +2,6 @@
   <PropertyGroup>
     <UseArtifactsOutput>true</UseArtifactsOutput>
     <ArtifactsPath>$(MSBuildThisFileDirectory)artifacts</ArtifactsPath>
-    <Version>3.0.3</Version>
+    <Version>4.0.0-beta</Version>
   </PropertyGroup>
 </Project>

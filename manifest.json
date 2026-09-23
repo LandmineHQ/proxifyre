@@ -1,5 +1,5 @@
 {
-  "version": "3.0.3",
+  "version": "4.0.0-beta",
   "sourceUrl": "https://github.com/LandmineHQ/proxifyre",
-  "announcement": "3.0.3全新方法，模组加载器上线！😊"
+  "announcement": "4.0.0-beta：WinDivert 数据平面稳定性升级，优化 UDP 转发、详细日志与注册流程。"
 }
