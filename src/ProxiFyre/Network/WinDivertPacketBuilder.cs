@@ -414,12 +414,14 @@ internal static class WinDivertPacketBuilder
         SocketError socketError)
     {
         var quoteLength = Math.Min(8, originalPayload.Length);
+        var originalUdpLength = 8 + originalPayload.Length;
+        var originalIpLength = 20 + originalUdpLength;
         var original = new byte[20 + 8 + quoteLength];
         var originalIp = original.AsSpan(0, 20);
         originalIp[0] = 0x45;
         BinaryPrimitives.WriteUInt16BigEndian(
             originalIp.Slice(2, 2),
-            (ushort)original.Length);
+            checked((ushort)originalIpLength));
         originalIp[8] = 64;
         originalIp[9] = PacketView.ProtocolUdp;
         clientAddress.GetAddressBytes().CopyTo(originalIp.Slice(12, 4));
@@ -432,7 +434,7 @@ internal static class WinDivertPacketBuilder
         BinaryPrimitives.WriteUInt16BigEndian(originalUdp.Slice(2, 2), remotePort);
         BinaryPrimitives.WriteUInt16BigEndian(
             originalUdp.Slice(4, 2),
-            (ushort)originalUdp.Length);
+            checked((ushort)originalUdpLength));
         originalPayload[..quoteLength].CopyTo(originalUdp[8..]);
 
         var (icmpType, icmpCode) = MapIpv4Icmp(socketError);
@@ -468,12 +470,13 @@ internal static class WinDivertPacketBuilder
         SocketError socketError)
     {
         var quoteLength = Math.Min(8, originalPayload.Length);
+        var originalUdpLength = 8 + originalPayload.Length;
         var original = new byte[40 + 8 + quoteLength];
         var originalIp = original.AsSpan(0, 40);
         originalIp[0] = 0x60;
         BinaryPrimitives.WriteUInt16BigEndian(
             originalIp.Slice(4, 2),
-            (ushort)(8 + quoteLength));
+            checked((ushort)originalUdpLength));
         originalIp[6] = PacketView.ProtocolUdp;
         originalIp[7] = 64;
         clientAddress.GetAddressBytes().CopyTo(originalIp.Slice(8, 16));
@@ -483,7 +486,7 @@ internal static class WinDivertPacketBuilder
         BinaryPrimitives.WriteUInt16BigEndian(originalUdp.Slice(2, 2), remotePort);
         BinaryPrimitives.WriteUInt16BigEndian(
             originalUdp.Slice(4, 2),
-            (ushort)originalUdp.Length);
+            checked((ushort)originalUdpLength));
         originalPayload[..quoteLength].CopyTo(originalUdp[8..]);
 
         var (icmpType, icmpCode) = MapIpv6Icmp(socketError);

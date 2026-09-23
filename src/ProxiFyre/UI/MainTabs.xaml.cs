@@ -13,6 +13,7 @@ public partial class MainTabs : UserControl
         ApplicationRulesTab.RemoveAppRequested += (_, e) => RemoveAppRequested?.Invoke(this, e);
         RuntimeInfoTab.ReloadRequested += (_, _) => ReloadRequested?.Invoke(this, EventArgs.Empty);
         SettingsTab.UuPatchToggleRequested += (_, e) => UuPatchToggleRequested?.Invoke(this, e);
+        SettingsTab.DetailedLoggingToggleRequested += (_, e) => DetailedLoggingToggleRequested?.Invoke(this, e);
     }
 
     public event EventHandler? SearchChanged;
@@ -26,6 +27,8 @@ public partial class MainTabs : UserControl
     public event EventHandler? ReloadRequested;
 
     public event EventHandler<UuPatchToggleRequestedEventArgs>? UuPatchToggleRequested;
+
+    public event EventHandler<DetailedLoggingToggleRequestedEventArgs>? DetailedLoggingToggleRequested;
 
     public ListBox Apps => ApplicationRulesTab.Apps;
 

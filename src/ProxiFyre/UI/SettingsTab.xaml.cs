@@ -12,6 +12,8 @@ public partial class SettingsTab : UserControl
 
     public event EventHandler<UuPatchToggleRequestedEventArgs>? UuPatchToggleRequested;
 
+    public event EventHandler<DetailedLoggingToggleRequestedEventArgs>? DetailedLoggingToggleRequested;
+
     private void UuPatchToggleButton_Click(object sender, RoutedEventArgs e)
     {
         if (sender is not ToggleButton toggle)
@@ -22,4 +24,21 @@ public partial class SettingsTab : UserControl
         var enabled = toggle.IsChecked == true;
         UuPatchToggleRequested?.Invoke(this, new UuPatchToggleRequestedEventArgs(enabled));
     }
+
+    private void DetailedLoggingToggleButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not ToggleButton toggle)
+        {
+            return;
+        }
+
+        DetailedLoggingToggleRequested?.Invoke(
+            this,
+            new DetailedLoggingToggleRequestedEventArgs(toggle.IsChecked == true));
+    }
+}
+
+public sealed class DetailedLoggingToggleRequestedEventArgs(bool enabled) : EventArgs
+{
+    public bool Enabled { get; } = enabled;
 }

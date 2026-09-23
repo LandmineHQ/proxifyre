@@ -5,8 +5,9 @@ namespace ProxiFyre;
 internal sealed class RelayService : IDisposable, IAsyncDisposable
 {
     private readonly Action<string> _log;
+    private readonly Action<string> _warningLog;
     private readonly Action<TrafficSnapshot>? _trafficSink;
-    private readonly bool _detailedLogging;
+    private readonly DetailedLoggingState _detailedLogging;
     private readonly TimeProvider _timeProvider;
     private readonly ProcessLookup _processLookup;
     private readonly TrafficCounter _trafficCounter = new();
@@ -23,13 +24,15 @@ internal sealed class RelayService : IDisposable, IAsyncDisposable
         Action<string> log,
         bool detailedLogging = false,
         Action<TrafficSnapshot>? trafficSink = null,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        Action<string>? warningLog = null)
     {
         _log = log;
+        _warningLog = warningLog ?? log;
         _trafficSink = trafficSink;
-        _detailedLogging = detailedLogging;
+        _detailedLogging = new DetailedLoggingState(detailedLogging);
         _timeProvider = timeProvider ?? TimeProvider.System;
-        _processLookup = new ProcessLookup(log, _timeProvider);
+        _processLookup = new ProcessLookup(log, _timeProvider, warningLog: _warningLog);
     }
 
     public bool IsRunning => _routerTask is { IsCompleted: false };
@@ -43,10 +46,11 @@ internal sealed class RelayService : IDisposable, IAsyncDisposable
             return false;
         }
 
+        _detailedLogging.Update(configuration.Detailed);
         _configuration.Update(configuration);
         _router?.ApplyConfiguration();
         _log(
-            $"Configuration reloaded: coreProcessName={configuration.CoreProcessName}, apps={configuration.Apps.Count}");
+            $"Configuration reloaded: coreProcessName={configuration.CoreProcessName}, apps={configuration.Apps.Count}, detailed={configuration.Detailed}");
         return true;
     }
 
@@ -96,18 +100,20 @@ internal sealed class RelayService : IDisposable, IAsyncDisposable
         _log($"Configured core process name: {configuration.CoreProcessName}");
         _log($"Configured apps: {string.Join(", ", configuration.Apps)}");
         _log($"WinDivert relay process: {Environment.ProcessPath} pid={Environment.ProcessId}");
-        _log($"Detailed packet logging: {(_detailedLogging ? "enabled" : "disabled")}");
+        _log($"Detailed packet logging: {(_detailedLogging.Enabled ? "enabled" : "disabled")}");
 
         _cts = CancellationTokenSource.CreateLinkedTokenSource(externalCancellationToken);
         _configuration = new DynamicAppConfiguration(configuration);
         _router = new WinDivertPacketRouter(
-            _configuration,
-            _processLookup,
-            _log,
-            _trafficCounter,
-            _packetWakeSignal,
-            _timeProvider,
-            _detailedLogging);
+            configuration: _configuration,
+            processLookup: _processLookup,
+            log: _log,
+            trafficCounter: _trafficCounter,
+            packetWakeSignal: _packetWakeSignal,
+            timeProvider: _timeProvider,
+            detailedLogging: _detailedLogging.Enabled,
+            detailedLoggingState: _detailedLogging,
+            warningLog: _warningLog);
         _router.Start(
             nativeDirectory,
             _cts.Token,
@@ -158,7 +164,8 @@ internal sealed class RelayService : IDisposable, IAsyncDisposable
                 }
                 catch (Exception ex)
                 {
-                    _log($"WinDivert relay cleanup after data-plane failure failed: {ex.Message}");
+                    _warningLog(
+                        $"WinDivert relay cleanup after data-plane failure failed: {ex.Message}");
                 }
             }
         }
@@ -194,7 +201,8 @@ internal sealed class RelayService : IDisposable, IAsyncDisposable
             }
             catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
             {
-                _log($"Configuration hot reload failed: {ex.Message}");
+                _warningLog(
+                    $"Configuration hot reload failed; keeping the active configuration: {ex.Message}");
             }
         }
     }
@@ -215,7 +223,9 @@ internal sealed class RelayService : IDisposable, IAsyncDisposable
 
         return AppConfiguration.NormalizeCoreProcessName(configuration.CoreProcessName)
             + "\n"
-            + string.Join("\n", configuration.Apps.Order(StringComparer.OrdinalIgnoreCase));
+            + string.Join("\n", configuration.Apps.Order(StringComparer.OrdinalIgnoreCase))
+            + "\n--detailed--\n"
+            + configuration.Detailed;
     }
 
     private async Task ReportTrafficStatsAsync(CancellationToken cancellationToken)
@@ -294,7 +304,7 @@ internal sealed class RelayService : IDisposable, IAsyncDisposable
         }
         catch (TimeoutException)
         {
-            _log($"WinDivert relay shutdown timed out waiting for the {name}.");
+            _warningLog($"WinDivert relay shutdown timed out waiting for the {name}.");
             return false;
         }
         catch

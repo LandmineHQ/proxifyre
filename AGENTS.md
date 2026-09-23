@@ -30,6 +30,9 @@
 - Module `RUN`/`RELOAD`/`STOP` commands and module events must carry the
   per-session token. Do not re-enable lower-integrity `WM_COPYDATA` on the
   module control window.
+- Treat command delivery and command acceptance as separate states. A timeout
+  must never close brokered WinDivert handles that the target may already have
+  consumed. `ATTACH` is the authenticated reconnection path after a UI restart.
 - TCP relay intentionally terminates the client-side TCP connection in
   user-space and forwards it through a real remote socket. UDP relay must not
   open a local listener. Preserve relay-process/tuple exclusion so relay-owned
@@ -37,8 +40,14 @@
 - Keep UDP relay sockets pinned to the captured adapter interface index. A UDP
   flow must not rely on the OS default route when multiple physical, tunnel, or
   virtual adapters are present.
+- Keep UDP remote-response endpoint policy fully open. Do not reintroduce
+  remote IP or port allowlists; retain client endpoint, process identity,
+  adapter/interface, and generation validation.
 - Keep `WinDivertPacketRouter` as the userspace capture/inject boundary and
   preserve bounded flow, connection, and packet-builder limits.
+- Keep WinDivert receive and packet processing decoupled through the bounded
+  processing queue. Do not move process-table queries, socket I/O, or packet
+  injection back onto the receive thread.
 - Preserve target-generation checks in UDP send queues. A relay shutdown or
   target reload must not accept packets or sends from an older ownership
   generation.
@@ -51,6 +60,10 @@
   behavior belongs in the shared relay core and `src/ProxiFyre.Module`.
 - Keep telemetry optional and non-blocking. Relay behavior must remain correct
   when the named pipe is unavailable.
+- Persist detailed logging as `detailed` in `app-config.json`, default it to
+  disabled, and apply runtime changes without restarting the relay.
+- Log every exception-driven fallback as `WARN`; do not demote fallback paths
+  to informational logs.
 - Keep WinDivert response packet construction checksum-correct for IPv4 and
   IPv6, and preserve bounded limits for proxy connections, UDP flows, and
   packet queues.

@@ -12,7 +12,8 @@ internal sealed class WinDivertUdpRelay : IDisposable
     private readonly UdpDirectRelay _relay;
     private readonly WinDivertPacketInjector _injector;
     private readonly Action<string> _log;
-    private readonly bool _detailedLogging;
+    private readonly Action<string> _warningLog;
+    private readonly DetailedLoggingState _detailedLogging;
     private readonly TimeProvider _timeProvider;
     private readonly ConcurrentDictionary<UdpRelayKey, byte> _activeFlows = new();
     private readonly ConcurrentDictionary<string, long> _throttledLogTimes = new();
@@ -26,15 +27,25 @@ internal sealed class WinDivertUdpRelay : IDisposable
         TrafficCounter trafficCounter,
         PacketWakeSignal packetWakeSignal,
         TimeProvider timeProvider,
-        bool detailedLogging)
+        bool detailedLogging,
+        DetailedLoggingState? detailedLoggingState = null,
+        Action<string>? warningLog = null)
     {
         _configuration = configuration;
         _processLookup = processLookup;
         _injector = injector;
         _log = log;
-        _detailedLogging = detailedLogging;
+        _warningLog = warningLog ?? log;
+        _detailedLogging = detailedLoggingState ?? new DetailedLoggingState(detailedLogging);
         _timeProvider = timeProvider;
-        _relay = new UdpDirectRelay(log, detailedLogging, trafficCounter, packetWakeSignal, timeProvider);
+        _relay = new UdpDirectRelay(
+            log,
+            detailedLogging,
+            trafficCounter,
+            packetWakeSignal,
+            timeProvider,
+            _detailedLogging,
+            _warningLog);
         _relay.SetResponseInjector(InjectResponse);
         _relay.SetErrorInjector(InjectError);
         _relay.SetResponseValidator(IsTargetCurrent);
@@ -112,7 +123,7 @@ internal sealed class WinDivertUdpRelay : IDisposable
             return false;
         }
 
-        if (createdFlow && _detailedLogging)
+        if (createdFlow && _detailedLogging.Enabled)
         {
             var submittedTimestamp = Stopwatch.GetTimestamp();
             _log(
@@ -191,12 +202,17 @@ internal sealed class WinDivertUdpRelay : IDisposable
         ProcessInfo process,
         string? matchedPattern)
     {
-        var mtu = NetworkInterfaceIndexResolver.TryGetMtu(
+        var hasResolvedMtu = NetworkInterfaceIndexResolver.TryGetMtu(
             (int)interfaceIndex,
             packet.AddressFamily,
-            out var resolvedMtu)
-            ? resolvedMtu
-            : 1500;
+            out var resolvedMtu);
+        if (!hasResolvedMtu)
+        {
+            _warningLog(
+                $"WinDivert UDP relay MTU lookup failed for interfaceIndex={interfaceIndex}; using 1500.");
+        }
+
+        var mtu = hasResolvedMtu ? resolvedMtu : 1500;
         return new DirectRelayTarget(
             packet.DestinationAddress,
             packet.DestinationPort,
@@ -244,7 +260,7 @@ internal sealed class WinDivertUdpRelay : IDisposable
         }
 
         _throttledLogTimes[category] = now;
-        _log(message);
+        _warningLog(message);
     }
 
     public void Dispose()

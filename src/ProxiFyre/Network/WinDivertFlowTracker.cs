@@ -40,6 +40,7 @@ internal sealed class WinDivertFlowTracker : IDisposable
     private readonly ConcurrentDictionary<WinDivertFlowKey, FlowOwner> _flows = new();
     private readonly ProcessLookup _processLookup;
     private readonly Action<string> _log;
+    private readonly Action<string> _warningLog;
     private readonly CancellationTokenSource _cts = new();
     private WinDivertHandle? _handle;
     private Task? _loopTask;
@@ -48,10 +49,12 @@ internal sealed class WinDivertFlowTracker : IDisposable
     public WinDivertFlowTracker(
         ProcessLookup processLookup,
         Action<string> log,
-        WinDivertHandle? handle = null)
+        WinDivertHandle? handle = null,
+        Action<string>? warningLog = null)
     {
         _processLookup = processLookup;
         _log = log;
+        _warningLog = warningLog ?? log;
         _handle = handle;
     }
 
@@ -90,7 +93,7 @@ internal sealed class WinDivertFlowTracker : IDisposable
         {
             _handle?.Dispose();
             _handle = null;
-            _log(
+            _warningLog(
                 $"WinDivert flow tracker is unavailable; process-table fallback will be used: {ex.Message}");
         }
     }
@@ -105,6 +108,11 @@ internal sealed class WinDivertFlowTracker : IDisposable
     {
         processId = 0;
         if (!_flows.TryGetValue(WinDivertFlowKey.FromPacket(packet), out var owner))
+        {
+            return false;
+        }
+
+        if (owner.Ambiguous)
         {
             return false;
         }
@@ -181,13 +189,14 @@ internal sealed class WinDivertFlowTracker : IDisposable
 
         if (_flows.Count >= MaxTrackedFlows && !_flows.ContainsKey(key))
         {
-            _log($"WinDivert flow tracker limit reached ({MaxTrackedFlows}); new process association was ignored.");
+            _warningLog(
+                $"WinDivert flow tracker limit reached ({MaxTrackedFlows}); new process association was ignored.");
             return;
         }
 
         if (processId == (uint)Environment.ProcessId)
         {
-            _flows[key] = new FlowOwner(processId, 0);
+            MergeOwner(key, processId, 0);
             return;
         }
 
@@ -208,9 +217,31 @@ internal sealed class WinDivertFlowTracker : IDisposable
             return;
         }
 
-        _flows[key] = new FlowOwner(
-            processId,
-            process.StartTimeUtcTicks);
+        MergeOwner(key, processId, process.StartTimeUtcTicks);
+    }
+
+    private void MergeOwner(WinDivertFlowKey key, uint processId, long processStartTimeUtcTicks)
+    {
+        if (_flows.TryGetValue(key, out var existing))
+        {
+            if (existing.Ambiguous)
+            {
+                return;
+            }
+
+            if (existing.ProcessId != processId
+                || (existing.ProcessStartTimeUtcTicks != 0
+                    && processStartTimeUtcTicks != 0
+                    && existing.ProcessStartTimeUtcTicks != processStartTimeUtcTicks))
+            {
+                _flows[key] = new FlowOwner(0, 0, Ambiguous: true);
+                _warningLog(
+                    $"WinDivert flow ownership is ambiguous for {key}; falling back to the Windows owner table.");
+                return;
+            }
+        }
+
+        _flows[key] = new FlowOwner(processId, processStartTimeUtcTicks, Ambiguous: false);
     }
 
     private static DateTimeOffset? GetEventTimeUtc(long eventTimestamp)
@@ -253,5 +284,8 @@ internal sealed class WinDivertFlowTracker : IDisposable
         _flows.Clear();
     }
 
-    private sealed record FlowOwner(uint ProcessId, long ProcessStartTimeUtcTicks);
+    private sealed record FlowOwner(
+        uint ProcessId,
+        long ProcessStartTimeUtcTicks,
+        bool Ambiguous);
 }

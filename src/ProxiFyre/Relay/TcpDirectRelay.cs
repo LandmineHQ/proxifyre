@@ -38,7 +38,8 @@ internal sealed class TcpDirectRelay : IDisposable
     private readonly ConcurrentDictionary<RelayOwnedTcpEndpoint, int> _relayOutboundLocalEndpoints = new();
     private readonly ConcurrentDictionary<TcpRelayKey, DateTimeOffset> _bypassedFlows = new();
     private readonly Action<string> _log;
-    private readonly bool _detailedLogging;
+    private readonly Action<string> _warningLog;
+    private readonly DetailedLoggingState _detailedLogging;
     private readonly TrafficCounter _trafficCounter;
     private readonly PacketWakeSignal? _packetWakeSignal;
     private readonly TimeProvider _timeProvider;
@@ -54,10 +55,13 @@ internal sealed class TcpDirectRelay : IDisposable
         bool detailedLogging = false,
         TrafficCounter? trafficCounter = null,
         PacketWakeSignal? packetWakeSignal = null,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        DetailedLoggingState? detailedLoggingState = null,
+        Action<string>? warningLog = null)
     {
         _log = log ?? Console.WriteLine;
-        _detailedLogging = detailedLogging;
+        _warningLog = warningLog ?? _log;
+        _detailedLogging = detailedLoggingState ?? new DetailedLoggingState(detailedLogging);
         _trafficCounter = trafficCounter ?? new TrafficCounter();
         _packetWakeSignal = packetWakeSignal;
         _timeProvider = timeProvider ?? TimeProvider.System;
@@ -117,7 +121,8 @@ internal sealed class TcpDirectRelay : IDisposable
             RegisterOutboundFlow,
             UnregisterOutboundFlow,
             _remove: Remove,
-            _detailedLogging ? LogDetail : null,
+            LogDetail,
+            _warningLog,
             _log,
             _timeProvider,
             cancellationToken);
@@ -157,7 +162,8 @@ internal sealed class TcpDirectRelay : IDisposable
             wildcardAddress,
             flowKey.RemoteAddress,
             flowKey.ClientPort,
-            flowKey.RemotePort));
+            flowKey.RemotePort,
+            flowKey.SubInterfaceIndex));
     }
 
     public bool IsRelayOutboundLocalEndpoint(IPAddress localAddress, ushort localPort)
@@ -229,7 +235,8 @@ internal sealed class TcpDirectRelay : IDisposable
                 connection.FlowKey.RemoteAddress,
                 connection.FlowKey.ClientPort,
                 connection.FlowKey.RemotePort,
-                connection.FlowKey.Dot1q));
+                connection.FlowKey.Dot1q,
+                connection.FlowKey.SubInterfaceIndex));
             connection.Dispose();
         }
     }
@@ -250,7 +257,8 @@ internal sealed class TcpDirectRelay : IDisposable
             flow.LocalAddress,
             flow.RemoteAddress,
             flow.LocalPort,
-            flow.RemotePort)] = 0;
+            flow.RemotePort,
+            flow.SubInterfaceIndex)] = 0;
         _outboundBypassRegister?.Invoke(flow);
     }
 
@@ -273,7 +281,8 @@ internal sealed class TcpDirectRelay : IDisposable
                 flow.LocalAddress,
                 flow.RemoteAddress,
                 flow.LocalPort,
-                flow.RemotePort),
+                flow.RemotePort,
+                flow.SubInterfaceIndex),
             out _);
         _outboundBypassUnregister?.Invoke(flow);
     }
@@ -289,7 +298,7 @@ internal sealed class TcpDirectRelay : IDisposable
 
     private void LogDetail(string message)
     {
-        if (_detailedLogging)
+        if (_detailedLogging.Enabled)
         {
             _log(message);
         }
@@ -331,7 +340,8 @@ internal sealed class TcpDirectRelay : IDisposable
                 connection.FlowKey.RemoteAddress,
                 connection.FlowKey.ClientPort,
                 connection.FlowKey.RemotePort,
-                connection.FlowKey.Dot1q));
+                connection.FlowKey.Dot1q,
+                connection.FlowKey.SubInterfaceIndex));
             connection.Dispose();
         }
 
@@ -360,6 +370,7 @@ internal sealed class TcpDirectRelay : IDisposable
         private readonly Action<RelayOutboundFlow> _unregisterOutboundFlow;
         private readonly Action<TcpRelayConnection> _remove;
         private readonly Action<string>? _detailLog;
+        private readonly Action<string> _warningLog;
         private readonly Action<string> _errorLog;
         private readonly TimeProvider _timeProvider;
         private readonly CancellationTokenSource _cts;
@@ -419,6 +430,7 @@ internal sealed class TcpDirectRelay : IDisposable
             Action<RelayOutboundFlow> unregisterOutboundFlow,
             Action<TcpRelayConnection> _remove,
             Action<string>? detailLog,
+            Action<string> warningLog,
             Action<string> errorLog,
             TimeProvider timeProvider,
             CancellationToken externalCancellationToken)
@@ -433,6 +445,7 @@ internal sealed class TcpDirectRelay : IDisposable
             _unregisterOutboundFlow = unregisterOutboundFlow;
             this._remove = _remove;
             _detailLog = detailLog;
+            _warningLog = warningLog;
             _errorLog = errorLog;
             _timeProvider = timeProvider;
             _cts = CancellationTokenSource.CreateLinkedTokenSource(externalCancellationToken);
@@ -547,12 +560,12 @@ internal sealed class TcpDirectRelay : IDisposable
                     hasFallback
                     && IsRetryableOutboundAddressError(ex.SocketErrorCode))
                 {
-                    _detailLog?.Invoke(
+                    _warningLog(
                         $"DIRECT TCP retrying outbound setup app={_target.AppLabel} attempt={index + 1}/{attempts.Count} bind={attempt.BindEndPoint} interfaceIndex={_target.InterfaceIndex} pinInterface={attempt.PinInterface}: {ex.Message}");
                 }
                 catch (PlatformNotSupportedException ex) when (hasFallback)
                 {
-                    _detailLog?.Invoke(
+                    _warningLog(
                         $"DIRECT TCP retrying outbound setup app={_target.AppLabel} attempt={index + 1}/{attempts.Count} bind={attempt.BindEndPoint} interfaceIndex={_target.InterfaceIndex} pinInterface={attempt.PinInterface}: {ex.Message}");
                 }
             }
@@ -626,7 +639,7 @@ internal sealed class TcpDirectRelay : IDisposable
                 }
                 catch (Exception ex)
                 {
-                    _detailLog?.Invoke(
+                    _warningLog(
                         $"DIRECT TCP outbound flow cleanup failed app={_target.AppLabel}: {ex.Message}");
                 }
 
@@ -656,13 +669,13 @@ internal sealed class TcpDirectRelay : IDisposable
             }
             catch (SocketException ex)
             {
-                _detailLog?.Invoke(
+                _warningLog(
                     $"DIRECT TCP could not pin interfaceIndex={_target.InterfaceIndex} app={_target.AppLabel}: {ex.Message}");
                 throw;
             }
             catch (PlatformNotSupportedException ex)
             {
-                _detailLog?.Invoke(
+                _warningLog(
                     $"DIRECT TCP interface pinning is unavailable app={_target.AppLabel}: {ex.Message}");
                 throw;
             }
@@ -735,7 +748,7 @@ internal sealed class TcpDirectRelay : IDisposable
                     if (!ProcessAckLocked(segment))
                     {
                         _detailLog?.Invoke(
-                            $"DIRECT TCP relay ignored an unacceptable acknowledgement seq={segment.SequenceNumber} ack={segment.AcknowledgmentNumber} expected<= {_remoteSendNext}.");
+                            $"DIRECT TCP relay ignored an unacceptable acknowledgement seq={segment.SequenceNumber} ack={segment.AcknowledgmentNumber} expected<= {_remoteSentNext}.");
                         sendAck = true;
                     }
                     else
@@ -790,8 +803,8 @@ internal sealed class TcpDirectRelay : IDisposable
                 return true;
             }
 
-            var ack = UnwrapNear(segment.AcknowledgmentNumber, _remoteSendNext);
-            if (ack > _remoteSendNext)
+            var ack = UnwrapNear(segment.AcknowledgmentNumber, _remoteSentNext);
+            if (ack > _remoteSentNext)
             {
                 return false;
             }

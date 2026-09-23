@@ -43,12 +43,12 @@ internal sealed unsafe class ModuleMessageClient : IDisposable
 
     private Action<ModuleEvent> EventHandler { get; }
 
-    public bool SendCommand(nint moduleWindow, string commandPayload)
+    public ModuleCommandSendResult SendCommand(nint moduleWindow, string commandPayload)
     {
         return SendCommand(moduleWindow, commandPayload, TimeSpan.FromSeconds(5));
     }
 
-    public bool SendCommand(nint moduleWindow, string commandPayload, TimeSpan timeout)
+    public ModuleCommandSendResult SendCommand(nint moduleWindow, string commandPayload, TimeSpan timeout)
     {
         return SendCopyData(moduleWindow, WindowHandle, ModuleMessageProtocol.CommandDataId, commandPayload, timeout);
     }
@@ -171,7 +171,12 @@ internal sealed unsafe class ModuleMessageClient : IDisposable
         return true;
     }
 
-    public static bool SendCopyData(nint targetWindow, nint senderWindow, int dataId, string payload, TimeSpan? timeout = null)
+    public static ModuleCommandSendResult SendCopyData(
+        nint targetWindow,
+        nint senderWindow,
+        int dataId,
+        string payload,
+        TimeSpan? timeout = null)
     {
         var timeoutMs = timeout is null
             ? CopyDataTimeoutMs
@@ -186,15 +191,17 @@ internal sealed unsafe class ModuleMessageClient : IDisposable
                 lpData = (nint)bytesPtr
             };
 
-            return SendMessageTimeoutW(
-                    targetWindow,
-                    ModuleMessageProtocol.WmCopyData,
-                    senderWindow,
-                    (nint)(&copyData),
-                    SmtoAbortIfHung,
-                    timeoutMs,
-                    out var result) != nint.Zero
-                && result != nint.Zero;
+            var callResult = SendMessageTimeoutW(
+                targetWindow,
+                ModuleMessageProtocol.WmCopyData,
+                senderWindow,
+                (nint)(&copyData),
+                SmtoAbortIfHung,
+                timeoutMs,
+                out var result);
+            return callResult != nint.Zero
+                ? new ModuleCommandSendResult(true, result, 0)
+                : new ModuleCommandSendResult(false, nint.Zero, Marshal.GetLastWin32Error());
         }
     }
 
@@ -335,6 +342,15 @@ internal sealed unsafe class ModuleMessageClient : IDisposable
     [DllImport("user32.dll", ExactSpelling = true, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool PostThreadMessageW(uint idThread, uint Msg, nint wParam, nint lParam);
+}
+
+internal readonly record struct ModuleCommandSendResult(bool Delivered, nint Response, int Win32Error)
+{
+    public bool Accepted => Delivered && Response == 1;
+
+    public bool RetryLater => Delivered && Response == 2;
+
+    public bool AlreadyRunning => Delivered && Response == 3;
 }
 
 public sealed record ModuleEvent(string EventName, string Text, bool? Running, int? ProcessId);

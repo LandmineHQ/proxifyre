@@ -21,13 +21,13 @@ internal static class UdpRelaySelfTest
 
         var responseSource = new TaskCompletionSource<IPEndPoint>(TaskCreationOptions.RunContinuationsAsynchronously);
         var responsePayload = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var unregisteredSource = new TaskCompletionSource<IPEndPoint>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var crossAddressSource = new TaskCompletionSource<IPEndPoint>(TaskCreationOptions.RunContinuationsAsynchronously);
         var alternateSource = new TaskCompletionSource<IPEndPoint>(TaskCreationOptions.RunContinuationsAsynchronously);
         relay.SetResponseInjector((_, remoteEndPoint, payload) =>
         {
             if (remoteEndPoint.Address.Equals(IPAddress.Parse("127.0.0.2")))
             {
-                unregisteredSource.TrySetResult(remoteEndPoint);
+                crossAddressSource.TrySetResult(remoteEndPoint);
             }
             else if (remoteEndPoint.Port == ((IPEndPoint)remoteAlternate.LocalEndPoint!).Port)
             {
@@ -136,10 +136,10 @@ internal static class UdpRelaySelfTest
                 SocketFlags.None,
                 requestA.RemoteEndPoint,
                 timeout.Token).ConfigureAwait(false);
-            await Task.Delay(TimeSpan.FromMilliseconds(200), timeout.Token).ConfigureAwait(false);
+            var injectedCrossAddressSource = await crossAddressSource.Task.WaitAsync(timeout.Token).ConfigureAwait(false);
             Assert(
-                !unregisteredSource.Task.IsCompleted,
-                "UDP relay injected a response from an unregistered remote address.");
+                injectedCrossAddressSource.Address.Equals(IPAddress.Parse("127.0.0.2")),
+                "UDP relay did not accept an open-policy response from a different remote address.");
 
             relay.Remove(keyA);
             Assert(
@@ -188,7 +188,7 @@ internal static class UdpRelaySelfTest
                 !relay.TryGetTarget(keyA, out _) && !relay.TryGetTarget(keyB, out _),
                 "UDP relay did not evict existing flows after a configuration reload.");
 
-            Console.WriteLine("PASS: UDP relay preserves client flow and external ports, accepts alternate ports on a registered address, rejects unregistered sources, fails closed without an interface index, and honors configuration reloads.");
+            Console.WriteLine("PASS: UDP relay preserves client flow and external ports, accepts open-policy remote endpoints, fails closed without an interface index, and honors configuration reloads.");
             return 0;
         }
         catch (Exception ex)

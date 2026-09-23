@@ -69,6 +69,7 @@ public partial class MainWindow : Window
         Tabs.RemoveAppRequested += Tabs_RemoveAppRequested;
         Tabs.ReloadRequested += (_, _) => ReloadConfigFromUi();
         Tabs.UuPatchToggleRequested += Tabs_UuPatchToggleRequested;
+        Tabs.DetailedLoggingToggleRequested += Tabs_DetailedLoggingToggleRequested;
         Header.OpenSourceRequested += (_, _) => OpenSource();
         Header.StartStopRequested += Header_StartStopRequested;
         Announcement.DismissRequested += (_, _) => DismissAnnouncement();
@@ -81,7 +82,8 @@ public partial class MainWindow : Window
         {
             Dispatcher.InvokeAsync(() => ApplyModuleEvent(moduleEvent));
         },
-        telemetryPipeName: _telemetryServer.PipeName);
+        telemetryPipeName: _telemetryServer.PipeName,
+        warningLog: AppendWarning);
         LoadLocalManifestInfo();
         SetVersionStatusChecking();
         UpdateCoreProcessInfo();
@@ -158,7 +160,7 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            AppendLog($"Module reconnect failed: {ex.Message}");
+            AppendWarning($"Module reconnect failed; continuing with no connected module: {ex.Message}");
             UpdateCoreProcessInfo();
             return ModuleAttachResult.NotLoaded;
         }
@@ -199,7 +201,7 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            AppendLog($"Update check failed: {ex.Message}");
+            AppendWarning($"Update check failed; continuing with the local version: {ex.Message}");
         }
     }
 
@@ -221,7 +223,7 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            AppendLog($"Failed to load local manifest: {ex.Message}");
+            AppendWarning($"Failed to load local manifest; using defaults: {ex.Message}");
         }
     }
 
@@ -305,7 +307,7 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            AppendLog($"Failed to clear core log: {ex.Message}");
+            AppendWarning($"Failed to clear core log; keeping the existing file: {ex.Message}");
         }
     }
 
@@ -320,6 +322,8 @@ public partial class MainWindow : Window
                 _rulesManager.BuildDisabledApps());
             RuleEntry.CoreProcessName = configuration.CoreProcessName;
             Tabs.SetLicenseKey(configuration.LicenseKey);
+            _settingsViewModel.SetDetailedLoggingEnabled(configuration.Detailed);
+            _moduleController.SetDetailedLogging(configuration.Detailed);
             _uuPatchDesired = configuration.EnableUuWhitelistPatch;
             _settingsViewModel.SetUuPatchEnabled(_uuPatchDesired);
             if (UuElevation.IsElevated || !_uuPatchDesired)
@@ -345,7 +349,7 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            AppendLog($"Failed to load config: {ex.Message}");
+            AppendWarning($"Failed to load config; keeping current UI state: {ex.Message}");
         }
     }
 
@@ -479,6 +483,33 @@ public partial class MainWindow : Window
         else
         {
             await DisableUuRuntimePatchAsync();
+        }
+    }
+
+    private void Tabs_DetailedLoggingToggleRequested(
+        object? sender,
+        DetailedLoggingToggleRequestedEventArgs e)
+    {
+        try
+        {
+            _configurationStore.SaveDetailedLogging(e.Enabled);
+            _settingsViewModel.SetDetailedLoggingEnabled(e.Enabled);
+            _moduleController.SetDetailedLogging(e.Enabled);
+            if (_moduleController.IsRunning)
+            {
+                _moduleController.Reload();
+                AppendLog(
+                    $"详细日志已{(e.Enabled ? "开启" : "关闭")}，已向模组发送实时重载命令。");
+            }
+            else
+            {
+                AppendLog($"详细日志已{(e.Enabled ? "开启" : "关闭")}，将在下次运行模组时生效。");
+            }
+        }
+        catch (Exception ex)
+        {
+            _settingsViewModel.SetDetailedLoggingEnabled(_configurationStore.GetDetailedLogging());
+            AppendWarning($"Failed to update detailed logging; reverting the toggle: {ex.Message}");
         }
     }
 
@@ -679,7 +710,7 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            AppendLog($"UU runtime patch failed: {ex.Message}");
+            AppendWarning($"UU runtime patch failed: {ex.Message}");
             MessageBox.Show(
                 this,
                 ex.Message,
@@ -750,7 +781,7 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            AppendLog($"UU runtime patch restore failed: {ex.Message}");
+            AppendWarning($"UU runtime patch restore failed: {ex.Message}");
             MessageBox.Show(
                 this,
                 ex.Message,
@@ -859,7 +890,7 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            AppendLog($"Failed to save UU whitelist patch setting: {ex.Message}");
+            AppendWarning($"Failed to save UU whitelist patch setting: {ex.Message}");
         }
     }
 
@@ -986,7 +1017,7 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            AppendLog($"Failed to open source URL: {ex.Message}");
+            AppendWarning($"Failed to open source URL; showing it as text: {ex.Message}");
             MessageBox.Show(this, _sourceUrl, "GitHub", MessageBoxButton.OK, MessageBoxImage.Information);
         }
     }
@@ -1007,7 +1038,16 @@ public partial class MainWindow : Window
             var result = await _moduleController.LoadAndRunAsync(
                 RuleEntry.CoreProcessName,
                 _rulesManager.BuildEnabledApps(),
-                (deviceId, currentKey) => RegistrationDialog.Show(this, deviceId, currentKey));
+                (deviceId, currentKey) =>
+                {
+                    var licenseKey = RegistrationDialog.Show(this, deviceId, currentKey);
+                    if (!string.IsNullOrWhiteSpace(licenseKey))
+                    {
+                        Tabs.SetLicenseKey(licenseKey);
+                    }
+
+                    return licenseKey;
+                });
             if (result == ModuleStartResult.Canceled)
             {
                 return;
@@ -1265,7 +1305,14 @@ public partial class MainWindow : Window
     {
         if (!string.IsNullOrWhiteSpace(moduleEvent.Text))
         {
-            AppendLog($"module {moduleEvent.EventName}: {moduleEvent.Text}");
+            if (string.Equals(moduleEvent.EventName, "warning", StringComparison.OrdinalIgnoreCase))
+            {
+                AppendWarning($"module {moduleEvent.EventName}: {moduleEvent.Text}");
+            }
+            else
+            {
+                AppendLog($"module {moduleEvent.EventName}: {moduleEvent.Text}");
+            }
         }
 
         if (moduleEvent.Running is not null)
@@ -1280,8 +1327,21 @@ public partial class MainWindow : Window
 
     private void AppendLog(string message)
     {
-        var uiLine = $"{DateTime.Now:HH:mm:ss}  {message}";
-        WriteUiLogLine(message);
+        AppendLog("INFO", message);
+    }
+
+    private void AppendWarning(string message)
+    {
+        AppendLog("WARN", message);
+    }
+
+    private void AppendLog(string level, string message)
+    {
+        var levelPrefix = string.Equals(level, "WARN", StringComparison.Ordinal)
+            ? "[WARN] "
+            : string.Empty;
+        var uiLine = $"{DateTime.Now:HH:mm:ss}  {levelPrefix}{message}";
+        WriteUiLogLine(level, message);
 
         Dispatcher.InvokeAsync(() =>
         {
@@ -1309,13 +1369,14 @@ public partial class MainWindow : Window
         return writer;
     }
 
-    private void WriteUiLogLine(string message)
+    private void WriteUiLogLine(string level, string message)
     {
         lock (_uiLogSync)
         {
             try
             {
-                _uiLogWriter.WriteLine($"{DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss.fff zzz} [INFO] {message}");
+                _uiLogWriter.WriteLine(
+                    $"{DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss.fff zzz} [{level}] {message}");
             }
             catch
             {
@@ -1405,7 +1466,7 @@ public partial class MainWindow : Window
 
         if (!_uuPatchOperationGate.Wait(TimeSpan.FromSeconds(1)))
         {
-            WriteUiLogLine("UU runtime patch operation was still busy during UI shutdown.");
+            WriteUiLogLine("WARN", "UU runtime patch operation was still busy during UI shutdown.");
             return;
         }
 
@@ -1414,18 +1475,22 @@ public partial class MainWindow : Window
             var restoreTask = Task.Run(() => _uuRuntimePatcher.Value.Restore());
             if (!restoreTask.Wait(TimeSpan.FromSeconds(3)))
             {
-                WriteUiLogLine("UU runtime patch restore did not finish before UI shutdown.");
+                WriteUiLogLine("WARN", "UU runtime patch restore did not finish before UI shutdown.");
                 return;
             }
 
             if (!restoreTask.Result.Success)
             {
-                WriteUiLogLine($"UU runtime patch restore on shutdown failed: {restoreTask.Result.Message}");
+                WriteUiLogLine(
+                    "WARN",
+                    $"UU runtime patch restore on shutdown failed: {restoreTask.Result.Message}");
             }
         }
         catch (Exception ex)
         {
-            WriteUiLogLine($"UU runtime patch restore on shutdown failed: {ex.Message}");
+            WriteUiLogLine(
+                "WARN",
+                $"UU runtime patch restore on shutdown failed: {ex.Message}");
         }
         finally
         {

@@ -70,7 +70,8 @@ internal static class Cli
         {
             using var logger = CoreLogger.CreateForCurrentProcess();
             var configuration = AppConfiguration.Load(configPath);
-            var detailedLogging = args.Any(a => string.Equals(a, "--detailed", StringComparison.OrdinalIgnoreCase));
+            var detailedLogging = configuration.Detailed
+                || args.Any(a => string.Equals(a, "--detailed", StringComparison.OrdinalIgnoreCase));
             logger.Info($"Configuration path: {configPath}");
             logger.Info($"Relay network activity process: {System.Diagnostics.Process.GetCurrentProcess().ProcessName}.exe");
             logger.Info($"Detailed logging: {(detailedLogging ? "enabled" : "disabled")}");
@@ -81,7 +82,11 @@ internal static class Cli
                 cts.Cancel();
             };
 
-            await using var service = new RelayService(logger.Info, detailedLogging, PrintTraffic);
+            await using var service = new RelayService(
+                logger.Info,
+                detailedLogging,
+                PrintTraffic,
+                warningLog: logger.Warning);
             service.Start(configuration, configPath, cts.Token);
             logger.Info("Running. Press Ctrl+C to stop.");
 

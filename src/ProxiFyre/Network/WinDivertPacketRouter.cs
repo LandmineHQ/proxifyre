@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.ComponentModel;
@@ -5,6 +6,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
+using System.Threading.Channels;
 
 namespace ProxiFyre;
 
@@ -12,6 +14,7 @@ internal sealed class WinDivertPacketRouter : IAsyncDisposable
 {
     private const int MaxTcpRelayConnections = 4096;
     private const int MaxPacketLength = 131072;
+    private const int MaxQueuedPackets = 4096;
     private const int MaxUdpPassThroughEntries = 65536;
     private static readonly TimeSpan UdpPassThroughTtl = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan UdpProcessMissPassThroughTtl = TimeSpan.FromMilliseconds(250);
@@ -20,7 +23,9 @@ internal sealed class WinDivertPacketRouter : IAsyncDisposable
     private readonly DynamicAppConfiguration _configuration;
     private readonly ProcessLookup _processLookup;
     private readonly Action<string> _log;
-    private readonly bool _detailedLogging;
+    private readonly Action<string> _warningLog;
+    private readonly ConcurrentDictionary<string, long> _warningTimes = new();
+    private readonly DetailedLoggingState _detailedLogging;
     private readonly TrafficCounter _trafficCounter;
     private readonly PacketWakeSignal _packetWakeSignal;
     private readonly TimeProvider _timeProvider;
@@ -30,9 +35,16 @@ internal sealed class WinDivertPacketRouter : IAsyncDisposable
     private long _packetsPassed;
     private long _packetsRelayed;
     private long _packetErrors;
+    private long _packetQueueFull;
     private long _lastHealthLogTick;
-    private readonly TaskCompletionSource _completed =
-        new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private long _lastPacketQueueFullLogTick;
+    private readonly Channel<CapturedPacket> _packetQueue = Channel.CreateBounded<CapturedPacket>(
+        new BoundedChannelOptions(MaxQueuedPackets)
+        {
+            SingleReader = true,
+            SingleWriter = true,
+            FullMode = BoundedChannelFullMode.Wait
+        });
     private readonly SemaphoreSlim _lifecycleGate = new(1, 1);
     private WinDivertHandle? _networkHandle;
     private WinDivertFlowTracker? _flowTracker;
@@ -40,6 +52,9 @@ internal sealed class WinDivertPacketRouter : IAsyncDisposable
     private TcpDirectRelay? _tcpRelay;
     private WinDivertUdpRelay? _udpRelay;
     private Task? _captureTask;
+    private Task? _packetProcessingTask;
+    private CancellationTokenRegistration _stopRegistration;
+    private bool _hasStopRegistration;
     private bool _disposed;
 
     public WinDivertPacketRouter(
@@ -49,15 +64,18 @@ internal sealed class WinDivertPacketRouter : IAsyncDisposable
         TrafficCounter trafficCounter,
         PacketWakeSignal packetWakeSignal,
         TimeProvider timeProvider,
-        bool detailedLogging)
+        bool detailedLogging,
+        DetailedLoggingState? detailedLoggingState = null,
+        Action<string>? warningLog = null)
     {
         _configuration = configuration;
         _processLookup = processLookup;
         _log = log;
+        _warningLog = warningLog ?? log;
         _trafficCounter = trafficCounter;
         _packetWakeSignal = packetWakeSignal;
         _timeProvider = timeProvider;
-        _detailedLogging = detailedLogging;
+        _detailedLogging = detailedLoggingState ?? new DetailedLoggingState(detailedLogging);
     }
 
     public Task Completion => _captureTask ?? Task.CompletedTask;
@@ -95,16 +113,27 @@ internal sealed class WinDivertPacketRouter : IAsyncDisposable
             NetworkInterfaceIndexResolver.PrimeMtuCache();
             _networkHandle = networkHandle ?? OpenNetworkHandle();
 
-            _flowTracker = new WinDivertFlowTracker(_processLookup, _log, flowHandle);
+            _flowTracker = new WinDivertFlowTracker(
+                _processLookup,
+                _log,
+                flowHandle,
+                _warningLog);
             _flowTracker.Start();
-            _injector = new WinDivertPacketInjector(_networkHandle, _log, _detailedLogging);
+            _injector = new WinDivertPacketInjector(
+                _networkHandle,
+                _log,
+                _detailedLogging.Enabled,
+                _detailedLogging,
+                _warningLog);
 
             _tcpRelay = new TcpDirectRelay(
                 _log,
-                _detailedLogging,
+                _detailedLogging.Enabled,
                 _trafficCounter,
                 _packetWakeSignal,
-                _timeProvider);
+                _timeProvider,
+                detailedLoggingState: _detailedLogging,
+                warningLog: _warningLog);
             _tcpRelay.SetPacketInjector(_injector.InjectTcpSegment);
             _tcpRelay.SetOutboundBypass(static _ => { }, static _ => { });
             _tcpRelay.SetTargetRedirectUnregister(static _ => { });
@@ -118,19 +147,26 @@ internal sealed class WinDivertPacketRouter : IAsyncDisposable
                 _trafficCounter,
                 _packetWakeSignal,
                 _timeProvider,
-                _detailedLogging);
+                _detailedLogging.Enabled,
+                _detailedLogging,
+                _warningLog);
             _udpRelay.Start(_cts.Token);
 
+            _packetProcessingTask = Task.Factory.StartNew(
+                () => ProcessCapturedPackets(_cts.Token),
+                _cts.Token,
+                TaskCreationOptions.LongRunning,
+                TaskScheduler.Default);
             _captureTask = Task.Factory.StartNew(
                 () => CaptureLoop(_cts.Token),
                 _cts.Token,
                 TaskCreationOptions.LongRunning,
                 TaskScheduler.Default);
 
-            var linkedRegistration = cancellationToken.Register(
+            _stopRegistration = cancellationToken.Register(
                 static state => ((WinDivertPacketRouter)state!).RequestStop(),
                 this);
-            _ = linkedRegistration;
+            _hasStopRegistration = true;
             _log("WinDivert packet router started.");
         }
         catch
@@ -186,32 +222,80 @@ internal sealed class WinDivertPacketRouter : IAsyncDisposable
                 }
 
                 Interlocked.Increment(ref _packetsReceived);
-                try
+                var packet = ArrayPool<byte>.Shared.Rent(packetLength);
+                Buffer.BlockCopy(buffer, 0, packet, 0, packetLength);
+                if (!_packetQueue.Writer.TryWrite(
+                        new CapturedPacket(packet, packetLength, address)))
                 {
-                    ProcessPacket(buffer.AsSpan(0, packetLength), address);
-                    LogHealthIfDue();
-                }
-                catch (Exception ex)
-                {
-                    Interlocked.Increment(ref _packetErrors);
-                    _log($"WinDivert packet handling failed: {ex}");
+                    ArrayPool<byte>.Shared.Return(packet);
+                    LogPacketQueueFull();
                     try
                     {
                         PassPacket(buffer.AsSpan(0, packetLength), address);
                     }
-                    catch (Exception passException)
+                    catch (Exception ex)
                     {
-                        _log($"WinDivert packet recovery pass-through failed: {passException.Message}");
+                        Interlocked.Increment(ref _packetErrors);
+                        _log($"WinDivert packet queue-full pass-through failed: {ex.Message}");
                     }
                 }
             }
 
-            _completed.TrySetResult();
+            _packetQueue.Writer.TryComplete();
         }
         catch (Exception ex)
         {
-            _completed.TrySetException(ex);
+            _packetQueue.Writer.TryComplete();
             _log($"WinDivert packet router stopped unexpectedly: {ex}");
+        }
+    }
+
+    private void ProcessCapturedPackets(CancellationToken cancellationToken)
+    {
+        try
+        {
+            while (_packetQueue.Reader.WaitToReadAsync(CancellationToken.None)
+                .AsTask()
+                .GetAwaiter()
+                .GetResult())
+            {
+                while (_packetQueue.Reader.TryRead(out var captured))
+                {
+                    try
+                    {
+                        ProcessPacket(
+                            captured.Buffer.AsSpan(0, captured.Length),
+                            captured.Address);
+                        LogHealthIfDue();
+                    }
+                    catch (Exception ex)
+                    {
+                        Interlocked.Increment(ref _packetErrors);
+                        _warningLog(
+                            $"WinDivert packet handling failed; falling back to direct pass-through: {ex}");
+                        try
+                        {
+                            PassPacket(
+                                captured.Buffer.AsSpan(0, captured.Length),
+                                captured.Address);
+                        }
+                        catch (Exception passException)
+                        {
+                            _log(
+                                $"WinDivert packet recovery pass-through failed: {passException.Message}");
+                        }
+                    }
+                    finally
+                    {
+                        ArrayPool<byte>.Shared.Return(captured.Buffer);
+                    }
+                }
+            }
+        }
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+        {
+            _log($"WinDivert packet processing stopped unexpectedly: {ex}");
+            RequestStop();
         }
     }
 
@@ -219,6 +303,9 @@ internal sealed class WinDivertPacketRouter : IAsyncDisposable
     {
         if (!PacketView.TryParseIp(packetBytes, packetBytes.Length, out var packet))
         {
+            LogWarningThrottled(
+                "packet-parse-fallback",
+                "WinDivert packet parsing failed; passing the captured packet directly.");
             PassPacket(packetBytes, address);
             return;
         }
@@ -257,6 +344,9 @@ internal sealed class WinDivertPacketRouter : IAsyncDisposable
 
         if (resolved > 0)
         {
+            LogWarningThrottled(
+                "interface-resolution-fallback",
+                $"WinDivert packet did not include an interface index; resolved fallback interfaceIndex={resolved} for {packet.SourceAddress}.");
             return (uint)resolved;
         }
 
@@ -275,7 +365,7 @@ internal sealed class WinDivertPacketRouter : IAsyncDisposable
             return;
         }
 
-        var relayKey = CreateTcpRelayKey(packet, interfaceIndex);
+        var relayKey = CreateTcpRelayKey(packet, interfaceIndex, address.NetworkSubInterfaceIndex);
         if (_tcpRelay!.IsRelayOutboundFlow(relayKey))
         {
             PassPacket(packetBytes, address);
@@ -300,7 +390,7 @@ internal sealed class WinDivertPacketRouter : IAsyncDisposable
             }
             else
             {
-                if (_detailedLogging)
+                if (_detailedLogging.Enabled)
                 {
                     _log(
                         $"TCP relay client segment flags=0x{packet.TcpFlags:X2} seq={packet.TcpSequenceNumber} ack={packet.TcpAcknowledgmentNumber} payload={packet.TcpPayloadLength} session={packet.Session}");
@@ -325,9 +415,10 @@ internal sealed class WinDivertPacketRouter : IAsyncDisposable
 
         if (_tcpRelay.ConnectionCount >= MaxTcpRelayConnections)
         {
+            LogWarningThrottled(
+                "tcp-connection-limit-fallback",
+                $"WinDivert TCP relay connection limit reached ({MaxTcpRelayConnections}); passing new target flows directly.");
             _tcpRelay.MarkBypassedFlow(relayKey);
-            _log(
-                $"WinDivert TCP relay connection limit reached ({MaxTcpRelayConnections}); passing new target flow directly.");
             PassPacket(packetBytes, address);
             return;
         }
@@ -336,6 +427,9 @@ internal sealed class WinDivertPacketRouter : IAsyncDisposable
             || isRelayProcess
             || process is null)
         {
+            LogWarningThrottled(
+                "tcp-owner-fallback",
+                $"WinDivert TCP owner lookup failed for {packet.Session}; passing the flow directly.");
             _tcpRelay.MarkBypassedFlow(relayKey);
             PassPacket(packetBytes, address);
             return;
@@ -350,9 +444,10 @@ internal sealed class WinDivertPacketRouter : IAsyncDisposable
 
         if (interfaceIndex == 0)
         {
-            _tcpRelay.MarkBypassedFlow(relayKey);
-            _log(
+            LogWarningThrottled(
+                "tcp-interface-fallback",
                 $"WinDivert TCP relay could not resolve the outbound interface for {packet.Session}; passing directly.");
+            _tcpRelay.MarkBypassedFlow(relayKey);
             PassPacket(packetBytes, address);
             return;
         }
@@ -420,6 +515,9 @@ internal sealed class WinDivertPacketRouter : IAsyncDisposable
             || isRelayProcess
             || process is null)
         {
+            LogWarningThrottled(
+                "udp-owner-fallback",
+                $"WinDivert UDP owner lookup failed for {packet.UdpEndpoint}; passing the flow directly.");
             MarkUdpPassThrough(passKey, UdpProcessMissPassThroughTtl);
             PassPacket(packetBytes, address);
             return;
@@ -435,7 +533,8 @@ internal sealed class WinDivertPacketRouter : IAsyncDisposable
 
         if (interfaceIndex == 0)
         {
-            _log(
+            LogWarningThrottled(
+                "udp-interface-fallback",
                 $"WinDivert UDP relay could not resolve the outbound interface for {packet.SourceAddress}:{packet.SourcePort} -> {packet.DestinationAddress}:{packet.DestinationPort}; passing directly.");
             PassPacket(packetBytes, address);
             return;
@@ -556,12 +655,18 @@ internal sealed class WinDivertPacketRouter : IAsyncDisposable
         ProcessInfo process,
         string? matchedPattern)
     {
-        var mtu = NetworkInterfaceIndexResolver.TryGetMtu(
+        var hasResolvedMtu = NetworkInterfaceIndexResolver.TryGetMtu(
             (int)interfaceIndex,
             packet.AddressFamily,
-            out var resolvedMtu)
-            ? resolvedMtu
-            : 1500;
+            out var resolvedMtu);
+        if (!hasResolvedMtu)
+        {
+            LogWarningThrottled(
+                "mtu-fallback",
+                $"WinDivert MTU lookup failed for interfaceIndex={interfaceIndex}; using 1500.");
+        }
+
+        var mtu = hasResolvedMtu ? resolvedMtu : 1500;
         return new DirectRelayTarget(
             packet.DestinationAddress,
             packet.DestinationPort,
@@ -580,7 +685,10 @@ internal sealed class WinDivertPacketRouter : IAsyncDisposable
             ProcessStartTimeUtcTicks: process.StartTimeUtcTicks);
     }
 
-    private static TcpRelayKey CreateTcpRelayKey(PacketView packet, uint interfaceIndex)
+    private static TcpRelayKey CreateTcpRelayKey(
+        PacketView packet,
+        uint interfaceIndex,
+        uint subInterfaceIndex)
     {
         return new TcpRelayKey(
             new IntPtr(interfaceIndex),
@@ -588,7 +696,8 @@ internal sealed class WinDivertPacketRouter : IAsyncDisposable
             packet.SourceAddress,
             packet.DestinationAddress,
             packet.SourcePort,
-            packet.DestinationPort);
+            packet.DestinationPort,
+            subInterfaceIndex);
     }
 
     private static UdpRelayKey CreateUdpRelayKey(
@@ -675,7 +784,7 @@ internal sealed class WinDivertPacketRouter : IAsyncDisposable
 
     private void LogHealthIfDue()
     {
-        if (!_detailedLogging)
+        if (!_detailedLogging.Enabled)
         {
             return;
         }
@@ -696,6 +805,37 @@ internal sealed class WinDivertPacketRouter : IAsyncDisposable
             $"WinDivert health: received={Interlocked.Read(ref _packetsReceived)} passed={Interlocked.Read(ref _packetsPassed)} relayed={Interlocked.Read(ref _packetsRelayed)} errors={Interlocked.Read(ref _packetErrors)}.");
     }
 
+    private void LogPacketQueueFull()
+    {
+        Interlocked.Increment(ref _packetQueueFull);
+        var now = Environment.TickCount64;
+        var last = Interlocked.Read(ref _lastPacketQueueFullLogTick);
+        if (last != 0 && now - last < 5000)
+        {
+            return;
+        }
+
+        if (Interlocked.CompareExchange(ref _lastPacketQueueFullLogTick, now, last) != last)
+        {
+            return;
+        }
+
+        _warningLog(
+            $"WinDivert packet processing queue is full; passing captured packets directly. queued_full={Interlocked.Read(ref _packetQueueFull)}.");
+    }
+
+    private void LogWarningThrottled(string category, string message, int intervalMs = 5000)
+    {
+        var now = Environment.TickCount64;
+        if (_warningTimes.TryGetValue(category, out var last) && now - last < intervalMs)
+        {
+            return;
+        }
+
+        _warningTimes[category] = now;
+        _warningLog(message);
+    }
+
     private void RequestStop()
     {
         if (_cts.IsCancellationRequested)
@@ -713,6 +853,7 @@ internal sealed class WinDivertPacketRouter : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         await _lifecycleGate.WaitAsync().ConfigureAwait(false);
+        var gateReleased = false;
         try
         {
             if (_disposed)
@@ -720,43 +861,24 @@ internal sealed class WinDivertPacketRouter : IAsyncDisposable
                 return;
             }
 
-            _disposed = true;
             RequestStop();
-            var captureStopped = false;
-            try
+            var stopped = await WaitForPacketTasksAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+            if (!stopped)
             {
-                await Completion.WaitAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
-                captureStopped = true;
-            }
-            catch (TimeoutException)
-            {
-                _log("WinDivert packet router shutdown timed out; forcing the network handle closed.");
+                _log(
+                    "WinDivert packet router shutdown timed out; forcing the local network handle closed.");
                 _networkHandle?.Dispose();
                 _networkHandle = null;
-            }
-            catch
-            {
-                captureStopped = true;
+                stopped = await WaitForPacketTasksAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false);
             }
 
-            if (!captureStopped && _networkHandle is null)
-            {
-                try
-                {
-                    await Completion.WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
-                    captureStopped = true;
-                }
-                catch
-                {
-                }
-            }
-
-            if (!captureStopped)
+            if (!stopped)
             {
                 throw new TimeoutException(
-                    "WinDivert capture loop did not stop; relay resources were retained.");
+                    "WinDivert capture or packet processing did not stop; relay resources were retained.");
             }
 
+            _packetQueue.Writer.TryComplete();
             _udpRelay?.Dispose();
             _tcpRelay?.Dispose();
             _flowTracker?.Dispose();
@@ -766,21 +888,35 @@ internal sealed class WinDivertPacketRouter : IAsyncDisposable
             _flowTracker = null;
             _injector = null;
             _networkHandle = null;
+            _captureTask = null;
+            _packetProcessingTask = null;
+            if (_hasStopRegistration)
+            {
+                _stopRegistration.Dispose();
+                _stopRegistration = default;
+                _hasStopRegistration = false;
+            }
+
+            _disposed = true;
             _cts.Dispose();
             _lifecycleGate.Release();
+            gateReleased = true;
             _lifecycleGate.Dispose();
             GC.SuppressFinalize(this);
         }
-        catch
+        finally
         {
-            _lifecycleGate.Release();
-            throw;
+            if (!gateReleased)
+            {
+                _lifecycleGate.Release();
+            }
         }
     }
 
     private void CleanupAfterStartFailure()
     {
         _cts.Cancel();
+        _packetQueue.Writer.TryComplete();
         if (_networkHandle is not null)
         {
             WinDivertNative.ShutdownReceive(_networkHandle);
@@ -796,10 +932,45 @@ internal sealed class WinDivertPacketRouter : IAsyncDisposable
         _injector = null;
         _networkHandle = null;
         _captureTask = null;
+        _packetProcessingTask = null;
+        if (_hasStopRegistration)
+        {
+            _stopRegistration.Dispose();
+            _stopRegistration = default;
+            _hasStopRegistration = false;
+        }
+    }
+
+    private async Task<bool> WaitForPacketTasksAsync(TimeSpan timeout)
+    {
+        var tasks = new List<Task> { Completion };
+        if (_packetProcessingTask is not null)
+        {
+            tasks.Add(_packetProcessingTask);
+        }
+
+        try
+        {
+            await Task.WhenAll(tasks).WaitAsync(timeout).ConfigureAwait(false);
+            return true;
+        }
+        catch (TimeoutException)
+        {
+            return false;
+        }
+        catch
+        {
+            return tasks.All(task => task.IsCompleted);
+        }
     }
 
     private readonly record struct UdpPassThroughKey(
         WinDivertFlowKey Flow,
         uint InterfaceIndex,
         uint SubInterfaceIndex);
+
+    private readonly record struct CapturedPacket(
+        byte[] Buffer,
+        int Length,
+        WinDivertAddress Address);
 }

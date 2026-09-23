@@ -41,6 +41,8 @@ internal sealed class CoreLogger : IDisposable
 
     public void Info(string message) => Write("INFO", message, Console.Out);
 
+    public void Warning(string message) => Write("WARN", message, Console.Error);
+
     public void Error(string message) => Write("ERROR", message, Console.Error);
 
     private void Write(string level, string message, TextWriter console)

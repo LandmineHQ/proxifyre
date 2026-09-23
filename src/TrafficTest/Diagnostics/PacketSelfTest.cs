@@ -28,6 +28,8 @@ internal static class PacketSelfTest
             TestUuPatchPersistence();
             TestDisabledApplicationPersistence();
             TestModuleMessageProtocol();
+            TestCoreLoggerLevels();
+            TestTcpRelayKeyInterfaceIsolation();
             TestNetworkInterfaceIndexResolution();
             TestRuntimeModuleCopy();
             Console.WriteLine("PASS: packet parsing, multicast detection, VLAN, TCP fields, WinDivert layouts/builders, TCP/UDP traffic counters, UU patch profiles/config, interface indexes, and runtime module copies.");
@@ -319,6 +321,12 @@ internal static class PacketSelfTest
         Assert(packetV4[20] == 3 && packetV4[21] == 3, "IPv4 UDP error type/code mismatch.");
         Assert(ComputeChecksum(packetV4.AsSpan(0, 20)) == 0, "IPv4 UDP error header checksum is invalid.");
         Assert(ComputeChecksum(packetV4.AsSpan(20)) == 0, "IPv4 UDP error ICMP checksum is invalid.");
+        Assert(
+            BinaryPrimitives.ReadUInt16BigEndian(packetV4.AsSpan(30, 2)) == 20 + 8 + payload.Length,
+            "IPv4 UDP error quoted IP total length must describe the original packet.");
+        Assert(
+            BinaryPrimitives.ReadUInt16BigEndian(packetV4.AsSpan(52, 2)) == 8 + payload.Length,
+            "IPv4 UDP error quoted UDP length must describe the original packet.");
 
         var remoteV6 = IPAddress.Parse("2001:db8::20");
         var clientV6 = IPAddress.Parse("2001:db8::10");
@@ -338,6 +346,12 @@ internal static class PacketSelfTest
                 protocol: 58,
                 packetV6.AsSpan(40)) == 0,
             "IPv6 UDP error ICMP checksum is invalid.");
+        Assert(
+            BinaryPrimitives.ReadUInt16BigEndian(packetV6.AsSpan(52, 2)) == 8 + payload.Length,
+            "IPv6 UDP error quoted payload length must describe the original packet.");
+        Assert(
+            BinaryPrimitives.ReadUInt16BigEndian(packetV6.AsSpan(92, 2)) == 8 + payload.Length,
+            "IPv6 UDP error quoted UDP length must describe the original packet.");
     }
 
     private static void TestWinDivertUdpFragmentation()
@@ -401,6 +415,20 @@ internal static class PacketSelfTest
             Assert(
                 !new ConfigurationStore(configPath).GetUuWhitelistPatchEnabled(),
                 "Disabled UU whitelist patch setting incorrectly reported as enabled.");
+
+            var store = new ConfigurationStore(configPath);
+            store.SaveDetailedLogging(true);
+            Assert(
+                AppConfiguration.Load(configPath).Detailed,
+                "Detailed logging setting did not persist in app-config.json.");
+            var detailedState = new DetailedLoggingState(false);
+            Assert(!detailedState.Enabled, "Detailed logging state should default to disabled.");
+            detailedState.Update(true);
+            Assert(detailedState.Enabled, "Detailed logging state did not update in real time.");
+            store.SaveUuWhitelistPatch(false);
+            Assert(
+                AppConfiguration.Load(configPath).Detailed,
+                "Saving another setting unexpectedly cleared detailed logging.");
         }
         finally
         {
@@ -453,6 +481,63 @@ internal static class PacketSelfTest
         Assert(ModuleMessageProtocol.GetHandle(values, "networkHandle") == new nint(456), "Module network handle mismatch.");
         Assert(ModuleMessageProtocol.GetHandle(values, "flowHandle") == new nint(789), "Module flow handle mismatch.");
         Assert(values["nativeDirectory"] == @"C:\native", "Module native directory mismatch.");
+
+        var attachPayload = ModuleMessageProtocol.BuildCommand(
+            "ATTACH",
+            replyHwnd: 321,
+            sessionToken: "D4E5F6");
+        Assert(
+            ModuleMessageProtocol.TryParse(attachPayload, out var attachValues),
+            "Module ATTACH payload did not parse.");
+        Assert(attachValues["command"] == "ATTACH", "Module ATTACH command mismatch.");
+        Assert(
+            ModuleMessageProtocol.GetReplyHwnd(attachValues) == new nint(321),
+            "Module ATTACH reply window mismatch.");
+    }
+
+    private static void TestTcpRelayKeyInterfaceIsolation()
+    {
+        var localAddress = IPAddress.Parse("192.0.2.10");
+        var remoteAddress = IPAddress.Parse("198.51.100.20");
+        var first = new TcpRelayKey(
+            new nint(17),
+            dot1q: 0,
+            localAddress,
+            remoteAddress,
+            clientPort: 50000,
+            remotePort: 443,
+            subInterfaceIndex: 1);
+        var second = new TcpRelayKey(
+            new nint(17),
+            dot1q: 0,
+            localAddress,
+            remoteAddress,
+            clientPort: 50000,
+            remotePort: 443,
+            subInterfaceIndex: 2);
+        Assert(first != second, "TCP relay keys must distinguish sub-interface indexes.");
+    }
+
+    private static void TestCoreLoggerLevels()
+    {
+        var directory = Directory.CreateTempSubdirectory("proxifyre-log-levels-");
+        try
+        {
+            var logPath = Path.Combine(directory.FullName, "core.log");
+            using (var logger = CoreLogger.Create(logPath))
+            {
+                logger.Warning("fallback warning");
+            }
+
+            var line = File.ReadLines(logPath).First();
+            Assert(
+                line.Contains("[WARN] fallback warning", StringComparison.Ordinal),
+                "CoreLogger warning level did not persist as [WARN].");
+        }
+        finally
+        {
+            directory.Delete(recursive: true);
+        }
     }
 
     private static void TestNetworkInterfaceIndexResolution()

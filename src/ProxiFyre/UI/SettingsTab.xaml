@@ -56,10 +56,12 @@
     <Grid Margin="12">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
         </Grid.RowDefinitions>
 
-        <Grid Margin="0,0,0,16">
+        <Grid Grid.Row="0"
+              Margin="0,0,0,16">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*" />
                 <ColumnDefinition Width="Auto" />
@@ -98,6 +100,30 @@
                               Click="UuPatchToggleButton_Click"
                               ToolTip="在 UU 进程中应用或恢复 local_proxy.dll 运行时补丁" />
             </StackPanel>
+        </Grid>
+
+        <Grid Grid.Row="1"
+              Margin="0,0,0,16">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <StackPanel>
+                <TextBlock Text="详细日志"
+                           FontSize="15"
+                           FontWeight="SemiBold" />
+                <TextBlock Text="{Binding DetailedLoggingStatusText}"
+                           FontWeight="SemiBold"
+                           Foreground="{StaticResource MutedTextBrush}"
+                           Margin="0,4,0,0" />
+            </StackPanel>
+            <ToggleButton x:Name="DetailedLoggingToggleButton"
+                          Grid.Column="1"
+                          Style="{StaticResource ToggleSwitchStyle}"
+                          IsChecked="{Binding IsDetailedLoggingEnabled, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                          Click="DetailedLoggingToggleButton_Click"
+                          VerticalAlignment="Center"
+                          ToolTip="记录额外的 relay 和 packet 诊断信息" />
         </Grid>
     </Grid>
 </UserControl>

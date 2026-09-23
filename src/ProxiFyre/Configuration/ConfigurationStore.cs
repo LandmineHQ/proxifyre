@@ -60,6 +60,18 @@ internal sealed class ConfigurationStore
         }
     }
 
+    public bool GetDetailedLogging()
+    {
+        try
+        {
+            return File.Exists(Path) && Load().Detailed;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     public bool Save(
         string coreProcessName,
         IEnumerable<string> apps,
@@ -136,6 +148,19 @@ internal sealed class ConfigurationStore
             configuration.LicenseKey,
             enabled,
             configuration.DisabledApps);
+    }
+
+    public void SaveDetailedLogging(bool enabled)
+    {
+        var configuration = Load();
+        AppConfiguration.SaveApps(
+            Path,
+            configuration.Apps,
+            configuration.CoreProcessName,
+            configuration.LicenseKey,
+            configuration.EnableUuWhitelistPatch,
+            configuration.DisabledApps,
+            enabled);
     }
 
     public void MarkLoaded(

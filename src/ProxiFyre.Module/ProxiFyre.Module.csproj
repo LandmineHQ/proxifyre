@@ -27,6 +27,7 @@
     <Compile Include="..\Shared\TrafficTelemetry.cs" Link="Shared\TrafficTelemetry.cs" />
     <Compile Include="..\ProxiFyre\Configuration\AppConfiguration.cs" Link="Configuration\AppConfiguration.cs" />
     <Compile Include="..\ProxiFyre\Configuration\DynamicAppConfiguration.cs" Link="Configuration\DynamicAppConfiguration.cs" />
+    <Compile Include="..\ProxiFyre\Logging\DetailedLoggingState.cs" Link="Logging\DetailedLoggingState.cs" />
     <Compile Include="..\ProxiFyre\Logging\CoreLogger.cs" Link="Logging\CoreLogger.cs" />
     <Compile Include="..\ProxiFyre\Network\NetworkEndpointResolver.cs" Link="Network\NetworkEndpointResolver.cs" />
     <Compile Include="..\ProxiFyre\Network\NetworkInterfaceIndexResolver.cs" Link="Network\NetworkInterfaceIndexResolver.cs" />

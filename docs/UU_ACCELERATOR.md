@@ -110,6 +110,12 @@ The Settings tab exposes a UU toggle:
   it restores the original bytes before closing. A forced termination skips
   this cleanup, but the patch still disappears when UU restarts.
 
+The same tab also exposes the detailed logging switch. It persists as
+`detailed` in `app-config.json`, defaults to off, and updates the running
+relay immediately through the normal configuration reload path. UDP response
+handling uses an open remote-endpoint policy while preserving client endpoint,
+process identity, adapter/interface, and generation validation.
+
 The runtime patch is temporary. Restarting UU discards it. The
 `local_proxy.dll` file and its Authenticode content remain unchanged.
 

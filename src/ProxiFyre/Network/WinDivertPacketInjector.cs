@@ -7,7 +7,8 @@ internal sealed class WinDivertPacketInjector
 {
     private readonly WinDivertHandle _handle;
     private readonly Action<string> _log;
-    private readonly bool _detailedLogging;
+    private readonly Action<string> _warningLog;
+    private readonly DetailedLoggingState _detailedLogging;
     private long _tcpSendSucceeded;
     private long _tcpSendFailed;
     private long _udpSendSucceeded;
@@ -16,11 +17,14 @@ internal sealed class WinDivertPacketInjector
     public WinDivertPacketInjector(
         WinDivertHandle handle,
         Action<string> log,
-        bool detailedLogging)
+        bool detailedLogging,
+        DetailedLoggingState? detailedLoggingState = null,
+        Action<string>? warningLog = null)
     {
         _handle = handle;
         _log = log;
-        _detailedLogging = detailedLogging;
+        _warningLog = warningLog ?? log;
+        _detailedLogging = detailedLoggingState ?? new DetailedLoggingState(detailedLogging);
     }
 
     public long TcpSendSucceeded => Interlocked.Read(ref _tcpSendSucceeded);
@@ -40,7 +44,7 @@ internal sealed class WinDivertPacketInjector
                 out var interfaceIndex,
                 out var subInterfaceIndex))
         {
-            if (_detailedLogging)
+            if (_detailedLogging.Enabled)
             {
                 _log(
                     $"WinDivert TCP injection could not resolve endpoints for {target.ClientEndpoint} <- {target.RemoteEndpoint}.");
@@ -70,7 +74,7 @@ internal sealed class WinDivertPacketInjector
             }
 
             Interlocked.Increment(ref _tcpSendSucceeded);
-            if (_detailedLogging
+            if (_detailedLogging.Enabled
                 && (segment.Flags & (PacketView.TcpFlagSyn | PacketView.TcpFlagAck))
                     == (PacketView.TcpFlagSyn | PacketView.TcpFlagAck))
             {
@@ -184,7 +188,7 @@ internal sealed class WinDivertPacketInjector
         }
     }
 
-    private static bool TryGetEndpoints(
+    private bool TryGetEndpoints(
         DirectRelayTarget target,
         out IPAddress clientAddress,
         out IPAddress remoteAddress,
@@ -215,6 +219,11 @@ internal sealed class WinDivertPacketInjector
         {
             var resolved = NetworkInterfaceIndexResolver.FindBestInterfaceIndex(remoteAddress);
             interfaceIndex = resolved > 0 ? (uint)resolved : 0;
+            if (interfaceIndex > 0)
+            {
+                _warningLog(
+                    $"WinDivert packet injection fell back to best-interface lookup for {clientAddress} -> {remoteAddress}: interfaceIndex={interfaceIndex}.");
+            }
         }
 
         return interfaceIndex > 0;

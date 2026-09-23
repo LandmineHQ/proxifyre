@@ -21,6 +21,10 @@ public static unsafe class ModuleExports
     private const uint WmNull = 0x0000;
     private const uint WmClose = 0x0010;
     private const uint WmDestroy = 0x0002;
+    private const int CommandRejected = 0;
+    private const int CommandAccepted = 1;
+    private const int CommandRetryLater = 2;
+    private const int CommandAlreadyRunning = 3;
 
     private static int _initialized;
 
@@ -96,6 +100,13 @@ public static unsafe class ModuleExports
     private static extern bool DestroyWindow(nint hWnd);
 
     [DllImport("user32.dll", ExactSpelling = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool IsWindow(nint hWnd);
+
+    [DllImport("user32.dll", ExactSpelling = true)]
+    private static extern uint GetWindowThreadProcessId(nint hWnd, out int processId);
+
+    [DllImport("user32.dll", ExactSpelling = true)]
     private static extern void PostQuitMessage(int nExitCode);
 
     [DllImport("user32.dll", ExactSpelling = true, SetLastError = true)]
@@ -147,6 +158,7 @@ public static unsafe class ModuleExports
         private static RelayService? _relayService;
         private static CoreLogger? _logger;
         private static nint _replyHwnd;
+        private static int _replyProcessId;
         private static string? _sessionToken;
         private static string? _configPath;
         private static Timer? _heartbeatTimer;
@@ -257,7 +269,7 @@ public static unsafe class ModuleExports
             {
                 if (msg == ModuleMessageProtocol.WmCopyData)
                 {
-                    return HandleCopyData(lParam) ? 1 : 0;
+                    return HandleCopyData(wParam, lParam);
                 }
 
                 if (msg == WmClose)
@@ -283,34 +295,35 @@ public static unsafe class ModuleExports
             return DefWindowProcW(hWnd, msg, wParam, lParam);
         }
 
-        private static bool HandleCopyData(nint lParam)
+        private static nint HandleCopyData(nint senderWindow, nint lParam)
         {
             var copyData = Marshal.PtrToStructure<COPYDATASTRUCT>(lParam);
             if (copyData.dwData != ModuleMessageProtocol.CommandDataId || copyData.cbData <= 2 || copyData.lpData == nint.Zero)
             {
-                return false;
+                return CommandRejected;
             }
 
             var payload = Marshal.PtrToStringUni(copyData.lpData, (copyData.cbData / 2) - 1);
             if (string.IsNullOrWhiteSpace(payload) || !ModuleMessageProtocol.TryParse(payload, out var values))
             {
-                return false;
+                return CommandRejected;
             }
 
             var replyHwnd = ModuleMessageProtocol.GetReplyHwnd(values);
+            if (!values.TryGetValue("command", out var command))
+            {
+                return CommandRejected;
+            }
+
+            if (!IsCommandAuthorized(senderWindow, command, values))
+            {
+                return CommandRejected;
+            }
+
             if (replyHwnd != nint.Zero)
             {
                 _replyHwnd = replyHwnd;
-            }
-
-            if (!values.TryGetValue("command", out var command))
-            {
-                return false;
-            }
-
-            if (!IsCommandAuthorized(command, values))
-            {
-                return false;
+                _replyProcessId = GetProcessIdForWindow(senderWindow);
             }
 
             MarkUiHeartbeat();
@@ -318,35 +331,38 @@ public static unsafe class ModuleExports
             switch (command.ToUpperInvariant())
             {
                 case "HEARTBEAT":
-                    return true;
+                    return CommandAccepted;
                 case "PING":
                     SendEvent("status", BuildStatusText(), running: IsRelayRunning());
-                    return true;
+                    return CommandAccepted;
+                case "ATTACH":
+                    SendEvent(
+                        IsRelayRunning() ? "running" : "stopped",
+                        IsRelayRunning()
+                            ? $"Relay running in target process pid={Environment.ProcessId}."
+                            : "Module attached; relay is stopped.",
+                        running: IsRelayRunning(),
+                        pid: Environment.ProcessId);
+                    return CommandAccepted;
                 case "RUN":
-                    RunRelay(values);
-                    return true;
+                    return RunRelay(values);
                 case "RELOAD":
-                    ReloadRelay(values);
-                    return true;
+                    return ReloadRelay(values);
                 case "STOP":
                     StopRelay("STOP command received.");
-                    return true;
+                    return CommandAccepted;
                 default:
                     SendEvent("error", $"Unknown module command: {command}", running: IsRelayRunning());
-                    return false;
+                    return CommandRejected;
             }
         }
 
         private static bool IsCommandAuthorized(
+            nint senderWindow,
             string command,
             Dictionary<string, string> values)
         {
             var normalized = command.ToUpperInvariant();
-            if (normalized is "HEARTBEAT" or "PING")
-            {
-                return true;
-            }
-
             if (!values.TryGetValue("sessionToken", out var token)
                 || string.IsNullOrWhiteSpace(token))
             {
@@ -355,7 +371,8 @@ public static unsafe class ModuleExports
 
             if (string.IsNullOrEmpty(_sessionToken))
             {
-                if (normalized != "RUN")
+                if (normalized is not ("ATTACH" or "RUN")
+                    || !IsTrustedBootstrapSender(senderWindow))
                 {
                     return false;
                 }
@@ -369,7 +386,10 @@ public static unsafe class ModuleExports
                 return true;
             }
 
-            if (normalized == "RUN" && !IsRelayRunning())
+            if (normalized is ("ATTACH" or "RUN")
+                && senderWindow != nint.Zero
+                && IsTrustedBootstrapSender(senderWindow)
+                && !IsReplySessionAlive())
             {
                 _sessionToken = token;
                 return true;
@@ -378,7 +398,85 @@ public static unsafe class ModuleExports
             return false;
         }
 
-        private static void RunRelay(Dictionary<string, string> values)
+        private static bool IsTrustedBootstrapSender(nint senderWindow)
+        {
+            try
+            {
+                var processId = GetProcessIdForWindow(senderWindow);
+                if (processId <= 0)
+                {
+                    return false;
+                }
+
+                using var process = Process.GetProcessById(processId);
+                var processName = process.ProcessName.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)
+                    ? process.ProcessName
+                    : process.ProcessName + ".exe";
+                if (!processName.Equals("ProxiFyre.exe", StringComparison.OrdinalIgnoreCase)
+                    && !processName.Equals("TrafficTest.exe", StringComparison.OrdinalIgnoreCase))
+                {
+                    return false;
+                }
+
+                try
+                {
+                    return process.SessionId == Process.GetCurrentProcess().SessionId;
+                }
+                catch
+                {
+                    return true;
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static int GetProcessIdForWindow(nint window)
+        {
+            return window != nint.Zero
+                && GetWindowThreadProcessId(window, out var processId) != 0
+                ? processId
+                : 0;
+        }
+
+        private static bool IsReplySessionAlive()
+        {
+            if (_replyHwnd == nint.Zero || !IsWindow(_replyHwnd))
+            {
+                return false;
+            }
+
+            if (_replyProcessId <= 0)
+            {
+                return true;
+            }
+
+            try
+            {
+                using var process = Process.GetProcessById(_replyProcessId);
+                if (process.HasExited)
+                {
+                    return false;
+                }
+
+                try
+                {
+                    return process.SessionId == Process.GetCurrentProcess().SessionId;
+                }
+                catch
+                {
+                    return true;
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static int RunRelay(Dictionary<string, string> values)
         {
             var configPath = RequireValue(values, "configPath");
             _configPath = configPath;
@@ -399,7 +497,7 @@ public static unsafe class ModuleExports
                 if (RelayStopInProgress)
                 {
                     SendEvent("error", "Relay is still stopping; retry RUN.", running: false);
-                    return;
+                    return CommandRetryLater;
                 }
 
                 lock (Sync)
@@ -411,7 +509,7 @@ public static unsafe class ModuleExports
                     {
                         relay.Reload(configuration);
                         SendEvent("running", "Relay was already running; configuration reloaded.", running: true);
-                        return;
+                        return CommandAlreadyRunning;
                     }
 
                     var previousRelay = _relayService;
@@ -426,7 +524,11 @@ public static unsafe class ModuleExports
                     }
 
                     Action<TrafficSnapshot>? trafficSink = _telemetryClient is null ? null : _telemetryClient.TryPublish;
-                    _relayService = new RelayService(LogRelay, _detailedLogging, trafficSink);
+                    _relayService = new RelayService(
+                        LogRelay,
+                        _detailedLogging,
+                        trafficSink,
+                        warningLog: LogWarning);
                     _relayService.Start(
                         configuration,
                         configPath,
@@ -441,9 +543,10 @@ public static unsafe class ModuleExports
             }
 
             SendEvent("running", $"Relay running in target process pid={Environment.ProcessId}.", running: true, pid: Environment.ProcessId);
+            return CommandAccepted;
         }
 
-        private static void ReloadRelay(Dictionary<string, string> values)
+        private static int ReloadRelay(Dictionary<string, string> values)
         {
             var configPath = values.TryGetValue("configPath", out var path) && !string.IsNullOrWhiteSpace(path)
                 ? path
@@ -452,7 +555,7 @@ public static unsafe class ModuleExports
             if (string.IsNullOrWhiteSpace(configPath))
             {
                 SendEvent("error", "Cannot reload because configPath is unknown.", running: IsRelayRunning());
-                return;
+                return CommandRejected;
             }
 
             RelayLifecycleGate.Wait();
@@ -461,7 +564,7 @@ public static unsafe class ModuleExports
                 if (RelayStopInProgress)
                 {
                     SendEvent("error", "Relay is still stopping; retry RELOAD.", running: false);
-                    return;
+                    return CommandRetryLater;
                 }
 
                 var configuration = NormalizeForCurrentProcess(AppConfiguration.Load(configPath));
@@ -470,7 +573,7 @@ public static unsafe class ModuleExports
                     if (_relayService is not { IsRunning: true } relay)
                     {
                         SendEvent("stopped", "Configuration loaded, but relay is not running.", running: false);
-                        return;
+                        return CommandRejected;
                     }
 
                     relay.Reload(configuration);
@@ -482,6 +585,7 @@ public static unsafe class ModuleExports
             }
 
             SendEvent("reloaded", $"Configuration reloaded from {configPath}.", running: true);
+            return CommandAccepted;
         }
 
         private static void StopRelay(string reason, bool sendStoppedEvent = true)
@@ -624,6 +728,7 @@ public static unsafe class ModuleExports
                 LicenseKey = configuration.LicenseKey,
                 ModuleDllName = configuration.ModuleDllName,
                 EnableFakeIpWhitelist = configuration.EnableFakeIpWhitelist,
+                Detailed = configuration.Detailed,
                 Apps = configuration.Apps
             };
         }
@@ -657,6 +762,13 @@ public static unsafe class ModuleExports
             EnsureLogger();
             _logger?.Info(message);
             SendEvent("log", message, running: IsRelayRunning());
+        }
+
+        private static void LogWarning(string message)
+        {
+            EnsureLogger();
+            _logger?.Warning(message);
+            SendEvent("warning", message, running: IsRelayRunning());
         }
 
         private static void LogLocal(string message)

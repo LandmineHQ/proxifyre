@@ -23,7 +23,9 @@ internal sealed class ProcessLookup
     private readonly TimeSpan _processIdentityCacheTtl = TimeSpan.FromMilliseconds(250);
     private readonly ConcurrentDictionary<int, CachedProcessInfo> _processCache = new();
     private readonly ConcurrentDictionary<int, ProcessIdentityCheck> _processIdentityChecks = new();
+    private readonly ConcurrentDictionary<string, long> _warningTimes = new();
     private readonly Action<string> _log;
+    private readonly Action<string> _warningLog;
     private readonly TimeProvider _timeProvider;
     private readonly bool _logRefreshes;
     private readonly object _sync = new();
@@ -40,9 +42,11 @@ internal sealed class ProcessLookup
     public ProcessLookup(
         Action<string>? log = null,
         TimeProvider? timeProvider = null,
-        bool logRefreshes = false)
+        bool logRefreshes = false,
+        Action<string>? warningLog = null)
     {
         _log = log ?? (_ => { });
+        _warningLog = warningLog ?? _log;
         _timeProvider = timeProvider ?? TimeProvider.System;
         _logRefreshes = logRefreshes;
     }
@@ -264,13 +268,14 @@ internal sealed class ProcessLookup
         }
     }
 
-    private static void AddTcp4(
+    private void AddTcp4(
         Dictionary<TcpSessionKey, int> owners,
         Dictionary<UdpEndpointKey, int> localOwners,
         Dictionary<ushort, int> portOwners,
         Dictionary<UdpEndpointKey, int> listeners)
     {
         QueryTable(
+            "TCP IPv4 owner table",
             (IntPtr buffer, ref int size) => GetExtendedTcpTable(buffer, ref size, false, AfInet, TcpTableOwnerPidAll, 0),
             buffer =>
             {
@@ -306,13 +311,14 @@ internal sealed class ProcessLookup
             });
     }
 
-    private static void AddTcp6(
+    private void AddTcp6(
         Dictionary<TcpSessionKey, int> owners,
         Dictionary<UdpEndpointKey, int> localOwners,
         Dictionary<ushort, int> portOwners,
         Dictionary<UdpEndpointKey, int> listeners)
     {
         QueryTable(
+            "TCP IPv6 owner table",
             (IntPtr buffer, ref int size) => GetExtendedTcpTable(buffer, ref size, false, AfInet6, TcpTableOwnerPidAll, 0),
             buffer =>
             {
@@ -387,9 +393,10 @@ internal sealed class ProcessLookup
         owners[key] = pid;
     }
 
-    private static void AddUdp4(Dictionary<UdpEndpointKey, int> owners)
+    private void AddUdp4(Dictionary<UdpEndpointKey, int> owners)
     {
         QueryTable(
+            "UDP IPv4 owner table",
             (IntPtr buffer, ref int size) => GetExtendedUdpTable(buffer, ref size, false, AfInet, UdpTableOwnerPid, 0),
             buffer =>
             {
@@ -416,9 +423,10 @@ internal sealed class ProcessLookup
             });
     }
 
-    private static void AddUdp6(Dictionary<UdpEndpointKey, int> owners)
+    private void AddUdp6(Dictionary<UdpEndpointKey, int> owners)
     {
         QueryTable(
+            "UDP IPv6 owner table",
             (IntPtr buffer, ref int size) => GetExtendedUdpTable(buffer, ref size, false, AfInet6, UdpTableOwnerPid, 0),
             buffer =>
             {
@@ -445,12 +453,18 @@ internal sealed class ProcessLookup
             });
     }
 
-    private static void QueryTable(QueryTableDelegate query, Action<IntPtr> process)
+    private void QueryTable(
+        string tableName,
+        QueryTableDelegate query,
+        Action<IntPtr> process)
     {
         var size = 0;
         var result = query(IntPtr.Zero, ref size);
         if (result != ErrorInsufficientBuffer && result != NoError)
         {
+            LogWarningThrottled(
+                $"process-table-size:{tableName}",
+                $"Process lookup {tableName} size query failed with Win32 error {result}; retaining the previous table.");
             return;
         }
 
@@ -462,11 +476,29 @@ internal sealed class ProcessLookup
             {
                 process(buffer);
             }
+            else
+            {
+                LogWarningThrottled(
+                    $"process-table-query:{tableName}",
+                    $"Process lookup {tableName} query failed with Win32 error {result}; retaining the previous table.");
+            }
         }
         finally
         {
             Marshal.FreeHGlobal(buffer);
         }
+    }
+
+    private void LogWarningThrottled(string category, string message)
+    {
+        var now = Environment.TickCount64;
+        if (_warningTimes.TryGetValue(category, out var last) && now - last < 5000)
+        {
+            return;
+        }
+
+        _warningTimes[category] = now;
+        _warningLog(message);
     }
 
     public ProcessInfo? GetProcessInfo(int pid, bool forceRefresh = false)
@@ -499,9 +531,19 @@ internal sealed class ProcessLookup
                 ? process.ProcessName
                 : process.ProcessName + ".exe";
 
-            var path = TryGetProcessImagePath(pid)
-                ?? TryGetMainModulePath(process)
-                ?? name;
+            var path = TryGetProcessImagePath(pid);
+            if (path is null)
+            {
+                path = TryGetMainModulePath(process);
+                if (path is not null)
+                {
+                    LogWarningThrottled(
+                        "process-path-fallback",
+                        $"Process image path lookup fell back to MainModule for pid={pid}.");
+                }
+            }
+
+            path ??= name;
             long startTimeUtcTicks = 0;
             try
             {

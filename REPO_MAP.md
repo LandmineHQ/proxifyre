@@ -99,8 +99,11 @@ use a local loopback listener.
    remote destinations.
 5. The first datagram of a new session is sent synchronously before WinDivert
    consumes the original packet; later datagrams use the bounded send queue.
-6. A remote response is accepted only from a registered endpoint and injected
-   back to the application as a checksum-correct IPv4/IPv6 UDP packet.
+6. A remote response is accepted from any remote address and port while the
+   client session remains valid, then injected back as a checksum-correct
+   IPv4/IPv6 UDP packet. This is an open-policy, public-network-like behavior;
+   client endpoint, process identity, adapter/interface, and generation checks
+   remain enforced.
 7. The original outbound datagram is dropped only after a successful relay
    send or queued submission; failures pass the original packet through.
 
@@ -114,7 +117,28 @@ WinDivert inbound path as ordinary UDP responses.
 
 `RelayService` watches `app-config.json`, updates `DynamicAppConfiguration`,
 and calls `WinDivertPacketRouter.ApplyConfiguration`. Existing TCP connections
-and UDP targets whose process no longer matches are removed.
+and UDP targets whose process no longer matches are removed. The `detailed`
+setting is also applied to the running relay immediately; it defaults to
+`false` and does not require a relay restart.
+
+Exception-driven fallback paths emit `WARN` log records. This includes
+process-table fallback, interface-resolution fallback, direct pass-through
+recovery, outbound bind/interface retries, and response-ownership validation
+failures.
+
+### Control Channel
+
+The injected module accepts `ATTACH`, `RUN`, `RELOAD`, `STOP`, `PING`, and
+`HEARTBEAT`. Every command must carry the per-session token. The first
+authenticated controller must be a same-session `ProxiFyre.exe` or diagnostic
+`TrafficTest.exe` window. A replacement controller may take over only after
+the previous reply window/process is no longer alive. Module events remain
+token-bound.
+
+Command responses distinguish accepted, rejected, retry-later, and
+already-running outcomes. In particular, `RUN` timeout is treated as unknown:
+brokered WinDivert handles are retained rather than closed when the target may
+already have consumed them.
 
 ## WinDivert Runtime
 
@@ -122,14 +146,14 @@ and UDP targets whose process no longer matches are removed.
 | --- | --- |
 | `src/ProxiFyre/Network/WinDivertNative.cs` | Thin Cdecl P/Invoke layer, safe handles, queue parameters, native DLL resolution. |
 | `src/ProxiFyre/Network/WinDivertAddress.cs` | Exact 80-byte `WINDIVERT_ADDRESS` layout and layer/event bit masks. |
-| `src/ProxiFyre/Network/WinDivertPacketRouter.cs` | NETWORK receive loop, packet classification, pass-through, and lifecycle. |
+| `src/ProxiFyre/Network/WinDivertPacketRouter.cs` | NETWORK receive loop, bounded single-consumer packet processing queue, classification, pass-through, and lifecycle. |
 | `src/ProxiFyre/Network/WinDivertFlowTracker.cs` | FLOW-layer PID association and stale-flow cleanup. |
 | `src/ProxiFyre/Network/WinDivertPacketBuilder.cs` | Checksum-correct IPv4/IPv6 TCP and UDP packet construction. |
 | `src/ProxiFyre/Network/WinDivertPacketInjector.cs` | Inbound packet injection and interface resolution. |
 | `src/ProxiFyre/Network/WinDivertUdpRelay.cs` | UDP capture-to-`UdpDirectRelay` adapter. |
 | `src/ProxiFyre/Network/WinDivertDnsSpoofHandler.cs` | Optional fake-IP DNS interception. |
 | `src/ProxiFyre/Relay/TcpDirectRelay.cs` | Transparent user-space TCP state machine and remote socket I/O. |
-| `src/ProxiFyre/Relay/UdpDirectRelay.cs` | Bounded UDP sessions, targets, response validation, and interface pinning. |
+| `src/ProxiFyre/Relay/UdpDirectRelay.cs` | Bounded UDP sessions, open remote-endpoint response policy, and interface pinning. |
 | `src/ProxiFyre/Relay/RelayService.cs` | Relay lifecycle, configuration reload, telemetry, and task supervision. |
 | `src/ProxiFyre/Process/ProcessLookup.cs` | Windows TCP/UDP owner lookup and process metadata cache. |
 
@@ -168,7 +192,8 @@ and a compatible WinDivert driver/loading policy.
 `package` consumes the Release build output and delegates to
 `scripts/package-release.ps1`. That script owns the production file allowlist,
 native hash/signature checks, exact archive-content validation, manifest/app
-version consistency, and creation of `release/proxifyre-win-x64.zip`.
+version consistency, cross-artifact product-version consistency, and creation
+of `release/proxifyre-win-x64.zip`.
 
 ## Diagnostics
 
@@ -177,21 +202,27 @@ version consistency, and creation of `release/proxifyre-win-x64.zip`.
 | `tcp` | End-to-end relay diagnostic using the injected WPF host and `curl.exe`. |
 | `udp` | End-to-end UDP relay diagnostic using STUN, with optional multi-flow latency sampling. |
 | `traffic-telemetry` | Named-pipe telemetry verification without a driver. |
-| `packet-selftest` | Packet parser, WinDivert layout, packet builders, UU config, and interface diagnostics. |
+| `packet-selftest` | Packet parser, WinDivert layout, packet builders, UU/detailed config round-trips, WARN logging, and interface diagnostics. |
 | `tcp-selftest` | Driver-free TCP handshake, payload, ACK, retransmission, close, and cleanup behavior. |
 | `udp-selftest` | Driver-free UDP session behavior, source rejection, pinning, and reload cleanup. |
 | `windivert-probe` | Opens the signed WinDivert NETWORK/FLOW handles and reports the driver version. |
 | `windivert-tcp-probe` | Verifies synthetic SYN-ACK injection into a real socket without the full relay state machine. |
-| `windivert-bypass-probe` | Verifies concurrent non-target HTTP/UDP pass-through while WinDivert is active. |
+| `windivert-bypass-probe` | Verifies 50 non-target HTTP requests plus 20 sequentially retried STUN requests pass through while WinDivert is active. |
 
 ## Known Limitations
 
 - WinDivert `NETWORK` packets do not contain a process ID. PID attribution is
   necessarily a correlation step and can race with process termination.
+- WinDivert 2.2 FLOW events do not expose the NETWORK layer interface index.
+  Conflicting process owners for one five-tuple are marked ambiguous and fall
+  back to the Windows owner table instead of guessing.
 - The initial SYN or first UDP datagram falls back to the Windows owner table
   if a FLOW event is not available yet.
 - Fragmented IP packets are captured with `FRAGMENTS` but currently pass
   through without relay reassembly; they are not silently split by the relay.
+- UDP responses are intentionally accepted from arbitrary remote endpoints
+  while the client session is active. This favors public-network compatibility
+  over remote-endpoint allowlisting.
 - WinDivert requires Administrator privileges to open the driver handle. The
   official driver is signed, but HVCI, Code Integrity policy, or EDR may still
   block it on a managed machine.

@@ -25,6 +25,7 @@ internal sealed class SettingsViewModel : ObservableObject
 
     private bool _isUuPatchEnabled;
     private bool _isUuPatchBusy;
+    private bool _isDetailedLoggingEnabled;
     private string _uuPatchBusyText = string.Empty;
     private string _uuPatchStatusText = "未检测";
     private string _uuPatchDetailText = "等待检测正在运行的 UU 应用。";
@@ -35,6 +36,20 @@ internal sealed class SettingsViewModel : ObservableObject
         get => _isUuPatchEnabled;
         set => SetProperty(ref _isUuPatchEnabled, value);
     }
+
+    public bool IsDetailedLoggingEnabled
+    {
+        get => _isDetailedLoggingEnabled;
+        set
+        {
+            if (SetProperty(ref _isDetailedLoggingEnabled, value))
+            {
+                OnPropertyChanged(nameof(DetailedLoggingStatusText));
+            }
+        }
+    }
+
+    public string DetailedLoggingStatusText => IsDetailedLoggingEnabled ? "已开启" : "已关闭";
 
     public bool IsUuPatchBusy
     {
@@ -95,6 +110,11 @@ internal sealed class SettingsViewModel : ObservableObject
     public void SetUuPatchEnabled(bool enabled)
     {
         IsUuPatchEnabled = enabled;
+    }
+
+    public void SetDetailedLoggingEnabled(bool enabled)
+    {
+        IsDetailedLoggingEnabled = enabled;
     }
 
     public void SetUuPatchBusy(string text)

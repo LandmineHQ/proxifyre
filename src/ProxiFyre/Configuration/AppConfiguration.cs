@@ -20,6 +20,8 @@ internal sealed class AppConfiguration
 
     public bool EnableUuWhitelistPatch { get; init; } = false;
 
+    public bool Detailed { get; init; } = false;
+
     public string ModuleDllName { get; init; } = "ProxiFyre.Module.dll";
 
     public bool Matches(ProcessInfo process)
@@ -119,6 +121,13 @@ internal sealed class AppConfiguration
             }
         }
 
+        var detailed = false;
+        if (root.TryGetProperty("detailed", out var detailedElement)
+            && detailedElement.ValueKind == JsonValueKind.True)
+        {
+            detailed = true;
+        }
+
         var enabledApps = apps
             .Select(app => app.Trim())
             .Where(app => app.Length > 0)
@@ -137,6 +146,7 @@ internal sealed class AppConfiguration
             LicenseKey = string.IsNullOrWhiteSpace(licenseKey) ? null : licenseKey.Trim(),
             EnableFakeIpWhitelist = enableFakeIpWhitelist,
             EnableUuWhitelistPatch = enableUuWhitelistPatch,
+            Detailed = detailed,
             ModuleDllName = string.IsNullOrWhiteSpace(moduleDllName) ? "ProxiFyre.Module.dll" : moduleDllName.Trim(),
             Apps = enabledApps,
             DisabledApps = disabledAppList
@@ -154,6 +164,7 @@ internal sealed class AppConfiguration
             Apps = ["chrome.exe", @"C:\Program Files\SomeApp\SomeApp.exe", @"C:\Games\SomeGame\"],
             DisabledApps = [],
             EnableUuWhitelistPatch = false,
+            Detailed = false,
             ModuleDllName = "ProxiFyre.Module.dll"
         };
 
@@ -183,6 +194,7 @@ internal sealed class AppConfiguration
             DisabledApps = disabledApps,
             EnableFakeIpWhitelist = existingConfiguration?.EnableFakeIpWhitelist ?? false,
             EnableUuWhitelistPatch = existingConfiguration?.EnableUuWhitelistPatch ?? false,
+            Detailed = existingConfiguration?.Detailed ?? false,
             ModuleDllName = existingConfiguration?.ModuleDllName ?? "ProxiFyre.Module.dll"
         };
         File.WriteAllText(path, JsonSerializer.Serialize(simpleConfiguration, AppConfigurationJsonContext.Default.SimpleConfiguration));
@@ -195,7 +207,8 @@ internal sealed class AppConfiguration
         string coreProcessName = DefaultCoreProcessName,
         string? licenseKey = null,
         bool? enableUuWhitelistPatch = null,
-        IEnumerable<string>? disabledApps = null)
+        IEnumerable<string>? disabledApps = null,
+        bool? detailed = null)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path)) ?? AppContext.BaseDirectory);
         var existing = File.Exists(path) ? Load(path) : null;
@@ -217,6 +230,7 @@ internal sealed class AppConfiguration
             EnableUuWhitelistPatch = enableUuWhitelistPatch
                 ?? existing?.EnableUuWhitelistPatch
                 ?? false,
+            Detailed = detailed ?? existing?.Detailed ?? false,
             ModuleDllName = existing?.ModuleDllName ?? "ProxiFyre.Module.dll"
         };
 
@@ -266,6 +280,9 @@ internal sealed class AppConfiguration
         [JsonPropertyName("enableUuWhitelistPatch")]
         public bool EnableUuWhitelistPatch { get; init; }
 
+        [JsonPropertyName("detailed")]
+        public bool Detailed { get; init; }
+
         [JsonPropertyName("moduleDllName")]
         public string? ModuleDllName { get; init; }
 
@@ -290,6 +307,9 @@ internal sealed class AppConfiguration
 
         [JsonPropertyName("enableUuWhitelistPatch")]
         public bool EnableUuWhitelistPatch { get; init; }
+
+        [JsonPropertyName("detailed")]
+        public bool Detailed { get; init; }
 
         [JsonPropertyName("moduleDllName")]
         public string? ModuleDllName { get; init; }

@@ -22,7 +22,6 @@
     <Description>WinDivert TCP and UDP relay for selected Windows applications.</Description>
     <Company>NT KERNEL</Company>
     <Product>ProxiFyre</Product>
-    <Version>3.0.3</Version>
   </PropertyGroup>
   <ItemGroup>
     <Using Remove='System.Drawing' />

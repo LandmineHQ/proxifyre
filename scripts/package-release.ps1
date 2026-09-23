@@ -118,6 +118,19 @@ if (-not $versionsMatch) {
     throw "manifest.json version '$manifestVersion' does not match ProxiFyre.exe version '$applicationVersion'."
 }
 
+$artifactProductVersions = @(
+    @(
+        "ProxiFyre.exe",
+        "ProxiFyre.dll",
+        "ProxiFyre.Module.dll"
+        ) | ForEach-Object {
+        (Get-Item -LiteralPath (Join-Path $StageDirectory $_)).VersionInfo.ProductVersion
+        } | Sort-Object -Unique
+)
+if ($artifactProductVersions.Count -ne 1) {
+    throw "Release artifacts do not share one product version: $($artifactProductVersions -join ', ')."
+}
+
 $ExpectedEntries = @($PackageFiles.Name | Sort-Object)
 $ActualEntries = @(Get-ChildItem -LiteralPath $StageDirectory -File | Select-Object -ExpandProperty Name | Sort-Object)
 $EntryDiff = @(Compare-Object -ReferenceObject $ExpectedEntries -DifferenceObject $ActualEntries)

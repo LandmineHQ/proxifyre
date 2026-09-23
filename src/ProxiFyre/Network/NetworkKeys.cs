@@ -198,7 +198,8 @@ internal readonly record struct TcpRelayKey
         IPAddress clientAddress,
         IPAddress remoteAddress,
         ushort clientPort,
-        ushort remotePort)
+        ushort remotePort,
+        uint subInterfaceIndex = 0)
     {
         AdapterHandle = adapterHandle;
         Dot1q = dot1q;
@@ -206,6 +207,7 @@ internal readonly record struct TcpRelayKey
         RemoteAddress = NetworkAddress.Normalize(remoteAddress);
         ClientPort = clientPort;
         RemotePort = remotePort;
+        SubInterfaceIndex = subInterfaceIndex;
     }
 
     public IPAddress ClientAddress { get; }
@@ -219,6 +221,8 @@ internal readonly record struct TcpRelayKey
     public IntPtr AdapterHandle { get; }
 
     public uint Dot1q { get; }
+
+    public uint SubInterfaceIndex { get; }
 
     public override string ToString()
     {

@@ -11,9 +11,11 @@ internal sealed class AotModuleController : IDisposable
 {
     private static readonly TimeSpan HeartbeatInterval = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan HeartbeatSendTimeout = TimeSpan.FromSeconds(1);
+    private const int ErrorTimeout = 1460;
 
     private readonly ConfigurationStore _configurationStore;
     private readonly Action<string> _log;
+    private readonly Action<string> _warningLog;
     private readonly Action<ModuleEvent> _moduleEvent;
     private readonly object _heartbeatLock = new();
     private ModuleMessageClient? _messageClient;
@@ -23,7 +25,7 @@ internal sealed class AotModuleController : IDisposable
     private ModuleTargetProcess? _targetProcess;
     private readonly string? _moduleLogPath;
     private readonly string? _telemetryPipeName;
-    private readonly bool _detailedLogging;
+    private volatile bool _detailedLogging;
     private readonly string _sessionToken = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
     private string? _nativeDirectory;
     private bool _relayRunning;
@@ -38,10 +40,12 @@ internal sealed class AotModuleController : IDisposable
         Action<ModuleEvent> moduleEvent,
         string? moduleLogPath = null,
         string? telemetryPipeName = null,
-        bool detailedLogging = false)
+        bool detailedLogging = false,
+        Action<string>? warningLog = null)
     {
         _configurationStore = configurationStore;
         _log = log;
+        _warningLog = warningLog ?? log;
         _moduleEvent = moduleEvent;
         _moduleLogPath = moduleLogPath;
         _telemetryPipeName = telemetryPipeName;
@@ -53,6 +57,11 @@ internal sealed class AotModuleController : IDisposable
     public string? ProcessName => _targetProcess?.ProcessName;
 
     public int? ProcessId => _targetProcess?.ProcessId;
+
+    public void SetDetailedLogging(bool enabled)
+    {
+        _detailedLogging = enabled;
+    }
 
     public void ApplyModuleEvent(ModuleEvent moduleEvent)
     {
@@ -175,7 +184,25 @@ internal sealed class AotModuleController : IDisposable
     {
         if (_moduleWindow != nint.Zero)
         {
-            _ = SendCommand("STOP", TimeSpan.FromSeconds(2));
+            try
+            {
+                var result = SendCommandResult("STOP", TimeSpan.FromSeconds(2));
+                if (!result.Accepted && !result.RetryLater)
+                {
+                    _log(
+                        result.Delivered
+                            ? $"模组拒绝 STOP 命令，response={result.Response}."
+                            : $"STOP 命令未确认，Win32={result.Win32Error}.");
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                _log($"STOP 命令发送失败: {ex.Message}");
+                return;
+            }
+
+            return;
         }
 
         _relayRunning = false;
@@ -247,7 +274,8 @@ internal sealed class AotModuleController : IDisposable
             _moduleWindow = moduleWindow;
             _log($"Existing module message window found for pid={candidate.ProcessId}.");
 
-            if (!SendCommand("PING", TimeSpan.FromSeconds(2)))
+            if (!SendCommand("ATTACH", TimeSpan.FromSeconds(2))
+                || !SendCommand("PING", TimeSpan.FromSeconds(2)))
             {
                 _relayRunning = false;
                 return ModuleAttachResult.Unresponsive;
@@ -294,7 +322,8 @@ internal sealed class AotModuleController : IDisposable
         if (selected.Target.ProcessId != minimumPid.ProcessId)
         {
             var minimumSummary = summaries.First(candidate => candidate.Target.ProcessId == minimumPid.ProcessId).Summary;
-            _log($"Selected hookable module target instead of minimum pid: skipped pid={minimumPid.ProcessId} ({minimumSummary.Description}); selected pid={selected.Target.ProcessId} ({selected.Summary.Description}).");
+            _warningLog(
+                $"Selected hookable module target instead of minimum pid: skipped pid={minimumPid.ProcessId} ({minimumSummary.Description}); selected pid={selected.Target.ProcessId} ({selected.Summary.Description}).");
         }
 
         return selected.Target;
@@ -309,7 +338,7 @@ internal sealed class AotModuleController : IDisposable
     {
         if (_relayRunning || _targetProcess is null)
         {
-            return SendCommand("RUN");
+            return SendRunCommandWithoutBrokeredHandles();
         }
 
         BrokeredWinDivertHandles handles;
@@ -321,17 +350,15 @@ internal sealed class AotModuleController : IDisposable
         }
         catch (Exception ex)
         {
-            _log(
+            _warningLog(
                 $"WinDivert handle brokering failed; attempting direct open in the target process: {ex.Message}");
-            return SendCommand("RUN");
+            return SendRunCommandWithoutBrokeredHandles();
         }
 
+        ModuleCommandSendResult result;
         try
         {
-            if (SendCommand("RUN", null, handles.Network, handles.Flow))
-            {
-                return true;
-            }
+            result = SendCommandResult("RUN", null, handles.Network, handles.Flow);
         }
         catch
         {
@@ -339,13 +366,54 @@ internal sealed class AotModuleController : IDisposable
             throw;
         }
 
+        if (result.Accepted)
+        {
+            return true;
+        }
+
+        if (result.AlreadyRunning)
+        {
+            WinDivertHandleBroker.CloseForTarget(_targetProcess.ProcessId, handles);
+            return true;
+        }
+
+        if (!result.Delivered && result.Win32Error == ErrorTimeout)
+        {
+            _warningLog(
+                $"RUN 命令等待响应超时，无法确认目标进程是否已接管 WinDivert handles；为避免关闭正在使用的句柄，本次保留 brokered handles。");
+            return true;
+        }
+
         WinDivertHandleBroker.CloseForTarget(_targetProcess.ProcessId, handles);
         return false;
     }
 
-    private bool SendCommand(
+    private bool SendRunCommandWithoutBrokeredHandles()
+    {
+        var result = SendCommandResult("RUN");
+        if (result.Accepted)
+        {
+            return true;
+        }
+
+        if (result.AlreadyRunning)
+        {
+            return true;
+        }
+
+        if (!result.Delivered && result.Win32Error == ErrorTimeout)
+        {
+            _warningLog(
+                "RUN 命令等待响应超时，将在后续心跳中确认目标进程状态。");
+            return true;
+        }
+
+        return false;
+    }
+
+    private ModuleCommandSendResult SendCommandResult(
         string command,
-        TimeSpan? timeout,
+        TimeSpan? timeout = null,
         nint networkHandle = 0,
         nint flowHandle = 0)
     {
@@ -369,6 +437,16 @@ internal sealed class AotModuleController : IDisposable
         return timeout is { } value
             ? _messageClient.SendCommand(_moduleWindow, payload, value)
             : _messageClient.SendCommand(_moduleWindow, payload);
+    }
+
+    private bool SendCommand(
+        string command,
+        TimeSpan? timeout = null,
+        nint networkHandle = 0,
+        nint flowHandle = 0)
+    {
+        var result = SendCommandResult(command, timeout, networkHandle, flowHandle);
+        return result.Accepted;
     }
 
     private void StartHeartbeat()
@@ -509,7 +587,7 @@ internal sealed class AotModuleController : IDisposable
         _moduleEvent(new ModuleEvent("lost", message, false, target.ProcessId));
     }
 
-    private static string PrepareRuntimeModuleDll(string dllName)
+    private string PrepareRuntimeModuleDll(string dllName)
     {
         var nativeDll = FindNativeModuleDll(dllName);
         var configuration = GetConfigurationName(nativeDll);
@@ -676,7 +754,7 @@ internal sealed class AotModuleController : IDisposable
         }
     }
 
-    private static string FindNativeModuleDll(string dllName)
+    private string FindNativeModuleDll(string dllName)
     {
         var baseDirectory = AppContext.BaseDirectory;
         var preferredConfiguration = GetPreferredConfigurationName(baseDirectory);
@@ -698,6 +776,13 @@ internal sealed class AotModuleController : IDisposable
 
         if (existing is not null)
         {
+            var resolvedConfiguration = GetConfigurationName(existing);
+            if (!resolvedConfiguration.Equals(preferredConfiguration, StringComparison.OrdinalIgnoreCase))
+            {
+                _warningLog(
+                    $"Preferred {preferredConfiguration} AOT module was not found; falling back to {resolvedConfiguration}: {existing}");
+            }
+
             return existing;
         }
 
@@ -803,15 +888,18 @@ internal sealed class AotModuleController : IDisposable
         nint finalWindow = await WaitForModuleWindowAsync(targetProcessId, TimeSpan.FromSeconds(5)).ConfigureAwait(false);
         if (finalWindow == nint.Zero && !remoteThreadAttempted)
         {
-            _log("WH_GETMESSAGE timed out. Attempting fallback via CreateRemoteThread...");
+            _warningLog(
+                "WH_GETMESSAGE timed out; falling back to CreateRemoteThread injection.");
             if (InjectDllViaCreateRemoteThread(targetProcessId, dllPath, out remoteThreadError))
             {
-                _log("Fallback CreateRemoteThread injection succeeded. Waiting for module message window...");
+                _warningLog(
+                    "CreateRemoteThread fallback injection succeeded; waiting for module message window.");
                 finalWindow = await WaitForModuleWindowAsync(targetProcessId, TimeSpan.FromSeconds(5)).ConfigureAwait(false);
             }
             else
             {
-                _log($"Fallback CreateRemoteThread injection failed: {remoteThreadError}");
+                _warningLog(
+                    $"CreateRemoteThread fallback injection failed: {remoteThreadError}");
             }
         }
 
