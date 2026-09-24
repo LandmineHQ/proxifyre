@@ -5,9 +5,17 @@ applications. It identifies outbound IPv4/IPv6 TCP and UDP traffic by process,
 relays matching traffic through an injected NativeAOT module, and injects
 responses back to the application without opening local listening ports.
 
-The UI also provides optional runtime compatibility patching for UU's
-`local_proxy.dll` whitelist. Architecture and implementation details are in
-`REPO_MAP.md` and `docs/UU_ACCELERATOR.md`.
+## UU Accelerator Patch
+
+The UI provides optional runtime compatibility patching for UU's
+`local_proxy.dll` policy checks. The patch changes only the loaded process
+image, preserves UU process matching and the installed DLL signature, and uses
+validated function signatures to support compatible UU builds.
+
+- [English implementation reference](docs/UU_ACCELERATOR.md)
+- [简体中文实现说明](docs/UU_ACCELERATOR.zh-CN.md)
+
+The repository architecture map is in `REPO_MAP.md`.
 
 ## Build
 

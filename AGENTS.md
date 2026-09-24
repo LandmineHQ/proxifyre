@@ -7,9 +7,12 @@
   limitations.
 - Read `docs/UU_ACCELERATOR.md` before changing UU patching, patch profiles,
   UAC behavior, the Settings tab, or UU-related configuration.
-- Keep `REPO_MAP.md`, `README.md`, and the UU document synchronized when a
-  change alters files, project boundaries, public configuration, commands,
-  protocols, or runtime behavior.
+- Treat `docs/UU_ACCELERATOR.md` as the reference for UU policy variables,
+  target-function contracts, replacement stubs, and profile resolution.
+- Keep `REPO_MAP.md`, `README.md`, `docs/UU_ACCELERATOR.md`, and
+  `docs/UU_ACCELERATOR.zh-CN.md` synchronized when a change alters files,
+  project boundaries, public configuration, commands, protocols, or runtime
+  behavior.
 - Verify current behavior against source and tests. Do not treat user-facing
   documentation as the implementation.
 
@@ -76,6 +79,16 @@
   include an exact source SHA256 and expected original/replacement bytes. Every
   target must include a unique function signature; fixed RVAs are only the fast
   path for an exact hash match.
+- Keep the maintained `uu-5247` profile as the exact-hash anchor unless the
+  target function bodies diverge. The current signatures resolve the same seven
+  RVAs in `5247` and `5248`; do not add a duplicate profile with identical
+  signatures because unknown-hash resolution would become ambiguous.
+- Do not use the UU installation directory, product version, or file version as
+  the compatibility key. Current `local_proxy.dll` builds can all report
+  version `9.9.9.99`.
+- Preserve each target's return ABI. Replacement stubs must be the same length
+  as the original prefix and must retain the target's `ret imm16` stack cleanup
+  width.
 - Fail closed. Validate the complete profile before writing anything, report
   the mismatched function to the UI, and never guess offsets or silently accept
   an unresolved or ambiguous DLL version.
@@ -141,7 +154,8 @@ Use the repository wrapper for normal work:
   not.
 - Runtime UU validation requires a running UU process with `local_proxy.dll`
   loaded and sufficient privileges to inspect or modify that process.
-- After changing UU signatures, validate uniqueness against the supported DLL:
+- After changing UU signatures, validate uniqueness against every available
+  supported installation build, including `5247` and `5248`:
   `node scripts/check-uu-signatures.cjs src/Shared/UuPatchProfiles.json <local_proxy.dll>`.
 - WinDivert must be deployed with the official `WinDivert.dll` and digitally
   signed `WinDivert64.sys`. Do not patch, resign, or replace the driver.
@@ -178,8 +192,8 @@ Use the repository wrapper for normal work:
 - Keep `manifest.json`, the application file version, and the manual Release
   `version` input synchronized. Packaging and release promotion must fail on a
   mismatch.
-- Keep `README.md` and `UU_ACCELERATOR.md` out of the release ZIP because they
-  are not runtime dependencies.
+- Keep `README.md`, `UU_ACCELERATOR.md`, and `UU_ACCELERATOR.zh-CN.md` out of
+  the release ZIP because they are not runtime dependencies.
 - Do not stage local configuration, logs, PDB files, build caches, or runtime
   DLL copies. The official WinDivert DLL, driver, and license are required
   release entries.

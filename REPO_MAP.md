@@ -24,7 +24,7 @@ are deployed as native assets. ProxiFyre does not enable test signing.
 
 | Project | Output | Responsibility |
 | --- | --- | --- |
-| `src/ProxiFyre/ProxiFyre.csproj` | WPF application and CLI | UI, configuration, module injection, WinDivert relay, telemetry, UU patch integration. |
+| `src/ProxiFyre/ProxiFyre.csproj` | WPF application and CLI | UI, configuration, module injection, WinDivert relay, telemetry, UU runtime patch integration. |
 | `src/ProxiFyre.Module/ProxiFyre.Module.csproj` | NativeAOT shared DLL | Injected relay host and linked relay/runtime sources. |
 | `src/ProxiFyre.Probe/ProxiFyre.Probe.csproj` | Diagnostic NativeAOT DLL | Investigation-only API hook probe. |
 | `src/TrafficTest/TrafficTest.csproj` | Console diagnostics | Packet, UDP relay, process, telemetry, and environment diagnostics. |
@@ -140,6 +140,25 @@ already-running outcomes. In particular, `RUN` timeout is treated as unknown:
 brokered WinDivert handles are retained rather than closed when the target may
 already have consumed them.
 
+## UU Runtime Patch
+
+The WPF UI can patch seven policy functions in the loaded `local_proxy.dll`
+without changing the installed file or its Authenticode content. The patch
+preserves the UU process ACL and only neutralizes process-domain, destination,
+ban-list, browser QUIC, and UDP destination/port rejection checks.
+
+Patch profiles live in `src/Shared/UuPatchProfiles.json`. The maintained
+`uu-5247` profile pins the original and patched DLL SHA256 values and provides
+an exact-hash fast path. Every target also has a unique executable-code
+signature; `5248` resolves the same seven RVAs through those signatures.
+Profile and function details are documented in `docs/UU_ACCELERATOR.md`.
+
+The runtime patcher validates the complete profile before suspending UU,
+checks the live original or patched bytes, changes page protection, writes the
+replacement stubs, flushes the instruction cache, restores protection, and
+resumes the process. Unknown or ambiguous signatures fail closed. UU patching
+is independent of the WinDivert relay data plane.
+
 ## WinDivert Runtime
 
 | Path | Responsibility |
@@ -239,6 +258,8 @@ of `release/proxifyre-win-x64.zip`.
 - The AOT module cannot migrate to a new process. Changing `coreProcessName`
   requires loading the module into the new target.
 - UU runtime patching remains separate from the WinDivert relay data plane.
+  Compatibility follows validated function signatures rather than the UU
+  installation directory or the shared `9.9.9.99` file version.
 
 ## Release Contract
 
@@ -251,6 +272,7 @@ entries are:
 `THIRD_PARTY_NOTICES.md`, `LICENSE`, `manifest.json`, and
 `UuPatchProfiles.json`.
 
-`README.md` and `UU_ACCELERATOR.md` are documentation-only and must not be
-staged into the release ZIP. `ProxiFyre.Probe.dll` is diagnostic-only and is
-also excluded from the production package.
+`README.md`, `UU_ACCELERATOR.md`, and `UU_ACCELERATOR.zh-CN.md` are
+documentation-only and must not be staged into the release ZIP.
+`ProxiFyre.Probe.dll` is diagnostic-only and is also excluded from the
+production package.
